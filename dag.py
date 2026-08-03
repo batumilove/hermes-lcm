@@ -165,6 +165,9 @@ class SummaryDAG:
         self._conn: Optional[sqlite3.Connection] = None
         self._db_lock = threading.RLock()
         self._init_db()
+        # Lifecycle metrics — registered *after* __init__ succeeds.
+        from hermes_lcm.lifecycle_metrics import register_summary_dag_created
+        register_summary_dag_created(self)
 
     @property
     def connection(self) -> Optional[sqlite3.Connection]:
@@ -825,14 +828,27 @@ class SummaryDAG:
         )
 
     def close(self) -> None:
+        from .lifecycle_metrics import (
+            begin_summary_dag_close,
+            complete_summary_dag_close,
+            fail_summary_dag_close,
+        )
+
+        transition = begin_summary_dag_close(self)
         conn = getattr(self, "_conn", None)
-        if conn:
-            try:
-                conn.execute("PRAGMA wal_checkpoint(PASSIVE)")
-            except sqlite3.Error:
-                pass
-            conn.close()
-            self._conn = None
+        try:
+            if conn:
+                try:
+                    conn.execute("PRAGMA wal_checkpoint(PASSIVE)")
+                except sqlite3.Error:
+                    pass
+                conn.close()
+                self._conn = None
+        except Exception:
+            fail_summary_dag_close(self)
+            raise
+        else:
+            complete_summary_dag_close(self)
 
     def __del__(self) -> None:  # pragma: no cover - defensive resource cleanup
         try:

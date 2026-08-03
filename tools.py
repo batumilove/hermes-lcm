@@ -128,6 +128,20 @@ def _require_engine(kwargs: Dict[str, Any]) -> "LCMEngine | None":
     return engine if engine is not None else None
 
 
+def _runtime_lifecycle_snapshot() -> dict:
+    """Privacy-safe process-local lifecycle counters for the lcm_status payload.
+
+    Returns only integer counters — no DB paths, session/conversation ids,
+    content, or object ids.  Never raises: if instrumentation is unavailable
+    the key is simply omitted from the status dict.
+    """
+    try:
+        from .lifecycle_metrics import snapshot as _snapshot
+        return _snapshot().get("runtime_lifecycle", {})
+    except Exception:
+        return {}
+
+
 def _get_session_node(engine: "LCMEngine", node_id: int):
     node = engine._dag.get_node(node_id)
     if node is None or node.session_id != engine.current_session_id:
@@ -4710,6 +4724,7 @@ def lcm_status(args: Dict[str, Any], **kwargs) -> str:
         "runtime_identity": runtime_identity,
         "lifecycle": lifecycle,
         "lifecycle_fragmentation": lifecycle_fragmentation,
+        "runtime_lifecycle": _runtime_lifecycle_snapshot(),
     })
 
 

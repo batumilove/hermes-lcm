@@ -243,6 +243,10 @@ class MessageStore:
         # uncontended ``RLock.acquire``/``release`` pair per operation.
         self._write_lock = threading.RLock()
         self._init_db()
+        # Lifecycle metrics — registered *after* __init__ succeeds so a
+        # construction failure cannot inflate live counts.
+        from hermes_lcm.lifecycle_metrics import register_message_store_created
+        register_message_store_created(self)
 
     def _init_db(self):
         self._conn = sqlite3.connect(str(self.db_path), timeout=5.0, check_same_thread=False)
@@ -1367,17 +1371,30 @@ class MessageStore:
     # -- Lifecycle ----------------------------------------------------------
 
     def close(self) -> None:
+        from hermes_lcm.lifecycle_metrics import (
+            begin_message_store_close,
+            complete_message_store_close,
+            fail_message_store_close,
+        )
+
+        transition = begin_message_store_close(self)
         conn = getattr(self, "_conn", None)
-        if conn:
-            # Graceful shutdown hygiene: checkpoint committed WAL frames before
-            # releasing the connection.  This does not run on crash/kill, and
-            # PASSIVE can leave frames behind when another reader is active.
-            try:
-                conn.execute("PRAGMA wal_checkpoint(PASSIVE)")
-            except sqlite3.Error:
-                pass  # best-effort only; don't let this mask the real close()
-            conn.close()
-            self._conn = None
+        try:
+            if conn:
+                # Graceful shutdown hygiene: checkpoint committed WAL frames before
+                # releasing the connection.  This does not run on crash/kill, and
+                # PASSIVE can leave frames behind when another reader is active.
+                try:
+                    conn.execute("PRAGMA wal_checkpoint(PASSIVE)")
+                except sqlite3.Error:
+                    pass  # best-effort only; don't let this mask the real close()
+                conn.close()
+                self._conn = None
+        except Exception:
+            fail_message_store_close(self)
+            raise
+        else:
+            complete_message_store_close(self)
 
     def __del__(self) -> None:  # pragma: no cover - defensive resource cleanup
         try:

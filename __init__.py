@@ -80,6 +80,7 @@ def _ensure_engine_bound_to_session(
 
 def register(ctx):
     """Plugin entry point — register the LCM context engine and tools."""
+    from .lifecycle_metrics import configure_from_host_policy
     from .config import LCMConfig
     from .engine import LCMEngine, resolve_active_lcm_engine
     from .schemas import (
@@ -95,6 +96,7 @@ def register(ctx):
         LCM_DOCTOR,
     )
 
+    configure_from_host_policy()
     config = LCMConfig.from_env()
 
     # Resolve hermes_home for profile-scoped storage

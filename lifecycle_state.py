@@ -64,6 +64,9 @@ class LifecycleStateStore:
         # advances cannot interleave and regress the checkpoint.
         self._lock = threading.RLock()
         self._init_db()
+        # Lifecycle metrics — registered *after* __init__ succeeds.
+        from hermes_lcm.lifecycle_metrics import register_lifecycle_state_store_created
+        register_lifecycle_state_store_created(self)
 
     def _init_db(self) -> None:
         self._conn = sqlite3.connect(
@@ -79,14 +82,27 @@ class LifecycleStateStore:
         self._conn.commit()
 
     def close(self) -> None:
+        from hermes_lcm.lifecycle_metrics import (
+            begin_lifecycle_state_store_close,
+            complete_lifecycle_state_store_close,
+            fail_lifecycle_state_store_close,
+        )
+
+        transition = begin_lifecycle_state_store_close(self)
         conn = getattr(self, "_conn", None)
-        if conn is not None:
-            try:
-                conn.execute("PRAGMA wal_checkpoint(PASSIVE)")
-            except sqlite3.Error:
-                pass
-            conn.close()
-            self._conn = None
+        try:
+            if conn is not None:
+                try:
+                    conn.execute("PRAGMA wal_checkpoint(PASSIVE)")
+                except sqlite3.Error:
+                    pass
+                conn.close()
+                self._conn = None
+        except Exception:
+            fail_lifecycle_state_store_close(self)
+            raise
+        else:
+            complete_lifecycle_state_store_close(self)
 
     def __del__(self) -> None:  # pragma: no cover - defensive resource cleanup
         try:

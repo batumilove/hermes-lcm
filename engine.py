@@ -376,6 +376,10 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
         self._host_fallback_compressor: Any = None
         self._host_fallback_session_id = ""
         self._host_fallback_import_warning_logged = False
+        # Lifecycle metrics — registered *after* __init__ succeeds so a
+        # construction failure cannot inflate live counts.
+        from .lifecycle_metrics import register_engine_created
+        register_engine_created(self)
 
     def clone_for_agent(self) -> "LCMEngine":
         """Return a fresh runtime engine for one AIAgent instance.
@@ -458,6 +462,9 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
             # this engine can publish or delete a DAG node.
             initialize_rollup_invalidation_outbox(self._dag)
         self._lifecycle = LifecycleStateStore(db_path)
+        # Lifecycle metrics: record one storage bind.
+        from .lifecycle_metrics import record_storage_bind
+        record_storage_bind()
 
     def _close_storage(self) -> None:
         """Best-effort close of currently bound SQLite helpers."""
@@ -5986,7 +5993,22 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
     # -- Lifecycle ---------------------------------------------------------
 
     def shutdown(self):
-        self._unregister_active_engine_binding()
-        self._store.close()
-        self._dag.close()
-        self._lifecycle.close()
+        from .lifecycle_metrics import (
+            begin_engine_shutdown,
+            complete_engine_shutdown,
+            fail_engine_shutdown,
+        )
+
+        transition = begin_engine_shutdown(self)
+        try:
+            self._unregister_active_engine_binding()
+            self._store.close()
+            self._dag.close()
+            self._lifecycle.close()
+        except Exception:
+            if transition:
+                fail_engine_shutdown(self)
+            raise
+        else:
+            if transition:
+                complete_engine_shutdown(self)
