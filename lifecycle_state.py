@@ -65,7 +65,7 @@ class LifecycleStateStore:
         self._lock = threading.RLock()
         self._init_db()
         # Lifecycle metrics — registered *after* __init__ succeeds.
-        from hermes_lcm.lifecycle_metrics import register_lifecycle_state_store_created
+        from .lifecycle_metrics import register_lifecycle_state_store_created
         register_lifecycle_state_store_created(self)
 
     def _init_db(self) -> None:
@@ -82,13 +82,13 @@ class LifecycleStateStore:
         self._conn.commit()
 
     def close(self) -> None:
-        from hermes_lcm.lifecycle_metrics import (
+        from .lifecycle_metrics import (
             begin_lifecycle_state_store_close,
             complete_lifecycle_state_store_close,
             fail_lifecycle_state_store_close,
         )
 
-        transition = begin_lifecycle_state_store_close(self)
+        begin_lifecycle_state_store_close(self)
         conn = getattr(self, "_conn", None)
         try:
             if conn is not None:

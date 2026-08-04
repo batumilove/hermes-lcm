@@ -245,7 +245,7 @@ class MessageStore:
         self._init_db()
         # Lifecycle metrics — registered *after* __init__ succeeds so a
         # construction failure cannot inflate live counts.
-        from hermes_lcm.lifecycle_metrics import register_message_store_created
+        from .lifecycle_metrics import register_message_store_created
         register_message_store_created(self)
 
     def _init_db(self):
@@ -1371,13 +1371,13 @@ class MessageStore:
     # -- Lifecycle ----------------------------------------------------------
 
     def close(self) -> None:
-        from hermes_lcm.lifecycle_metrics import (
+        from .lifecycle_metrics import (
             begin_message_store_close,
             complete_message_store_close,
             fail_message_store_close,
         )
 
-        transition = begin_message_store_close(self)
+        begin_message_store_close(self)
         conn = getattr(self, "_conn", None)
         try:
             if conn:
