@@ -275,6 +275,65 @@ def test_plugin_entrypoint_registers_lcm_context_engine():
     assert EXPECTED_LCM_TOOLS.issubset(tool_names)
 
 
+def test_plugin_entrypoint_loads_under_hermes_namespaced_module(tmp_path):
+    """The real host imports user plugins as ``hermes_plugins.<name>``.
+
+    Run in an isolated interpreter so the test suite's compatibility alias for
+    ``hermes_lcm`` cannot hide absolute intra-package imports.
+    """
+    repo_root = Path(__file__).resolve().parent.parent
+    script = r"""
+import importlib.util
+from pathlib import Path
+import sys
+import types
+
+repo_root = Path(sys.argv[1])
+package_name = "hermes_plugins.hermes_lcm"
+namespace = types.ModuleType("hermes_plugins")
+namespace.__path__ = []
+sys.modules["hermes_plugins"] = namespace
+spec = importlib.util.spec_from_file_location(
+    package_name,
+    repo_root / "__init__.py",
+    submodule_search_locations=[str(repo_root)],
+)
+assert spec is not None and spec.loader is not None
+module = importlib.util.module_from_spec(spec)
+sys.modules[package_name] = module
+spec.loader.exec_module(module)
+
+class Ctx:
+    context_engine_tool_handlers_receive_messages = False
+
+    def __init__(self):
+        self.engine = None
+
+    def register_context_engine(self, engine):
+        self.engine = engine
+
+    def register_tool(self, *args, **kwargs):
+        pass
+
+ctx = Ctx()
+module.register(ctx)
+assert ctx.engine is not None
+assert ctx.engine.name == "lcm"
+ctx.engine.shutdown()
+"""
+    hermes_home = tmp_path / "hermes-home"
+    result = subprocess.run(
+        [sys.executable, "-I", "-c", script, str(repo_root)],
+        cwd=tmp_path,
+        env={**os.environ, "HOME": str(tmp_path), "HERMES_HOME": str(hermes_home)},
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+
+    assert result.returncode == 0, result.stderr
+
+
 def test_plugin_entrypoint_registers_declared_lcm_tools():
     module = _load_plugin_entrypoint_module("hermes_lcm_packaging_tool_registration")
     registered = []
