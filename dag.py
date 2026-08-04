@@ -166,7 +166,7 @@ class SummaryDAG:
         self._db_lock = threading.RLock()
         self._init_db()
         # Lifecycle metrics — registered *after* __init__ succeeds.
-        from hermes_lcm.lifecycle_metrics import register_summary_dag_created
+        from .lifecycle_metrics import register_summary_dag_created
         register_summary_dag_created(self)
 
     @property
