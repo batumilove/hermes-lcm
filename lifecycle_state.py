@@ -88,7 +88,7 @@ class LifecycleStateStore:
             fail_lifecycle_state_store_close,
         )
 
-        transition = begin_lifecycle_state_store_close(self)
+        begin_lifecycle_state_store_close(self)
         conn = getattr(self, "_conn", None)
         try:
             if conn is not None:

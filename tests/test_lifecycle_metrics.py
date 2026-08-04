@@ -19,7 +19,7 @@ import gc
 import json
 import sys
 import threading
-from pathlib import Path
+import types
 
 import pytest
 
@@ -85,16 +85,24 @@ class TestRegistryShape:
     def test_configure_from_host_policy_reuses_shared_metrics_opt_in(
         self, monkeypatch
     ):
-        monkeypatch.setattr(
-            "hermes_cli.config.read_raw_config_readonly",
+        hermes_cli = types.ModuleType("hermes_cli")
+        hermes_cli.__path__ = []
+        config_module = types.ModuleType("hermes_cli.config")
+        setattr(
+            config_module,
+            "read_raw_config_readonly",
             lambda: {"telemetry": {"shared_metrics": {"enabled": True}}},
         )
+        setattr(hermes_cli, "config", config_module)
+        monkeypatch.setitem(sys.modules, "hermes_cli", hermes_cli)
+        monkeypatch.setitem(sys.modules, "hermes_cli.config", config_module)
         lcm_metrics.configure(enabled=False)
         lcm_metrics.configure_from_host_policy()
         assert _snapshot()["runtime_lifecycle"]["enabled"] == 1
 
-        monkeypatch.setattr(
-            "hermes_cli.config.read_raw_config_readonly",
+        setattr(
+            config_module,
+            "read_raw_config_readonly",
             lambda: {"telemetry": {"shared_metrics": {"enabled": False}}},
         )
         lcm_metrics.configure_from_host_policy()

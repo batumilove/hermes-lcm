@@ -290,6 +290,21 @@ import types
 
 repo_root = Path(sys.argv[1])
 package_name = "hermes_plugins.hermes_lcm"
+
+agent_package = types.ModuleType("agent")
+agent_package.__path__ = []
+context_engine_module = types.ModuleType("agent.context_engine")
+
+class ContextEngine:
+    def __init__(self, **kwargs):
+        self.compression_count = 0
+        self.last_prompt_tokens = 0
+
+context_engine_module.ContextEngine = ContextEngine
+agent_package.context_engine = context_engine_module
+sys.modules["agent"] = agent_package
+sys.modules["agent.context_engine"] = context_engine_module
+
 namespace = types.ModuleType("hermes_plugins")
 namespace.__path__ = []
 sys.modules["hermes_plugins"] = namespace

@@ -1377,7 +1377,7 @@ class MessageStore:
             fail_message_store_close,
         )
 
-        transition = begin_message_store_close(self)
+        begin_message_store_close(self)
         conn = getattr(self, "_conn", None)
         try:
             if conn:
