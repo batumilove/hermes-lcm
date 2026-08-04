@@ -834,7 +834,7 @@ class SummaryDAG:
             fail_summary_dag_close,
         )
 
-        transition = begin_summary_dag_close(self)
+        begin_summary_dag_close(self)
         conn = getattr(self, "_conn", None)
         try:
             if conn:
