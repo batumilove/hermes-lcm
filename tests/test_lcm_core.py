@@ -2132,6 +2132,31 @@ class TestMessageStore:
         assert results[0]["store_id"] == target
         assert results[0]["snippet"]
 
+    def test_search_simple_hyphenated_terms_use_fts(self, store):
+        target = store.append(
+            "sess1",
+            {
+                "role": "user",
+                "content": "durable Hermes LCM promotion post-restart acceptance",
+            },
+        )
+
+        traced: list[str] = []
+        store._conn.set_trace_callback(traced.append)
+        try:
+            results = store.search(
+                "durable Hermes LCM promotion post-restart acceptance",
+                session_id="sess1",
+                limit=5,
+                sort="relevance",
+            )
+        finally:
+            store._conn.set_trace_callback(None)
+
+        assert [result["store_id"] for result in results] == [target]
+        assert any("FROM messages_fts" in statement for statement in traced)
+        assert not any("content LIKE" in statement for statement in traced)
+
     def test_search_like_fallback_applies_sql_limit(self, store):
         for idx in range(80):
             store.append("sess1", {"role": "assistant", "content": f"plugin-only fallback load test {idx}"})

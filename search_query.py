@@ -87,7 +87,35 @@ def contains_risky_fts_ascii(text: str) -> bool:
 
 
 def requires_like_fallback(query: str) -> bool:
-    return contains_cjk(query) or contains_emoji(query) or contains_risky_fts_ascii(query)
+    if contains_cjk(query) or contains_emoji(query):
+        return True
+
+    raw = (query or "").strip()
+    if not raw:
+        return False
+    if raw.count('"') % 2:
+        return True
+
+    text_without_phrases = _QUOTED_PHRASE_RE.sub(" ", raw)
+    risky_tokens = _RISKY_FTS_TOKEN_RE.findall(text_without_phrases)
+    if not risky_tokens:
+        return False
+
+    # The sanitizer replaces hyphens with spaces before FTS5 sees the query, so
+    # ordinary multi-word prose such as ``promotion post-restart acceptance``
+    # is safe and should stay on the indexed path. Keep LIKE fallback for a
+    # single hyphenated lookup (whose repetition-aware ranking is intentional),
+    # slash/colon tokens, and explicit boolean expressions where splitting an
+    # operand can change the query semantics.
+    if any("/" in token or ":" in token for token in risky_tokens):
+        return True
+    tokens = text_without_phrases.split()
+    if any(
+        token.strip(_STRIP_EDGE_PUNCT).upper() in _BOOLEAN_OPERATORS
+        for token in tokens
+    ):
+        return True
+    return len(tokens) <= 1
 
 
 def _token_variants(token: str) -> List[str]:
