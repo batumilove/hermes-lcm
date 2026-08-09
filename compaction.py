@@ -22,6 +22,7 @@ from typing import Any, Dict, List, Optional
 from .dag import SummaryNode
 from .message_content import text_content_for_pattern_matching
 from .sanitize import _contains_sensitive_redaction
+from .sqlite_util import _is_sqlite_locked_error
 from .tokens import count_message_tokens, count_messages_tokens, count_tokens
 
 logger = logging.getLogger(__name__)
@@ -359,7 +360,15 @@ class CompactionMixin:
                 focus_topic=focus_topic,
                 force=force,
             )
-        except BaseException:
+        except BaseException as exc:
+            if _is_sqlite_locked_error(exc):
+                self._last_compression_status = "deferred"
+                self._last_compression_noop_reason = "sqlite lock contention"
+                logger.warning(
+                    "LCM compaction deferred after bounded SQLite lock/busy retries; "
+                    "preserving the active context for this turn"
+                )
+                return messages
             self._last_compression_status = "error"
             self._last_compression_noop_reason = ""
             raise

@@ -21,7 +21,13 @@ def _is_sqlite_locked_error(exc: BaseException) -> bool:
     while current is not None and id(current) not in seen:
         seen.add(id(current))
         message = str(current).lower()
-        if isinstance(current, sqlite3.Error) and "locked" in message:
+        code = getattr(current, "sqlite_errorcode", None)
+        primary_code = code & 0xFF if isinstance(code, int) else None
+        if isinstance(current, sqlite3.Error) and (
+            primary_code in {sqlite3.SQLITE_BUSY, sqlite3.SQLITE_LOCKED}
+            or "locked" in message
+            or "busy" in message
+        ):
             return True
         current = current.__cause__ or current.__context__
     return False
