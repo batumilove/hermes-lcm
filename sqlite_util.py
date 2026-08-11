@@ -20,6 +20,57 @@ from typing import Any, Iterator, List
 
 _PROCESS_SQLITE_WRITE_LOCK_TIMEOUT_SECONDS = 30.0
 _PROCESS_SQLITE_WRITE_LOCKS_GUARD = threading.Lock()
+_LOCK_OWNER_LABEL_LIMIT = 96
+_LOCK_TIMEOUT_DETAIL_LIMIT = 384
+
+
+def _bounded_diagnostic_text(value: Any, *, limit: int) -> str:
+    """Return one bounded, single-line diagnostic field."""
+    try:
+        text = str(value)[:limit]
+    except Exception:
+        return "unknown"
+    sanitized = "".join(character if character.isprintable() else "?" for character in text)
+    return sanitized or "unknown"
+
+
+def _bounded_diagnostic_label(value: Any) -> str:
+    """Return a bounded token that cannot inject another key/value field."""
+    text = _bounded_diagnostic_text(value, limit=_LOCK_OWNER_LABEL_LIMIT)
+    label = "".join(
+        character
+        if character.isascii()
+        and (character.isalnum() or character in "-_.:/@()")
+        else "_"
+        for character in text
+    )
+    return label or "unknown"
+
+
+def _lock_operation_label() -> str:
+    """Infer the lock caller without allowing frame telemetry to break acquisition."""
+    try:
+        operation_frame = sys._getframe(2)
+        if operation_frame.f_code.co_name == "__enter__":
+            operation_frame = operation_frame.f_back or operation_frame
+        operation = operation_frame.f_code.co_name
+    except Exception:
+        operation = "unknown"
+    return _bounded_diagnostic_label(operation)
+
+
+def _optional_timeout_detail(write_lock: Any) -> str:
+    """Return optional bounded telemetry without masking the primary timeout."""
+    try:
+        timeout_detail = getattr(write_lock, "timeout_detail", None)
+        if not callable(timeout_detail):
+            return ""
+        detail = _bounded_diagnostic_text(
+            timeout_detail(), limit=_LOCK_TIMEOUT_DETAIL_LIMIT
+        )
+    except Exception:
+        return ""
+    return "; " + detail
 
 
 class ProcessSQLiteWriteLock:
@@ -35,21 +86,26 @@ class ProcessSQLiteWriteLock:
         self._owner_depth = 0
 
     def acquire(self, blocking: bool = True, timeout: float = -1) -> bool:
+        thread_id = threading.get_ident()
+        try:
+            thread_name = threading.current_thread().name
+        except Exception:
+            thread_name = "unknown"
+        thread_name = _bounded_diagnostic_label(thread_name)
+        operation = _lock_operation_label()
         acquired = self._lock.acquire(blocking, timeout)
         if not acquired:
             return False
-        thread = threading.current_thread()
-        operation_frame = sys._getframe(1)
-        if operation_frame.f_code.co_name == "__enter__":
-            operation_frame = operation_frame.f_back or operation_frame
-        operation = operation_frame.f_code.co_name
-        now = time.monotonic()
+        try:
+            now = time.monotonic()
+        except Exception:
+            now = 0.0
         with self._metadata_lock:
-            if self._owner_thread_id == thread.ident:
+            if self._owner_thread_id == thread_id:
                 self._owner_depth += 1
             else:
-                self._owner_thread_id = thread.ident
-                self._owner_thread_name = thread.name
+                self._owner_thread_id = thread_id
+                self._owner_thread_name = thread_name
                 self._owner_operation = operation
                 self._owner_acquired_at = now
                 self._owner_depth = 1
@@ -68,16 +124,20 @@ class ProcessSQLiteWriteLock:
             self._lock.release()
 
     def owner_snapshot(self) -> dict[str, Any]:
-        """Return aggregate lock-owner diagnostics without database/user data."""
+        """Return bounded lock-owner diagnostics without database or SQL content."""
         with self._metadata_lock:
             if self._owner_thread_id is None:
                 return {}
+            try:
+                age_seconds = max(0.0, time.monotonic() - self._owner_acquired_at)
+            except Exception:
+                age_seconds = 0.0
             return {
                 "thread_id": self._owner_thread_id,
                 "thread_name": self._owner_thread_name,
                 "operation": self._owner_operation,
                 "depth": self._owner_depth,
-                "age_seconds": max(0.0, time.monotonic() - self._owner_acquired_at),
+                "age_seconds": age_seconds,
             }
 
     def timeout_detail(self) -> str:
@@ -97,8 +157,8 @@ class ProcessSQLiteWriteLock:
     def __enter__(self) -> "ProcessSQLiteWriteLock":
         if not self.acquire(timeout=_PROCESS_SQLITE_WRITE_LOCK_TIMEOUT_SECONDS):
             raise sqlite3.OperationalError(
-                "database is locked: timed out waiting for process-wide SQLite writer; "
-                + self.timeout_detail()
+                "database is locked: timed out waiting for process-wide SQLite writer"
+                + _optional_timeout_detail(self)
             )
         return self
 
@@ -198,12 +258,9 @@ def _acquire_process_write_lock(
 ) -> Iterator[None]:
     """Acquire a coordinator using the caller's existing bounded wait budget."""
     if not write_lock.acquire(timeout=max(0.0, float(timeout_seconds))):
-        detail = ""
-        timeout_detail = getattr(write_lock, "timeout_detail", None)
-        if callable(timeout_detail):
-            detail = "; " + str(timeout_detail())
         raise sqlite3.OperationalError(
-            "database is locked: timed out waiting for process-wide SQLite writer" + detail
+            "database is locked: timed out waiting for process-wide SQLite writer"
+            + _optional_timeout_detail(write_lock)
         )
     try:
         yield
