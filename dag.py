@@ -15,6 +15,7 @@ import json
 import logging
 import sqlite3
 import time
+from contextlib import nullcontext
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, Sequence
@@ -838,13 +839,14 @@ class SummaryDAG:
         begin_summary_dag_close(self)
         conn = getattr(self, "_conn", None)
         try:
-            if conn:
-                try:
-                    conn.execute("PRAGMA wal_checkpoint(PASSIVE)")
-                except sqlite3.Error:
-                    pass
-                conn.close()
-                self._conn = None
+            with getattr(self, "_db_lock", nullcontext()):
+                if conn:
+                    try:
+                        conn.execute("PRAGMA wal_checkpoint(PASSIVE)")
+                    except sqlite3.Error:
+                        pass
+                    conn.close()
+                    self._conn = None
         except Exception:
             fail_summary_dag_close(self)
             raise

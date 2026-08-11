@@ -22,11 +22,12 @@ def flush_engine_connections(engine) -> None:
     ``rotate_backup_database`` (rolling backup) so the connection-flush
     contract stays in one place.
     """
-    engine._store.commit()
-    engine._dag._conn.commit()
-    lifecycle_conn = getattr(getattr(engine, "_lifecycle", None), "_conn", None)
-    if lifecycle_conn is not None:
-        lifecycle_conn.commit()
+    with engine._store._write_lock:
+        engine._store.commit()
+        engine._dag._conn.commit()
+        lifecycle_conn = getattr(getattr(engine, "_lifecycle", None), "_conn", None)
+        if lifecycle_conn is not None:
+            lifecycle_conn.commit()
 
 
 def backup_database(engine) -> dict[str, Any]:
@@ -44,13 +45,13 @@ def backup_database(engine) -> dict[str, Any]:
 
     try:
         backup_dir.mkdir(parents=True, exist_ok=True)
-        flush_engine_connections(engine)
-
-        dest = sqlite3.connect(str(backup_path))
-        try:
-            engine._store.backup(dest)
-        finally:
-            dest.close()
+        with engine._store._write_lock:
+            flush_engine_connections(engine)
+            dest = sqlite3.connect(str(backup_path))
+            try:
+                engine._store.backup(dest)
+            finally:
+                dest.close()
     except (OSError, sqlite3.Error) as exc:
         return {
             "ok": False,
@@ -88,17 +89,17 @@ def rotate_backup_database(engine) -> dict[str, Any]:
 
     try:
         backup_dir.mkdir(parents=True, exist_ok=True)
-        flush_engine_connections(engine)
-
-        if tmp_path.exists():
-            tmp_path.unlink()
-        dest = sqlite3.connect(str(tmp_path))
-        try:
-            engine._store.backup(dest)
-        finally:
-            dest.close()
-        # Atomic replace so the rolling slot is never half-written.
-        tmp_path.replace(backup_path)
+        with engine._store._write_lock:
+            flush_engine_connections(engine)
+            if tmp_path.exists():
+                tmp_path.unlink()
+            dest = sqlite3.connect(str(tmp_path))
+            try:
+                engine._store.backup(dest)
+            finally:
+                dest.close()
+            # Atomic replace so the rolling slot is never half-written.
+            tmp_path.replace(backup_path)
     except (OSError, sqlite3.Error) as exc:
         # Best-effort cleanup of the tmp file if something failed midway.
         try:

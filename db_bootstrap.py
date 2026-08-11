@@ -17,6 +17,8 @@ import threading
 import time
 from typing import Iterable, Sequence
 
+from .sqlite_util import process_sqlite_write_lock
+
 logger = logging.getLogger(__name__)
 
 
@@ -1998,52 +2000,56 @@ def _run_background_integrity_scan(
     """
     key = (db_path, spec.table_name)
     timeout = SQLITE_BUSY_TIMEOUT_MS / 1000.0
+    process_write_lock = process_sqlite_write_lock(db_path)
     try:
-        scan_conn = sqlite3.connect(db_path, timeout=timeout, check_same_thread=False)
-        try:
-            scan_conn.execute(f"PRAGMA busy_timeout={SQLITE_BUSY_TIMEOUT_MS}")
-            # Persist the scan-started stamp on this DB so a crash mid-scan is
-            # detectable cross-process via the staleness window above.
-            _record_scan_started(scan_conn, spec, now=started_at)
-            scan_conn.commit()
-            result = check_external_content_fts_integrity(scan_conn, spec)
-        finally:
-            scan_conn.close()
+        with process_write_lock:
+            scan_conn = sqlite3.connect(db_path, timeout=timeout, check_same_thread=False)
+            try:
+                scan_conn.execute(f"PRAGMA busy_timeout={SQLITE_BUSY_TIMEOUT_MS}")
+                # Persist the scan-started stamp on this DB so a crash mid-scan is
+                # detectable cross-process via the staleness window above.
+                _record_scan_started(scan_conn, spec, now=started_at)
+                scan_conn.commit()
+                result = check_external_content_fts_integrity(scan_conn, spec)
+            finally:
+                scan_conn.close()
 
-        meta_conn = sqlite3.connect(db_path, timeout=timeout, check_same_thread=False)
-        try:
-            meta_conn.execute(f"PRAGMA busy_timeout={SQLITE_BUSY_TIMEOUT_MS}")
-            status = result.get("status")
-            if status == "pass":
-                _record_integrity_checked(meta_conn, spec, now=started_at)
-                _clear_integrity_failed(meta_conn, spec)
-            elif status == "fail":
-                _record_integrity_failed(
-                    meta_conn, spec, detail=result.get("detail", ""), now=started_at
-                )
-                logger.warning(
-                    "Background FTS integrity-check found corruption in '%s': %s. "
-                    "Run `/lcm doctor repair apply` to rebuild the index.",
-                    spec.table_name,
-                    result.get("detail", ""),
-                )
-            # 'unchecked' (e.g. a read-only DB): leave the throttle marker unset
-            # so the next bind retries; do not stamp or flag.
-            _clear_scan_started(meta_conn, spec, expected=started_at)
-            meta_conn.commit()
-        finally:
-            meta_conn.close()
+        with process_write_lock:
+            meta_conn = sqlite3.connect(db_path, timeout=timeout, check_same_thread=False)
+            try:
+                meta_conn.execute(f"PRAGMA busy_timeout={SQLITE_BUSY_TIMEOUT_MS}")
+                status = result.get("status")
+                if status == "pass":
+                    _record_integrity_checked(meta_conn, spec, now=started_at)
+                    _clear_integrity_failed(meta_conn, spec)
+                elif status == "fail":
+                    _record_integrity_failed(
+                        meta_conn, spec, detail=result.get("detail", ""), now=started_at
+                    )
+                    logger.warning(
+                        "Background FTS integrity-check found corruption in '%s': %s. "
+                        "Run `/lcm doctor repair apply` to rebuild the index.",
+                        spec.table_name,
+                        result.get("detail", ""),
+                    )
+                # 'unchecked' (e.g. a read-only DB): leave the throttle marker unset
+                # so the next bind retries; do not stamp or flag.
+                _clear_scan_started(meta_conn, spec, expected=started_at)
+                meta_conn.commit()
+            finally:
+                meta_conn.close()
     except Exception:  # pragma: no cover - defensive
         logger.exception(
             "Background FTS integrity-check for '%s' failed", spec.table_name
         )
         try:
-            cleanup = sqlite3.connect(db_path, timeout=timeout, check_same_thread=False)
-            try:
-                _clear_scan_started(cleanup, spec, expected=started_at)
-                cleanup.commit()
-            finally:
-                cleanup.close()
+            with process_write_lock:
+                cleanup = sqlite3.connect(db_path, timeout=timeout, check_same_thread=False)
+                try:
+                    _clear_scan_started(cleanup, spec, expected=started_at)
+                    cleanup.commit()
+                finally:
+                    cleanup.close()
         except sqlite3.DatabaseError:
             pass
     finally:
@@ -2086,16 +2092,17 @@ def _dispatch_background_integrity_scan(
         # just falls back to the thread's own stamp).
         claim_timeout = SQLITE_BUSY_TIMEOUT_MS / 1000.0
         try:
-            claim_conn = sqlite3.connect(
-                db_path, timeout=claim_timeout, check_same_thread=False
-            )
-            try:
-                claim_conn.execute(f"PRAGMA busy_timeout={SQLITE_BUSY_TIMEOUT_MS}")
-                claim_conn.execute("BEGIN IMMEDIATE")
-                _record_scan_started(claim_conn, spec, now=current)
-                claim_conn.commit()
-            finally:
-                claim_conn.close()
+            with process_sqlite_write_lock(db_path):
+                claim_conn = sqlite3.connect(
+                    db_path, timeout=claim_timeout, check_same_thread=False
+                )
+                try:
+                    claim_conn.execute(f"PRAGMA busy_timeout={SQLITE_BUSY_TIMEOUT_MS}")
+                    claim_conn.execute("BEGIN IMMEDIATE")
+                    _record_scan_started(claim_conn, spec, now=current)
+                    claim_conn.commit()
+                finally:
+                    claim_conn.close()
         except sqlite3.DatabaseError:
             pass
 
