@@ -49,10 +49,18 @@ from .search_query import (
     should_apply_directness_rank_adjustment,
 )
 from .store import _normalize_source_value, _UNKNOWN_SOURCE, _legacy_blank_source_clause
-from .sqlite_util import process_sqlite_write_lock
+from .sqlite_util import (
+    _is_sqlite_locked_error,
+    _temporary_sqlite_busy_timeout,
+    process_sqlite_write_lock,
+)
 
 
 logger = logging.getLogger(__name__)
+
+_DAG_WRITE_MAX_ATTEMPTS = 3
+_DAG_WRITE_BUSY_TIMEOUT_MS = 250
+_DAG_WRITE_RETRY_BASE_SECONDS = 0.05
 
 
 def _build_search_order_by(sort: str | None, recency_expr: str) -> str:
@@ -249,30 +257,70 @@ class SummaryDAG:
     # -- Write --------------------------------------------------------------
 
     def add_node(self, node: SummaryNode) -> int:
-        """Insert a summary node and return its node_id."""
+        """Insert a summary node and return its node_id.
+
+        SQLite's busy handler is bounded so a contended compaction cannot hold a
+        user turn for the connection-wide 30-second default on every attempt.
+        Lock/busy failures are rolled back and retried with short bounded
+        backoff; unrelated database errors retain their original behavior.
+        """
         with self._db_lock:
-            cur = self._conn.execute(
-                """INSERT INTO summary_nodes
-                   (session_id, depth, summary, token_count, source_token_count,
-                    source_ids, source_type, created_at, earliest_at, latest_at, expand_hint)
-                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
-                (
-                    node.session_id,
-                    node.depth,
-                    node.summary,
-                    node.token_count,
-                    node.source_token_count,
-                    json.dumps(node.source_ids),
-                    node.source_type,
-                    node.created_at or time.time(),
-                    node.earliest_at,
-                    node.latest_at,
-                    node.expand_hint,
-                ),
-            )
-            self._conn.commit()
-            node.node_id = cur.lastrowid
-            return node.node_id
+            conn = self._conn
+            if conn is None:
+                raise RuntimeError("SummaryDAG is closed")
+            for attempt in range(_DAG_WRITE_MAX_ATTEMPTS):
+                try:
+                    with _temporary_sqlite_busy_timeout(
+                        [conn], _DAG_WRITE_BUSY_TIMEOUT_MS
+                    ):
+                        cur = conn.execute(
+                            """INSERT INTO summary_nodes
+                               (session_id, depth, summary, token_count, source_token_count,
+                                source_ids, source_type, created_at, earliest_at, latest_at, expand_hint)
+                               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                            (
+                                node.session_id,
+                                node.depth,
+                                node.summary,
+                                node.token_count,
+                                node.source_token_count,
+                                json.dumps(node.source_ids),
+                                node.source_type,
+                                node.created_at or time.time(),
+                                node.earliest_at,
+                                node.latest_at,
+                                node.expand_hint,
+                            ),
+                        )
+                        conn.commit()
+                    node_id = cur.lastrowid
+                    if node_id is None:
+                        raise RuntimeError("Summary DAG insert did not return a node id")
+                    node.node_id = node_id
+                    return node_id
+                except sqlite3.Error as exc:
+                    if not _is_sqlite_locked_error(exc):
+                        raise
+                    try:
+                        conn.rollback()
+                    except sqlite3.Error:
+                        raise exc
+                    if attempt + 1 >= _DAG_WRITE_MAX_ATTEMPTS:
+                        logger.warning(
+                            "Summary DAG write deferred after %d SQLite lock/busy attempts",
+                            _DAG_WRITE_MAX_ATTEMPTS,
+                        )
+                        raise
+                    delay = _DAG_WRITE_RETRY_BASE_SECONDS * (2 ** attempt)
+                    logger.warning(
+                        "Summary DAG write hit SQLite lock/busy contention; "
+                        "retrying attempt %d/%d in %.2fs",
+                        attempt + 2,
+                        _DAG_WRITE_MAX_ATTEMPTS,
+                        delay,
+                    )
+                    time.sleep(delay)
+        raise AssertionError("unreachable")
 
     @staticmethod
     def stage_delete_session_scope(
