@@ -9,9 +9,55 @@ example the session-end timeout budget).
 from __future__ import annotations
 
 import sqlite3
+import threading
 import uuid
-from contextlib import contextmanager
-from typing import Iterator, List
+from contextlib import contextmanager, nullcontext
+from pathlib import Path
+from typing import Any, Iterator, List
+
+
+_PROCESS_SQLITE_WRITE_LOCK_TIMEOUT_SECONDS = 30.0
+_PROCESS_SQLITE_WRITE_LOCKS_GUARD = threading.Lock()
+
+
+class ProcessSQLiteWriteLock:
+    """Reentrant same-process writer gate with a SQLite-aligned wait bound."""
+
+    def __init__(self) -> None:
+        self._lock = threading.RLock()
+
+    def acquire(self, blocking: bool = True, timeout: float = -1) -> bool:
+        return self._lock.acquire(blocking, timeout)
+
+    def release(self) -> None:
+        self._lock.release()
+
+    def _is_owned(self) -> bool:
+        return self._lock._is_owned()
+
+    def __enter__(self) -> "ProcessSQLiteWriteLock":
+        if not self.acquire(timeout=_PROCESS_SQLITE_WRITE_LOCK_TIMEOUT_SECONDS):
+            raise sqlite3.OperationalError(
+                "database is locked: timed out waiting for process-wide SQLite writer"
+            )
+        return self
+
+    def __exit__(self, exc_type: Any, exc: Any, traceback: Any) -> None:
+        self.release()
+
+
+_PROCESS_SQLITE_WRITE_LOCKS: dict[str, ProcessSQLiteWriteLock] = {}
+
+
+def process_sqlite_write_lock(db_path: str | Path) -> ProcessSQLiteWriteLock:
+    """Return the process-wide reentrant writer lock for one SQLite file."""
+    key = str(Path(db_path).expanduser().resolve())
+    with _PROCESS_SQLITE_WRITE_LOCKS_GUARD:
+        lock = _PROCESS_SQLITE_WRITE_LOCKS.get(key)
+        if lock is None:
+            lock = ProcessSQLiteWriteLock()
+            _PROCESS_SQLITE_WRITE_LOCKS[key] = lock
+        return lock
 
 
 def _is_sqlite_locked_error(exc: BaseException) -> bool:
@@ -55,18 +101,21 @@ def _sqlite_savepoint(conn: sqlite3.Connection) -> Iterator[None]:
 def _temporary_sqlite_busy_timeout(
     connections: List[sqlite3.Connection | None],
     timeout_ms: int,
+    *,
+    write_lock: Any = None,
 ) -> Iterator[None]:
-    """Temporarily bound SQLite lock waits for gateway-critical paths."""
-    bounded_timeout = max(0, int(timeout_ms))
-    originals: list[tuple[sqlite3.Connection, int]] = []
-    for conn in connections:
-        if conn is None:
-            continue
-        original = _sqlite_busy_timeout_ms(conn)
-        conn.execute(f"PRAGMA busy_timeout={bounded_timeout}")
-        originals.append((conn, original))
-    try:
-        yield
-    finally:
-        for conn, original in reversed(originals):
-            conn.execute(f"PRAGMA busy_timeout={original}")
+    """Temporarily bound lock waits while excluding same-process writers."""
+    with write_lock if write_lock is not None else nullcontext():
+        bounded_timeout = max(0, int(timeout_ms))
+        originals: list[tuple[sqlite3.Connection, int]] = []
+        for conn in connections:
+            if conn is None:
+                continue
+            original = _sqlite_busy_timeout_ms(conn)
+            conn.execute(f"PRAGMA busy_timeout={bounded_timeout}")
+            originals.append((conn, original))
+        try:
+            yield
+        finally:
+            for conn, original in reversed(originals):
+                conn.execute(f"PRAGMA busy_timeout={original}")

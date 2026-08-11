@@ -12,13 +12,13 @@ from __future__ import annotations
 
 import functools
 import sqlite3
-import threading
 import time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Optional
 
 from .db_bootstrap import configure_connection, refuse_schema_version_too_new, run_versioned_migrations
+from .sqlite_util import process_sqlite_write_lock
 
 
 def _synchronized(method):
@@ -58,12 +58,11 @@ class LifecycleStateStore:
         self.db_path = Path(db_path)
         self.db_path.parent.mkdir(parents=True, exist_ok=True)
         self._conn: Optional[sqlite3.Connection] = None
-        # The connection is opened check_same_thread=False in autocommit mode
-        # and is shared across the gateway thread, dispatcher, and sub-agents.
-        # Serialize read-modify-write flows so concurrent binds/frontier
-        # advances cannot interleave and regress the checkpoint.
-        self._lock = threading.RLock()
-        self._init_db()
+        # Serialize this store's read-modify-write flows and coordinate them
+        # with every other in-process helper writing the same database.
+        self._lock = process_sqlite_write_lock(self.db_path)
+        with self._lock:
+            self._init_db()
         # Lifecycle metrics — registered *after* __init__ succeeds.
         from .lifecycle_metrics import register_lifecycle_state_store_created
         register_lifecycle_state_store_created(self)

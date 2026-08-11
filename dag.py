@@ -14,7 +14,6 @@ Depth semantics:
 import json
 import logging
 import sqlite3
-import threading
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -49,6 +48,7 @@ from .search_query import (
     should_apply_directness_rank_adjustment,
 )
 from .store import _normalize_source_value, _UNKNOWN_SOURCE, _legacy_blank_source_clause
+from .sqlite_util import process_sqlite_write_lock
 
 
 logger = logging.getLogger(__name__)
@@ -163,8 +163,9 @@ class SummaryDAG:
     def __init__(self, db_path: str | Path):
         self.db_path = Path(db_path)
         self._conn: Optional[sqlite3.Connection] = None
-        self._db_lock = threading.RLock()
-        self._init_db()
+        self._db_lock = process_sqlite_write_lock(self.db_path)
+        with self._db_lock:
+            self._init_db()
         # Lifecycle metrics — registered *after* __init__ succeeds.
         from .lifecycle_metrics import register_summary_dag_created
         register_summary_dag_created(self)

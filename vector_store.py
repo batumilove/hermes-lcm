@@ -33,7 +33,7 @@ from .db_bootstrap import (
     verify_chunk_schema,
     verify_embedding_schema,
 )
-from .sqlite_util import _is_sqlite_locked_error
+from .sqlite_util import _is_sqlite_locked_error, process_sqlite_write_lock
 
 logger = logging.getLogger(__name__)
 
@@ -309,7 +309,7 @@ class VectorStore:
             getattr(resolved_config, "embedding_binary_prescreen", False)
         )
         self._conn: Optional[sqlite3.Connection] = None
-        self._write_lock = threading.RLock()
+        self._write_lock = process_sqlite_write_lock(self.db_path)
         self._cache_lock = threading.RLock()
         # Nesting depth for _write_transaction. The outermost entry owns the
         # BEGIN IMMEDIATE/COMMIT (one fsync); a re-entrant inner entry (e.g. a
@@ -335,7 +335,8 @@ class VectorStore:
         self._binary_matrix_cache: "OrderedDict[tuple[str, int], tuple[list[str], Any]]" = OrderedDict()
         self._chunk_binary_matrix_cache: "OrderedDict[tuple[str, int], tuple[list[str], Any]]" = OrderedDict()
         self._chunk_schema_ready = False
-        self._init_db()
+        with self._write_lock:
+            self._init_db()
 
     def _init_db(self) -> None:
         # isolation_level=None (autocommit) so every read runs as its own
