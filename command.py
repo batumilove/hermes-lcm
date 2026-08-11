@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from contextlib import nullcontext
 from datetime import date, datetime, timezone
 from enum import Enum
 from pathlib import Path
@@ -52,6 +53,7 @@ from .maintenance import backup_database, rotate_backup_database
 from . import rollup_builder
 from .rollup_store import RollupStore
 from .session_patterns import build_session_match_keys, matches_session_pattern
+from .sqlite_util import process_sqlite_write_lock
 from .store import build_message_fts_spec
 from .chunking import (
     VALID_CONTENT_POLICIES,
@@ -83,6 +85,16 @@ from .vector_store import EmbeddingIdentity, EmbeddingPublishOutcome, VectorStor
 _EMBEDDING_BACKFILL_CLAIM_KEY = "lcm_embedding_backfill_claim"
 _EMBEDDING_BACKFILL_CLAIM_TTL_S = 10 * 60
 _EMBEDDING_BACKFILL_BATCH_SIZE = 32
+
+
+def _database_write_context(engine, conn: sqlite3.Connection):
+    db_path = getattr(getattr(engine, "_store", None), "db_path", None)
+    if not db_path:
+        row = conn.execute("PRAGMA database_list").fetchone()
+        db_path = row[2] if row and len(row) > 2 else None
+    if not db_path or str(db_path) == ":memory:":
+        return nullcontext()
+    return process_sqlite_write_lock(db_path)
 
 
 def _env_float(key: str, default: float) -> float:
@@ -911,7 +923,10 @@ def _scan_fts_repair(engine) -> dict[str, Any]:
     for label, spec in specs.items():
         try:
             structural_needs_repair = external_content_fts_needs_repair(conn, spec)
-            integrity_check = check_external_content_fts_integrity(conn, spec)
+            # Despite being logically read-only, the FTS5 integrity command is
+            # issued as INSERT and obtains SQLite writer state.
+            with _database_write_context(engine, conn):
+                integrity_check = check_external_content_fts_integrity(conn, spec)
             integrity_status = str(integrity_check.get("status") or "fail")
             needs_repair = structural_needs_repair or integrity_status == "fail"
             content_count = int(conn.execute(
@@ -986,8 +1001,9 @@ def _doctor_repair_apply_text(engine) -> str:
 
     conn = engine._store.connection
     try:
-        messages_result = repair_external_content_fts(conn, build_message_fts_spec())
-        nodes_result = repair_external_content_fts(conn, build_nodes_fts_spec())
+        with _database_write_context(engine, conn):
+            messages_result = repair_external_content_fts(conn, build_message_fts_spec())
+            nodes_result = repair_external_content_fts(conn, build_nodes_fts_spec())
     except sqlite3.Error as exc:
         return "\n".join([
             "LCM doctor repair apply",

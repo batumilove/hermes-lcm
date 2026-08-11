@@ -46,6 +46,7 @@ from .ingest_protection import (
 )
 from .model_routing import apply_lcm_model_route
 from .presets import preset_status_payload
+from .sqlite_util import process_sqlite_write_lock
 from .rollup_periods import (
     CoverageNode,
     RecentPeriodWindow,
@@ -4820,7 +4821,11 @@ def lcm_doctor(args: Dict[str, Any], **kwargs) -> str:
         ("nodes_fts_integrity", engine._dag.connection, build_nodes_fts_spec()),
     ):
         try:
-            fts_integrity = check_external_content_fts_integrity(conn, spec)
+            # FTS5 exposes its integrity check as an INSERT control command.
+            # It rolls back its savepoint, but still requires a writable handle
+            # and can contend with ordinary ingest in another engine clone.
+            with process_sqlite_write_lock(engine._store.db_path):
+                fts_integrity = check_external_content_fts_integrity(conn, spec)
             status = fts_integrity["status"]
             checks.append({
                 "check": check_name,

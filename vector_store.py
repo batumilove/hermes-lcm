@@ -15,7 +15,7 @@ import struct
 import threading
 import uuid
 from collections import OrderedDict
-from contextlib import contextmanager
+from contextlib import contextmanager, nullcontext
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from enum import Enum
@@ -2501,18 +2501,19 @@ class VectorStore:
 
     def close(self) -> None:
         conn = getattr(self, "_conn", None)
-        if conn is not None:
-            try:
-                conn.execute("PRAGMA wal_checkpoint(PASSIVE)")
-            except sqlite3.Error:
-                pass
-            conn.close()
-            self._conn = None
-        with self._cache_lock:
-            self._matrix_cache.clear()
-            self._chunk_matrix_cache.clear()
-            self._binary_matrix_cache.clear()
-            self._chunk_binary_matrix_cache.clear()
+        with getattr(self, "_write_lock", nullcontext()):
+            if conn is not None:
+                try:
+                    conn.execute("PRAGMA wal_checkpoint(PASSIVE)")
+                except sqlite3.Error:
+                    pass
+                conn.close()
+                self._conn = None
+            with self._cache_lock:
+                self._matrix_cache.clear()
+                self._chunk_matrix_cache.clear()
+                self._binary_matrix_cache.clear()
+                self._chunk_binary_matrix_cache.clear()
 
     def __del__(self) -> None:  # pragma: no cover - defensive resource cleanup
         try:

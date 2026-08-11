@@ -9,7 +9,7 @@ from __future__ import annotations
 import logging
 import sqlite3
 import uuid
-from contextlib import contextmanager
+from contextlib import contextmanager, nullcontext
 from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 from typing import Iterator, NamedTuple, Optional, Sequence
@@ -833,13 +833,14 @@ class RollupStore:
 
     def close(self) -> None:
         conn = getattr(self, "_conn", None)
-        if conn is not None:
-            try:
-                conn.execute("PRAGMA wal_checkpoint(PASSIVE)")
-            except sqlite3.Error:
-                pass
-            conn.close()
-            self._conn = None
+        with getattr(self, "_write_lock", nullcontext()):
+            if conn is not None:
+                try:
+                    conn.execute("PRAGMA wal_checkpoint(PASSIVE)")
+                except sqlite3.Error:
+                    pass
+                conn.close()
+                self._conn = None
 
     def __del__(self) -> None:  # pragma: no cover - defensive resource cleanup
         try:

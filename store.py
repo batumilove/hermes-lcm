@@ -13,6 +13,7 @@ import json
 import logging
 import sqlite3
 import time
+from contextlib import nullcontext
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional
 
@@ -1356,7 +1357,8 @@ class MessageStore:
         the private connection. Requires a live connection: a closed store
         raises, matching direct ``_conn.commit()`` use.
         """
-        self._conn.commit()
+        with self._write_lock:
+            self._conn.commit()
 
     def backup(self, dest: sqlite3.Connection) -> None:
         """Copy the store's database into the already-open ``dest`` connection.
@@ -1365,7 +1367,8 @@ class MessageStore:
         store without reaching its private connection. Requires a live
         connection, matching direct ``_conn.backup(dest)`` use.
         """
-        self._conn.backup(dest)
+        with self._write_lock:
+            self._conn.backup(dest)
 
     # -- Lifecycle ----------------------------------------------------------
 
@@ -1379,16 +1382,17 @@ class MessageStore:
         begin_message_store_close(self)
         conn = getattr(self, "_conn", None)
         try:
-            if conn:
-                # Graceful shutdown hygiene: checkpoint committed WAL frames before
-                # releasing the connection.  This does not run on crash/kill, and
-                # PASSIVE can leave frames behind when another reader is active.
-                try:
-                    conn.execute("PRAGMA wal_checkpoint(PASSIVE)")
-                except sqlite3.Error:
-                    pass  # best-effort only; don't let this mask the real close()
-                conn.close()
-                self._conn = None
+            with getattr(self, "_write_lock", nullcontext()):
+                if conn:
+                    # Graceful shutdown hygiene: checkpoint committed WAL frames before
+                    # releasing the connection.  This does not run on crash/kill, and
+                    # PASSIVE can leave frames behind when another reader is active.
+                    try:
+                        conn.execute("PRAGMA wal_checkpoint(PASSIVE)")
+                    except sqlite3.Error:
+                        pass  # best-effort only; don't let this mask the real close()
+                    conn.close()
+                    self._conn = None
         except Exception:
             fail_message_store_close(self)
             raise

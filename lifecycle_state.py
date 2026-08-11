@@ -13,6 +13,7 @@ from __future__ import annotations
 import functools
 import sqlite3
 import time
+from contextlib import nullcontext
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Optional
@@ -90,13 +91,14 @@ class LifecycleStateStore:
         begin_lifecycle_state_store_close(self)
         conn = getattr(self, "_conn", None)
         try:
-            if conn is not None:
-                try:
-                    conn.execute("PRAGMA wal_checkpoint(PASSIVE)")
-                except sqlite3.Error:
-                    pass
-                conn.close()
-                self._conn = None
+            with getattr(self, "_lock", nullcontext()):
+                if conn is not None:
+                    try:
+                        conn.execute("PRAGMA wal_checkpoint(PASSIVE)")
+                    except sqlite3.Error:
+                        pass
+                    conn.close()
+                    self._conn = None
         except Exception:
             fail_lifecycle_state_store_close(self)
             raise
@@ -642,6 +644,7 @@ class LifecycleStateStore:
         self._conn.commit()
         return self.get_by_conversation(conversation_id)
 
+    @_synchronized
     def clear_debt(self, conversation_id: str | None) -> LifecycleState | None:
         if not conversation_id:
             return None
@@ -824,6 +827,7 @@ class LifecycleStateStore:
             conn.rollback()
             raise
 
+    @_synchronized
     def delete_safe_rows_for_sessions(
         self,
         session_ids: set[str] | list[str] | tuple[str, ...],

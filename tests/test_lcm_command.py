@@ -18,6 +18,7 @@ from hermes_lcm.db_bootstrap import check_external_content_fts_integrity
 from hermes_lcm.diagnostics import doctor_guidance_for_check
 from hermes_lcm.engine import LCMEngine
 from hermes_lcm.store import build_message_fts_spec
+from hermes_lcm.sqlite_util import process_sqlite_write_lock
 
 
 @pytest.fixture
@@ -499,6 +500,63 @@ def test_lcm_doctor_tool_reports_heartbeat_noise_as_read_only_payload_detail(eng
         }
     ]
     assert "Still working" not in json.dumps(payload)
+
+
+def test_lcm_doctor_tool_coordinates_write_capable_fts_checks(engine, monkeypatch):
+    coordinator = process_sqlite_write_lock(engine._store.db_path)
+    observations = []
+
+    def probe(conn, spec):
+        observations.append(coordinator._is_owned())
+        return {"status": "pass", "detail": "ok"}
+
+    monkeypatch.setattr(lcm_tools, "check_external_content_fts_integrity", probe)
+
+    json.loads(lcm_tools.lcm_doctor({}, engine=engine))
+
+    assert observations == [True, True]
+
+
+def test_lcm_doctor_repair_scan_coordinates_write_capable_fts_checks(engine, monkeypatch):
+    coordinator = process_sqlite_write_lock(engine._store.db_path)
+    observations = []
+
+    def probe(conn, spec):
+        observations.append(coordinator._is_owned())
+        return {"status": "pass", "detail": "ok"}
+
+    monkeypatch.setattr(command_mod, "check_external_content_fts_integrity", probe)
+
+    handle_lcm_command("doctor repair", engine)
+
+    assert observations == [True, True]
+
+
+def test_lcm_doctor_repair_apply_coordinates_fts_rebuilds(engine, monkeypatch):
+    coordinator = process_sqlite_write_lock(engine._store.db_path)
+    observations = []
+
+    monkeypatch.setattr(
+        command_mod,
+        "backup_database",
+        lambda engine: {
+            "ok": True,
+            "db_path": str(engine._store.db_path),
+            "backup_path": str(engine._store.db_path) + ".backup",
+            "backup_size": 1,
+        },
+    )
+    monkeypatch.setattr(command_mod, "join_background_integrity_scans", lambda: None)
+
+    def probe(conn, spec):
+        observations.append(coordinator._is_owned())
+        return {"rebuilt": False, "degraded": False, "triggers_recreated": False}
+
+    monkeypatch.setattr(command_mod, "repair_external_content_fts", probe)
+
+    handle_lcm_command("doctor repair apply", engine)
+
+    assert observations == [True, True]
 
 
 def test_lcm_doctor_context_pressure_uses_runtime_threshold(tmp_path):
