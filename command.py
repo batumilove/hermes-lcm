@@ -8,6 +8,7 @@ from datetime import date, datetime, timezone
 from enum import Enum
 from pathlib import Path
 import dataclasses
+from functools import wraps
 import json
 import math
 import os
@@ -97,6 +98,30 @@ def _database_write_context(engine, conn: sqlite3.Connection):
     return process_sqlite_write_lock(db_path)
 
 
+def _coordinated_connection_write(method):
+    """Run a connection- or lease-bound write under the process coordinator."""
+
+    @wraps(method)
+    def wrapper(connection_or_owner, *args, **kwargs):
+        conn = getattr(connection_or_owner, "conn", connection_or_owner)
+        with _database_write_context(None, conn):
+            return method(connection_or_owner, *args, **kwargs)
+
+    return wrapper
+
+
+def _coordinated_engine_store_write(method):
+    """Run a direct engine-store transaction under the process coordinator."""
+
+    @wraps(method)
+    def wrapper(engine, *args, **kwargs):
+        conn = engine._store.connection
+        with _database_write_context(engine, conn):
+            return method(engine, *args, **kwargs)
+
+    return wrapper
+
+
 def _env_float(key: str, default: float) -> float:
     raw = os.environ.get(key)
     if raw is None:
@@ -126,6 +151,7 @@ def _embedding_backfill_budget_s() -> float:
     return _env_float("LCM_EMBEDDING_BACKFILL_BUDGET_S", 0.0)
 
 
+@_coordinated_connection_write
 def _ensure_inflight_table(conn: sqlite3.Connection) -> None:
     expected_columns = (
         ("embedded_id", "TEXT", 0, None, 1),
@@ -1851,6 +1877,7 @@ def _doctor_retention_text(engine) -> str:
     return "\n".join(lines)
 
 
+@_coordinated_engine_store_write
 def _delete_clean_candidates_atomically(engine, session_ids: set[str]) -> dict[str, int]:
     """Delete cleanup candidates in one SQLite transaction.
 
@@ -2930,6 +2957,7 @@ class _BackfillLease:
             sort_keys=True,
         )
 
+    @_coordinated_connection_write
     def renew(self, *, now: float | None = None, force: bool = False) -> bool:
         now = time.time() if now is None else float(now)
         if not force and (now - self._last_heartbeat) < self.heartbeat_s:
@@ -2954,6 +2982,7 @@ class _BackfillLease:
         self._last_heartbeat = now
         return True
 
+    @_coordinated_connection_write
     def release(self) -> None:
         self.conn.execute(
             """
@@ -2966,6 +2995,7 @@ class _BackfillLease:
         )
 
 
+@_coordinated_connection_write
 def _acquire_embedding_backfill_lease(
     conn: sqlite3.Connection,
     *,
@@ -3010,6 +3040,7 @@ def _acquire_embedding_backfill_lease(
         raise
 
 
+@_coordinated_connection_write
 def _prepare_inflight_for_lease(
     conn: sqlite3.Connection,
     identity_hash: str,
@@ -3113,6 +3144,7 @@ def _prepare_inflight_for_lease(
         raise
 
 
+@_coordinated_connection_write
 def _mark_inflight(
     conn: sqlite3.Connection,
     identity_hash: str,
@@ -3189,6 +3221,7 @@ def _mark_inflight(
         raise
 
 
+@_coordinated_connection_write
 def _mark_dispatched(
     conn: sqlite3.Connection,
     identity_hash: str,
@@ -3245,6 +3278,7 @@ def _mark_dispatched(
         raise
 
 
+@_coordinated_connection_write
 def _owned_inflight_transition(
     conn: sqlite3.Connection,
     identity_hash: str,

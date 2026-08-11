@@ -8,6 +8,7 @@ import time
 
 import pytest
 
+from hermes_lcm import command as command_mod
 from hermes_lcm import db_bootstrap, maintenance, sqlite_util
 from hermes_lcm.dag import SummaryDAG, SummaryNode
 from hermes_lcm.lifecycle_state import LifecycleStateStore
@@ -547,3 +548,101 @@ def test_concurrent_backup_during_write_is_serialized(tmp_path):
         assert snapshot.execute("PRAGMA quick_check").fetchone()[0] == "ok"
     finally:
         snapshot.close()
+
+
+def test_command_embedding_write_transactions_hold_database_coordinator(tmp_path):
+    db_path = tmp_path / "lcm.db"
+    real_connection = sqlite3.connect(db_path, isolation_level=None)
+    real_connection.execute(
+        "CREATE TABLE metadata(key TEXT PRIMARY KEY, value TEXT NOT NULL)"
+    )
+    coordinator = sqlite_util.process_sqlite_write_lock(db_path)
+    observations = []
+
+    class ProbeConnection:
+        def execute(self, sql, *args, **kwargs):
+            normalized = " ".join(str(sql).split()).upper()
+            if normalized.startswith(
+                ("BEGIN", "CREATE", "INSERT", "UPDATE", "DELETE", "DROP", "ALTER")
+            ):
+                observations.append(coordinator._is_owned())
+            return real_connection.execute(sql, *args, **kwargs)
+
+        def __getattr__(self, name):
+            return getattr(real_connection, name)
+
+    connection = ProbeConnection()
+    try:
+        command_mod._ensure_inflight_table(connection)
+        lease = command_mod._acquire_embedding_backfill_lease(
+            connection, ttl_s=60.0, heartbeat_s=1.0, now=1.0
+        )
+        assert lease is not None
+        command_mod._prepare_inflight_for_lease(connection, "identity", lease)
+        command_mod._mark_inflight(
+            connection, "identity", lease, ["node-1"], now=2.0
+        )
+        assert command_mod._mark_dispatched(
+            connection, "identity", lease, ["node-1"], "request-1"
+        ) == 1
+        assert command_mod._owned_inflight_transition(
+            connection,
+            "identity",
+            lease,
+            "request-1",
+            embedded_id="node-1",
+        )
+        assert lease.renew(now=3.0, force=True)
+        lease.release()
+    finally:
+        real_connection.close()
+
+    assert observations
+    assert all(observations)
+
+
+def test_command_atomic_cleanup_holds_database_coordinator(tmp_path):
+    db_path = tmp_path / "lcm.db"
+    store = MessageStore(db_path)
+    dag = SummaryDAG(db_path)
+    lifecycle = LifecycleStateStore(db_path)
+    coordinator = sqlite_util.process_sqlite_write_lock(db_path)
+    real_connection = store._conn
+    observations = []
+
+    class ProbeConnection:
+        def execute(self, sql, *args, **kwargs):
+            normalized = " ".join(str(sql).split()).upper()
+            if normalized.startswith(
+                ("BEGIN", "CREATE", "INSERT", "UPDATE", "DELETE", "DROP", "ALTER")
+            ):
+                observations.append(coordinator._is_owned())
+            return real_connection.execute(sql, *args, **kwargs)
+
+        def __getattr__(self, name):
+            return getattr(real_connection, name)
+
+    class ProbeEngine:
+        _store = store
+        _dag = dag
+        _lifecycle = lifecycle
+        _session_id = "active-session"
+
+    store._conn = ProbeConnection()
+    try:
+        deleted = command_mod._delete_clean_candidates_atomically(
+            ProbeEngine(), {"inactive-session"}
+        )
+    finally:
+        store.close()
+        dag.close()
+        lifecycle.close()
+
+    assert deleted == {
+        "messages_deleted": 0,
+        "nodes_deleted": 0,
+        "lifecycle_deleted": 0,
+        "lifecycle_skipped": 0,
+    }
+    assert observations
+    assert all(observations)
