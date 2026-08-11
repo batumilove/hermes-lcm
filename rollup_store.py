@@ -8,7 +8,6 @@ from __future__ import annotations
 
 import logging
 import sqlite3
-import threading
 import uuid
 from contextlib import contextmanager
 from datetime import date, datetime, timedelta, timezone
@@ -23,7 +22,7 @@ from .db_bootstrap import (
     run_versioned_migrations,
     verify_temporal_rollup_schema,
 )
-from .sqlite_util import _is_sqlite_locked_error
+from .sqlite_util import _is_sqlite_locked_error, process_sqlite_write_lock
 
 logger = logging.getLogger(__name__)
 
@@ -56,8 +55,9 @@ class RollupStore:
         self.db_path = Path(db_path)
         self.db_path.parent.mkdir(parents=True, exist_ok=True)
         self._conn: Optional[sqlite3.Connection] = None
-        self._write_lock = threading.RLock()
-        self._init_db()
+        self._write_lock = process_sqlite_write_lock(self.db_path)
+        with self._write_lock:
+            self._init_db()
 
     def _init_db(self) -> None:
         self._conn = sqlite3.connect(

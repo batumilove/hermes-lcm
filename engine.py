@@ -3029,6 +3029,7 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
                     getattr(self._lifecycle, "_conn", None),
                 ],
                 _SESSION_END_BUSY_TIMEOUT_MS,
+                write_lock=getattr(self._store, "_write_lock", None),
             ):
                 try:
                     # Best-effort final flush. Keep this path bounded because

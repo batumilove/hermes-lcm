@@ -12,7 +12,6 @@ row identity (`store_id`) for DAG/source lookup.
 import json
 import logging
 import sqlite3
-import threading
 import time
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional
@@ -46,6 +45,7 @@ from .search_query import (
     should_apply_directness_rank_adjustment,
 )
 from .message_content import normalize_content_value as _normalize_content_value
+from .sqlite_util import process_sqlite_write_lock
 from .tokens import count_message_tokens
 
 logger = logging.getLogger(__name__)
@@ -235,14 +235,13 @@ class MessageStore:
         # 28 bytes of the database file replaced with a TLS record header +
         # ciphertext while the "SQLit" magic remains intact).
         #
-        # This re-entrant lock is defense-in-depth: it forces all write call
-        # sites that use ``self._conn`` to be serialized at the Python layer,
-        # eliminating any window where Python-side buffer reuse or memory
-        # aliasing could intersect SQLite's flush of a write. It does not
-        # change semantics for single-threaded callers and adds only a single
-        # uncontended ``RLock.acquire``/``release`` pair per operation.
-        self._write_lock = threading.RLock()
-        self._init_db()
+        # Coordinate every in-process helper/clone that writes this database,
+        # not only callers sharing this connection. SQLite still arbitrates
+        # external processes; this gate removes self-contention between the
+        # gateway's many per-agent LCM clones.
+        self._write_lock = process_sqlite_write_lock(self.db_path)
+        with self._write_lock:
+            self._init_db()
         # Lifecycle metrics — registered *after* __init__ succeeds so a
         # construction failure cannot inflate live counts.
         from .lifecycle_metrics import register_message_store_created
