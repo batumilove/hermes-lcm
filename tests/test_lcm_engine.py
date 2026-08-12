@@ -11534,7 +11534,12 @@ class TestEngineCompress:
 
         import hermes_lcm.compaction as compaction_module
 
-        monkeypatch.setattr(compaction_module.time, "monotonic", fake_monotonic)
+        class FakeCompactionTime:
+            monotonic = staticmethod(fake_monotonic)
+            perf_counter = staticmethod(time.perf_counter)
+            time = staticmethod(time.time)
+
+        monkeypatch.setattr(compaction_module, "time", FakeCompactionTime)
         monkeypatch.setattr(instance, "_summarize_leaf_chunk_with_rescue", fake_leaf)
         try:
             instance.compress(messages, current_tokens=count_messages_tokens(messages))
@@ -23146,8 +23151,9 @@ class TestEngineTools:
 
         assert result["results"][0]["type"] == "summary"
         assert result["results"][0]["snippet"].startswith("Summary: keep hermes-lcm external")
-        assert result["results"][1]["type"] == "message"
-        assert result["results"][1]["role"] == "user"
+        # The indexed conjunction excludes the vague partial message hit.
+        assert result["total_results"] == 1
+        assert [item["type"] for item in result["results"]] == ["summary"]
 
     def test_handle_grep_hybrid_prefers_much_better_summary_over_vague_recent_user_hit(self, engine):
         store_id = engine._store.append(
@@ -23178,8 +23184,9 @@ class TestEngineTools:
 
         assert result["results"][0]["type"] == "summary"
         assert result["results"][0]["snippet"].startswith("Summary: keep hermes-lcm external")
-        assert result["results"][1]["type"] == "message"
-        assert result["results"][1]["role"] == "user"
+        # Hybrid inherits the FTS arm's conjunctive filtering.
+        assert result["total_results"] == 1
+        assert [item["type"] for item in result["results"]] == ["summary"]
 
     def test_handle_grep_hybrid_does_not_let_weak_summary_beat_stronger_message_hit(self, engine):
         engine._store.append(
