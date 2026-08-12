@@ -433,6 +433,21 @@ class TestConcurrency:
             for clone in clones:
                 clone.shutdown()
 
+    def test_independent_roots_keep_distinct_storage_stacks(self, tmp_path):
+        """Shared ownership is family-scoped, never global across roots."""
+        first = _make_engine(tmp_path, "independent-roots")
+        second = _make_engine(tmp_path, "independent-roots")
+        try:
+            assert first._storage_owner is not second._storage_owner
+            assert first._store is not second._store
+            assert first._dag is not second._dag
+            assert first._lifecycle is not second._lifecycle
+            first.shutdown()
+            assert second._store._conn is not None
+        finally:
+            first.shutdown()
+            second.shutdown()
+
     def test_concurrent_engine_creation_and_shutdown(self, tmp_path):
         before = _snapshot()["runtime_lifecycle"]
         errors = []
@@ -478,6 +493,32 @@ class TestConcurrency:
 
 
 class TestFailureAndRegistryCounters:
+    def test_shared_owner_attempts_every_close_and_raises_first_error(self):
+        from hermes_lcm.engine import _SharedStorageOwner
+
+        calls = []
+
+        class BrokenHelper:
+            def __init__(self, name):
+                self.name = name
+
+            def close(self):
+                calls.append(self.name)
+                raise RuntimeError(f"{self.name} close failed")
+
+        owner = _SharedStorageOwner(
+            BrokenHelper("store"),
+            BrokenHelper("dag"),
+            BrokenHelper("lifecycle"),
+        )
+
+        with pytest.raises(RuntimeError, match="store close failed"):
+            owner.release()
+
+        assert calls == ["store", "dag", "lifecycle"]
+        owner.release()
+        assert calls == ["store", "dag", "lifecycle"]
+
     def test_helper_close_failure_is_not_reported_as_closed(self):
         from hermes_lcm.store import MessageStore
 

@@ -11,6 +11,11 @@ import os
 
 logger = logging.getLogger(__name__)
 
+# ``PluginManager.discover_and_load(force=True)`` can invoke register() again
+# in the same process. Keep only the current process-root engine here so a
+# superseded root releases its shared-storage reference after replacement.
+_registered_root_engine = None
+
 
 def _env_flag_enabled(name: str, default: bool = False) -> bool:
     value = os.environ.get(name)
@@ -47,6 +52,16 @@ def _host_forwards_registered_tool_messages(ctx) -> bool:
     return bool(capability)
 
 
+def _host_registered_context_engine(ctx):
+    """Read back the engine accepted by supported host registration contexts."""
+    if hasattr(ctx, "engine"):
+        return getattr(ctx, "engine", None)
+    manager = getattr(ctx, "_manager", None)
+    if manager is not None and hasattr(manager, "_context_engine"):
+        return getattr(manager, "_context_engine", None)
+    return None
+
+
 def _engine_bound_session_id(engine) -> str:
     """Return the lifecycle/ingest session bound on an LCM engine.
 
@@ -80,6 +95,8 @@ def _ensure_engine_bound_to_session(
 
 def register(ctx):
     """Plugin entry point — register the LCM context engine and tools."""
+    global _registered_root_engine
+
     from .lifecycle_metrics import configure_from_host_policy
     from .config import LCMConfig
     from .engine import LCMEngine, resolve_active_lcm_engine
@@ -110,8 +127,29 @@ def register(ctx):
 
     engine = LCMEngine(config=config, hermes_home=hermes_home)
 
-    # Register as the context engine (replaces ContextCompressor)
-    ctx.register_context_engine(engine)
+    # Registration is transactional from the plugin's perspective: publish the
+    # replacement first, then retire the superseded root. This prevents a
+    # failed registration from destroying the previously usable engine while
+    # ensuring force-rediscovery cannot accumulate orphan SQLite connections.
+    try:
+        ctx.register_context_engine(engine)
+    except Exception:
+        engine.shutdown()
+        raise
+    registered_engine = _host_registered_context_engine(ctx)
+    if registered_engine is not None and registered_engine is not engine:
+        engine.shutdown()
+        return
+    previous_engine = _registered_root_engine
+    _registered_root_engine = engine
+    if previous_engine is not None and previous_engine is not engine:
+        try:
+            previous_engine.shutdown()
+        except Exception:
+            logger.warning(
+                "LCM superseded root engine shutdown failed during plugin rediscovery",
+                exc_info=True,
+            )
 
     # Subscribe to the host's explicit subagent lifecycle events when available.
     # These carry the child_session_id/parent_session_id linkage directly, so LCM
