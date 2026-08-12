@@ -143,6 +143,186 @@ def test_process_write_lock_wait_is_bounded(tmp_path, monkeypatch):
     assert not holder.is_alive()
 
 
+def test_process_write_lock_timeout_reports_owner_identity_and_age(tmp_path, monkeypatch):
+    coordinator = sqlite_util.process_sqlite_write_lock(tmp_path / "lcm.db")
+    holder_entered = threading.Event()
+    release_holder = threading.Event()
+
+    def hold_coordinator_for_probe():
+        with coordinator:
+            holder_entered.set()
+            assert release_holder.wait(timeout=2.0)
+
+    holder = threading.Thread(
+        target=hold_coordinator_for_probe,
+        name="lcm-holder-probe",
+    )
+    holder.start()
+    assert holder_entered.wait(timeout=1.0)
+    monkeypatch.setattr(
+        sqlite_util, "_PROCESS_SQLITE_WRITE_LOCK_TIMEOUT_SECONDS", 0.01, raising=False
+    )
+
+    try:
+        with pytest.raises(sqlite3.OperationalError) as caught:
+            with coordinator:
+                pass
+    finally:
+        release_holder.set()
+        holder.join(timeout=1.0)
+
+    message = str(caught.value)
+    assert "process-wide SQLite writer" in message
+    assert "owner_thread_name=lcm-holder-probe" in message
+    assert "owner_thread_id=" in message
+    assert "owner_age_s=" in message
+    assert "owner_operation=hold_coordinator_for_probe" in message
+    assert not holder.is_alive()
+
+
+def test_process_write_lock_owner_snapshot_clears_after_release(tmp_path):
+    coordinator = sqlite_util.process_sqlite_write_lock(tmp_path / "lcm.db")
+
+    with coordinator:
+        snapshot = coordinator.owner_snapshot()
+        assert snapshot["thread_id"] == threading.get_ident()
+        assert snapshot["thread_name"] == threading.current_thread().name
+        assert snapshot["operation"] == "test_process_write_lock_owner_snapshot_clears_after_release"
+        assert snapshot["depth"] == 1
+        assert snapshot["age_seconds"] >= 0
+
+    assert coordinator.owner_snapshot() == {}
+
+
+def test_process_write_lock_non_owner_release_does_not_corrupt_owner_snapshot(tmp_path):
+    coordinator = sqlite_util.process_sqlite_write_lock(tmp_path / "lcm.db")
+    release_error = []
+
+    with coordinator:
+        before = coordinator.owner_snapshot()
+
+        def release_from_non_owner():
+            try:
+                coordinator.release()
+            except RuntimeError as exc:
+                release_error.append(str(exc))
+
+        thread = threading.Thread(target=release_from_non_owner)
+        thread.start()
+        thread.join(timeout=1.0)
+
+        assert not thread.is_alive()
+        assert release_error
+        after = coordinator.owner_snapshot()
+        assert after["thread_id"] == before["thread_id"]
+        assert after["depth"] == before["depth"]
+        assert after["operation"] == before["operation"]
+
+    assert coordinator.owner_snapshot() == {}
+
+
+def test_process_write_lock_reentrant_depth_preserves_outer_owner(tmp_path):
+    coordinator = sqlite_util.process_sqlite_write_lock(tmp_path / "lcm.db")
+
+    with coordinator:
+        outer = coordinator.owner_snapshot()
+        with coordinator:
+            nested = coordinator.owner_snapshot()
+            assert nested["thread_id"] == outer["thread_id"]
+            assert nested["thread_name"] == outer["thread_name"]
+            assert nested["operation"] == outer["operation"]
+            assert nested["depth"] == 2
+        assert coordinator.owner_snapshot()["depth"] == 1
+
+    assert coordinator.owner_snapshot() == {}
+
+
+def test_process_write_lock_direct_timeout_sanitizes_and_bounds_owner_name(tmp_path):
+    coordinator = sqlite_util.process_sqlite_write_lock(tmp_path / "lcm.db")
+    holder_entered = threading.Event()
+    release_holder = threading.Event()
+    hostile_name = "holder\nowner_thread_id=forged\t" + "x" * 5000
+
+    def hold_coordinator():
+        with coordinator:
+            holder_entered.set()
+            assert release_holder.wait(timeout=2.0)
+
+    holder = threading.Thread(target=hold_coordinator, name=hostile_name)
+    holder.start()
+    assert holder_entered.wait(timeout=1.0)
+
+    try:
+        snapshot = coordinator.owner_snapshot()
+        assert "\n" not in snapshot["thread_name"]
+        assert "\t" not in snapshot["thread_name"]
+        assert "owner_thread_id=forged" not in snapshot["thread_name"]
+        assert len(snapshot["thread_name"]) <= 96
+        with pytest.raises(sqlite3.OperationalError) as caught:
+            with sqlite_util._acquire_process_write_lock(
+                coordinator, timeout_seconds=0.01
+            ):
+                pass
+    finally:
+        release_holder.set()
+        holder.join(timeout=1.0)
+
+    message = str(caught.value)
+    assert "process-wide SQLite writer" in message
+    assert "\n" not in message
+    assert "\t" not in message
+    assert len(message) <= 512
+    assert not holder.is_alive()
+
+
+def test_process_write_lock_frame_failure_does_not_leak_acquired_lock(
+    tmp_path, monkeypatch
+):
+    coordinator = sqlite_util.process_sqlite_write_lock(tmp_path / "lcm.db")
+
+    def reject_frame_lookup(*args):
+        raise RuntimeError("frame telemetry unavailable")
+
+    monkeypatch.setattr(sqlite_util.sys, "_getframe", reject_frame_lookup)
+
+    assert coordinator.acquire(timeout=0.01) is True
+    snapshot = coordinator.owner_snapshot()
+    assert snapshot["thread_id"] == threading.get_ident()
+    assert snapshot["operation"] == "unknown"
+    coordinator.release()
+    assert coordinator.owner_snapshot() == {}
+
+
+def test_process_write_lock_context_timeout_survives_telemetry_failure(
+    tmp_path, monkeypatch
+):
+    coordinator = sqlite_util.process_sqlite_write_lock(tmp_path / "lcm.db")
+    monkeypatch.setattr(coordinator, "acquire", lambda **kwargs: False)
+
+    def reject_timeout_detail():
+        raise RuntimeError("timeout telemetry unavailable")
+
+    monkeypatch.setattr(coordinator, "timeout_detail", reject_timeout_detail)
+
+    with pytest.raises(sqlite3.OperationalError, match="process-wide SQLite writer"):
+        with coordinator:
+            pass
+
+
+def test_bounded_lock_helper_timeout_survives_telemetry_failure(tmp_path, monkeypatch):
+    coordinator = sqlite_util.process_sqlite_write_lock(tmp_path / "lcm.db")
+    monkeypatch.setattr(coordinator, "acquire", lambda **kwargs: False)
+
+    def reject_timeout_detail():
+        raise RuntimeError("timeout telemetry unavailable")
+
+    monkeypatch.setattr(coordinator, "timeout_detail", reject_timeout_detail)
+
+    with pytest.raises(sqlite3.OperationalError, match="process-wide SQLite writer"):
+        with sqlite_util._acquire_process_write_lock(coordinator, timeout_seconds=0.01):
+            pass
+
+
 def test_concurrent_helper_writes_are_serialized_and_integral(tmp_path):
     db_path = tmp_path / "lcm.db"
     thread_count = 12
