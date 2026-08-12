@@ -85,14 +85,20 @@ class ProcessSQLiteWriteLock:
         self._owner_acquired_at = 0.0
         self._owner_depth = 0
 
-    def acquire(self, blocking: bool = True, timeout: float = -1) -> bool:
+    def acquire(
+        self,
+        blocking: bool = True,
+        timeout: float = -1,
+        *,
+        operation: str | None = None,
+    ) -> bool:
         thread_id = threading.get_ident()
         try:
             thread_name = threading.current_thread().name
         except Exception:
             thread_name = "unknown"
         thread_name = _bounded_diagnostic_label(thread_name)
-        operation = _lock_operation_label()
+        operation = _bounded_diagnostic_label(operation or _lock_operation_label())
         acquired = self._lock.acquire(blocking, timeout)
         if not acquired:
             return False
@@ -164,6 +170,22 @@ class ProcessSQLiteWriteLock:
 
     def __exit__(self, exc_type: Any, exc: Any, traceback: Any) -> None:
         self.release()
+
+    @contextmanager
+    def attributed(self, operation: str) -> Iterator["ProcessSQLiteWriteLock"]:
+        """Hold the coordinator with an explicit bounded operation label."""
+        if not self.acquire(
+            timeout=_PROCESS_SQLITE_WRITE_LOCK_TIMEOUT_SECONDS,
+            operation=operation,
+        ):
+            raise sqlite3.OperationalError(
+                "database is locked: timed out waiting for process-wide SQLite writer"
+                + _optional_timeout_detail(self)
+            )
+        try:
+            yield self
+        finally:
+            self.release()
 
 
 _PROCESS_SQLITE_WRITE_LOCKS: dict[str, ProcessSQLiteWriteLock] = {}
