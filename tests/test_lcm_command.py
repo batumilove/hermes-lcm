@@ -1871,6 +1871,97 @@ def test_register_skips_lcm_slash_command_by_default(tmp_path, monkeypatch):
     assert "lcm" not in ctx.commands
 
 
+def test_repeated_register_shuts_down_superseded_root_engine(tmp_path, monkeypatch):
+    """Plugin rediscovery must not strand the previous root SQLite stack."""
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / "hermes_home"))
+    monkeypatch.delenv("LCM_ENABLE_SLASH_COMMAND", raising=False)
+
+    spec = importlib.util.spec_from_file_location(
+        "hermes_lcm_init_runtime_rediscovery",
+        str(Path(__file__).resolve().parent.parent / "__init__.py"),
+        submodule_search_locations=[str(Path(__file__).resolve().parent.parent)],
+    )
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[spec.name] = module
+    assert spec.loader is not None
+    spec.loader.exec_module(module)
+
+    class _Ctx:
+        def __init__(self):
+            self.engine = None
+
+        def register_context_engine(self, engine):
+            self.engine = engine
+
+        def register_tool(self, name, toolset, schema, handler, description="", emoji=""):
+            pass
+
+    first_ctx = _Ctx()
+    module.register(first_ctx)
+    first = first_ctx.engine
+    assert first._store._conn is not None
+
+    second_ctx = _Ctx()
+    module.register(second_ctx)
+    second = second_ctx.engine
+    try:
+        assert second is not first
+        assert first._store._conn is None
+        assert first._dag._conn is None
+        assert first._lifecycle._conn is None
+        assert second._store._conn is not None
+    finally:
+        second.shutdown()
+
+
+def test_rejected_reregistration_keeps_previous_root_and_closes_rejected_engine(
+    tmp_path, monkeypatch
+):
+    """A host collision must not retire the still-registered root engine."""
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / "hermes_home"))
+    monkeypatch.delenv("LCM_ENABLE_SLASH_COMMAND", raising=False)
+
+    spec = importlib.util.spec_from_file_location(
+        "hermes_lcm_init_runtime_rejected_rediscovery",
+        str(Path(__file__).resolve().parent.parent / "__init__.py"),
+        submodule_search_locations=[str(Path(__file__).resolve().parent.parent)],
+    )
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[spec.name] = module
+    assert spec.loader is not None
+    spec.loader.exec_module(module)
+
+    class _Ctx:
+        def __init__(self, *, accept=True, registered=None):
+            self.accept = accept
+            self.engine = registered
+            self.attempted = None
+
+        def register_context_engine(self, engine):
+            self.attempted = engine
+            if self.accept:
+                self.engine = engine
+
+        def register_tool(self, name, toolset, schema, handler, description="", emoji=""):
+            pass
+
+    first_ctx = _Ctx()
+    module.register(first_ctx)
+    first = first_ctx.engine
+
+    rejected_ctx = _Ctx(accept=False, registered=first)
+    module.register(rejected_ctx)
+    rejected = rejected_ctx.attempted
+    try:
+        assert rejected is not first
+        assert rejected_ctx.engine is first
+        assert first._store._conn is not None
+        assert rejected._store._conn is None
+        assert module._registered_root_engine is first
+    finally:
+        first.shutdown()
+
+
 def test_register_allows_lcm_slash_command_when_explicitly_enabled(tmp_path, monkeypatch):
     monkeypatch.setenv("HERMES_HOME", str(tmp_path / "hermes_home"))
     monkeypatch.setenv("LCM_ENABLE_SLASH_COMMAND", "1")
