@@ -146,6 +146,43 @@ _PRESERVED_TODO_CONTEXT_PREFIX = "[Your active task list was preserved across co
 _LCM_MESSAGE_PREFIX_FINGERPRINT_LIMIT = 8
 
 
+class _SharedStorageOwner:
+    """Reference-count one SQLite helper stack across related agent runtimes."""
+
+    def __init__(self, store: MessageStore, dag: SummaryDAG, lifecycle: LifecycleStateStore):
+        self.store = store
+        self.dag = dag
+        self.lifecycle = lifecycle
+        self._lock = threading.Lock()
+        self._references = 1
+        self._closed = False
+
+    def acquire(self) -> "_SharedStorageOwner":
+        with self._lock:
+            if self._closed:
+                raise RuntimeError("cannot acquire closed LCM storage")
+            self._references += 1
+        return self
+
+    def release(self) -> None:
+        with self._lock:
+            if self._references <= 0:
+                return
+            self._references -= 1
+            if self._references != 0:
+                return
+            self._closed = True
+        first_error: Exception | None = None
+        for helper in (self.store, self.dag, self.lifecycle):
+            try:
+                helper.close()
+            except Exception as exc:
+                if first_error is None:
+                    first_error = exc
+        if first_error is not None:
+            raise first_error
+
+
 class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessionMixin, PlaceholderLedgerMixin, BypassMixin, ContextEngine):
     """Lossless Context Management engine.
 
@@ -165,12 +202,17 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
     """
 
     def __init__(self, config: LCMConfig | None = None,
-                 hermes_home: str = ""):
+                 hermes_home: str = "", *,
+                 _shared_storage: _SharedStorageOwner | None = None):
         self._config = config or LCMConfig.from_env()
         self._hermes_home = hermes_home
 
         db_path = self._resolve_db_path(hermes_home)
-        self._bind_storage(db_path, hermes_home)
+        self._storage_released = False
+        if _shared_storage is None:
+            self._bind_storage(db_path, hermes_home)
+        else:
+            self._adopt_storage(_shared_storage)
 
         self._session_id: str = ""
         self._session_platform: str = ""
@@ -399,6 +441,7 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
         clone = type(self)(
             config=copy.deepcopy(self._config),
             hermes_home=self._hermes_home,
+            _shared_storage=self._storage_owner,
         )
         clone.model = self.model
         clone.base_url = self.base_url
@@ -462,20 +505,57 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
             # this engine can publish or delete a DAG node.
             initialize_rollup_invalidation_outbox(self._dag)
         self._lifecycle = LifecycleStateStore(db_path)
+        self._storage_owner = _SharedStorageOwner(
+            self._store,
+            self._dag,
+            self._lifecycle,
+        )
+        self._storage_released = False
         # Lifecycle metrics: record one storage bind.
         from .lifecycle_metrics import record_storage_bind
         record_storage_bind()
 
+    def _adopt_storage(self, owner: _SharedStorageOwner) -> None:
+        """Acquire an existing helper stack without sharing engine runtime state."""
+        self._storage_owner = owner.acquire()
+        self._storage_released = False
+        self._store = owner.store
+        self._dag = owner.dag
+        self._lifecycle = owner.lifecycle
+
+    def _release_storage(self) -> None:
+        if getattr(self, "_storage_released", False):
+            return
+        self._storage_released = True
+        owner = getattr(self, "_storage_owner", None)
+        if owner is not None:
+            owner.release()
+            return
+        # Compatibility for partially constructed test doubles and hosts that
+        # restored an engine serialized before shared ownership existed.
+        first_error: Exception | None = None
+        for helper in (
+            getattr(self, "_store", None),
+            getattr(self, "_dag", None),
+            getattr(self, "_lifecycle", None),
+        ):
+            close = getattr(helper, "close", None)
+            if not callable(close):
+                continue
+            try:
+                close()
+            except Exception as exc:
+                if first_error is None:
+                    first_error = exc
+        if first_error is not None:
+            raise first_error
+
     def _close_storage(self) -> None:
         """Best-effort close of currently bound SQLite helpers."""
-        for attr in ("_store", "_dag", "_lifecycle"):
-            helper = getattr(self, attr, None)
-            close = getattr(helper, "close", None)
-            if callable(close):
-                try:
-                    close()
-                except Exception:
-                    logger.debug("LCM failed closing %s during profile rebind", attr, exc_info=True)
+        try:
+            self._release_storage()
+        except Exception:
+            logger.debug("LCM failed closing storage during profile rebind", exc_info=True)
 
     def _reset_profile_runtime_state(self) -> None:
         """Clear process-local session state that cannot cross profile homes."""
@@ -538,10 +618,9 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
             current_store_home = str(getattr(getattr(self, "_store", None), "_hermes_home", "") or "")
             if current_home == str(hermes_home) and current_store_home == str(hermes_home):
                 return False
+            self._close_storage()
             self._hermes_home = hermes_home
-            store = getattr(self, "_store", None)
-            if store is not None:
-                store._hermes_home = hermes_home
+            self._bind_storage(self._resolve_db_path(hermes_home), hermes_home)
             self._reset_profile_runtime_state()
             logger.info("LCM rebound Hermes home for configured database path %s", hermes_home)
             return True
@@ -6003,9 +6082,7 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
         transition = begin_engine_shutdown(self)
         try:
             self._unregister_active_engine_binding()
-            self._store.close()
-            self._dag.close()
-            self._lifecycle.close()
+            self._release_storage()
         except Exception:
             if transition:
                 fail_engine_shutdown(self)
