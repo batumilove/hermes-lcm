@@ -1,17 +1,24 @@
 """Tests for /lcm command surface and diagnostics."""
 
+import json
 from pathlib import Path
 import importlib.util
 import sqlite3
 import sys
+from types import SimpleNamespace
 
 import pytest
 
+from hermes_lcm import tools as lcm_tools
 import hermes_lcm.command as command_mod
 from hermes_lcm.command import _fmt_size, handle_lcm_command
 from hermes_lcm.config import LCMConfig
 from hermes_lcm.dag import SummaryNode
+from hermes_lcm.db_bootstrap import check_external_content_fts_integrity
+from hermes_lcm.diagnostics import doctor_guidance_for_check
 from hermes_lcm.engine import LCMEngine
+from hermes_lcm.store import build_message_fts_spec
+from hermes_lcm.sqlite_util import process_sqlite_write_lock
 
 
 @pytest.fixture
@@ -22,9 +29,39 @@ def engine(tmp_path):
     e = LCMEngine(config=config, hermes_home=str(hermes_home))
     e._session_id = "test-session"
     e._session_platform = "telegram"
-    e.context_length = 200000
-    e.threshold_tokens = int(200000 * config.context_threshold)
+    e.update_model(
+        "gpt-test",
+        200000,
+        provider="openai-codex",
+        api_mode="responses",
+    )
     return e
+
+
+def _replace_with_header_only_sqlite_db(e: LCMEngine) -> Path:
+    """Replace the active DB file with a valid SQLite header and no tables."""
+    db_path = Path(e._store.db_path)
+    e.shutdown()
+    for path in (db_path, Path(str(db_path) + "-wal"), Path(str(db_path) + "-shm")):
+        path.unlink(missing_ok=True)
+    with sqlite3.connect(str(db_path)) as conn:
+        conn.execute("PRAGMA user_version = 2")
+        conn.commit()
+    e._store._conn = sqlite3.connect(str(db_path), timeout=5.0, check_same_thread=False)
+    e._dag._conn = sqlite3.connect(str(db_path), timeout=5.0, check_same_thread=False)
+    e._lifecycle._conn = sqlite3.connect(
+        str(db_path),
+        timeout=30.0,
+        check_same_thread=False,
+        isolation_level=None,
+    )
+    e._lifecycle._conn.row_factory = sqlite3.Row
+    return db_path
+
+
+def test_lcm_engine_declares_automatic_compaction_silent(engine):
+    assert engine.emit_automatic_compaction_status is False
+    assert engine.quiet_mode is True
 
 
 def test_lcm_status_default_reports_current_session(engine):
@@ -36,8 +73,265 @@ def test_lcm_status_default_reports_current_session(engine):
     assert "cache_metrics_available: no" in result
     assert "last_cache_read_tokens: 0" in result
     assert "last_cache_write_tokens: 0" in result
+    assert "last_compression_status: idle" in result
+    assert "last_compression_noop_reason: (none)" in result
+    assert "model: gpt-test" in result
+    assert "provider: openai-codex" in result
+    assert "context_length: 200000" in result
+    assert "context_length_source: update_model" in result
+    assert f"context_threshold: {engine._config.context_threshold}" in result
+    assert f"threshold_tokens: {int(200000 * engine._config.context_threshold)}" in result
     assert "store_messages: 0" in result
     assert "dag_nodes: 0" in result
+
+
+def test_lcm_status_json_reports_runtime_context_indicators(engine):
+    status = engine.get_status()
+    payload = json.loads(lcm_tools.lcm_status({}, engine=engine))
+
+    assert status["model"] == "gpt-test"
+    assert status["provider"] == "openai-codex"
+    assert status["context_length"] == 200000
+    assert status["context_length_source"] == "update_model"
+    assert status["context_threshold"] == engine._config.context_threshold
+    assert status["threshold_tokens"] == int(200000 * engine._config.context_threshold)
+    assert payload["model"] == "gpt-test"
+    assert payload["provider"] == "openai-codex"
+    assert payload["context_length"] == 200000
+    assert payload["context_length_source"] == "update_model"
+    assert payload["context_threshold"] == engine._config.context_threshold
+    assert payload["threshold_tokens"] == int(200000 * engine._config.context_threshold)
+
+
+def test_lcm_status_uses_dag_aggregates_without_loading_all_nodes(engine, monkeypatch):
+    engine._dag.add_node(SummaryNode(
+        session_id="test-session",
+        depth=0,
+        summary="leaf",
+        token_count=10,
+        source_token_count=100,
+        source_ids=[1],
+        source_type="messages",
+        created_at=1.0,
+        expand_hint="Expand for details about: leaf",
+    ))
+    engine._dag.add_node(SummaryNode(
+        session_id="test-session",
+        depth=1,
+        summary="parent",
+        token_count=5,
+        source_token_count=100,
+        source_ids=[1],
+        source_type="nodes",
+        created_at=2.0,
+        expand_hint="Expand for details about: parent",
+    ))
+
+    def fail_get_session_nodes(*_args, **_kwargs):
+        raise AssertionError("status should use aggregate DAG queries")
+
+    monkeypatch.setattr(engine._dag, "get_session_nodes", fail_get_session_nodes)
+
+    status = engine.get_status()
+    payload = json.loads(lcm_tools.lcm_status({}, engine=engine))
+
+    assert status["dag_nodes"] == 2
+    assert payload["dag"]["total_nodes"] == 2
+    assert payload["dag"]["total_tokens"] == 15
+    assert payload["dag"]["depths"] == {
+        "d0": {"count": 1, "tokens": 10, "source_tokens": 100},
+        "d1": {"count": 1, "tokens": 5, "source_tokens": 100},
+    }
+
+
+def test_lcm_describe_overview_uses_dag_aggregates_without_loading_all_nodes(engine, monkeypatch):
+    for idx in range(25):
+        engine._dag.add_node(SummaryNode(
+            session_id="test-session",
+            depth=0,
+            summary=f"leaf {idx}",
+            token_count=idx + 1,
+            source_token_count=10,
+            source_ids=[idx + 1],
+            source_type="messages",
+            created_at=float(idx + 1),
+            expand_hint=f"Expand for details about: leaf {idx}",
+        ))
+    engine._dag.add_node(SummaryNode(
+        session_id="test-session",
+        depth=1,
+        summary="parent",
+        token_count=7,
+        source_token_count=250,
+        source_ids=[1, 2],
+        source_type="nodes",
+        created_at=30.0,
+        expand_hint="Expand for details about: parent",
+    ))
+
+    def fail_get_session_nodes(*_args, **_kwargs):
+        raise AssertionError("describe overview should use aggregate DAG queries")
+
+    monkeypatch.setattr(engine._dag, "get_session_nodes", fail_get_session_nodes)
+
+    overview = json.loads(lcm_tools.lcm_describe({}, engine=engine))
+
+    assert overview["depths"]["d0"]["count"] == 25
+    assert overview["depths"]["d0"]["total_tokens"] == sum(range(1, 26))
+    assert overview["depths"]["d0"]["total_source_tokens"] == 250
+    assert len(overview["depths"]["d0"]["nodes"]) == 20
+    assert overview["depths"]["d1"]["count"] == 1
+    assert overview["depths"]["d1"]["nodes"][0]["expand_hint"] == "Expand for details about: parent"
+
+
+def test_lcm_status_and_describe_count_more_than_default_node_page(engine):
+    node_count = 1005
+    for idx in range(node_count):
+        engine._dag.add_node(SummaryNode(
+            session_id="test-session",
+            depth=0,
+            summary=f"leaf {idx}",
+            token_count=1,
+            source_token_count=2,
+            source_ids=[idx + 1],
+            source_type="messages",
+            created_at=float(idx + 1),
+            expand_hint=f"Expand for details about: leaf {idx}",
+        ))
+
+    status = engine.get_status()
+    payload = json.loads(lcm_tools.lcm_status({}, engine=engine))
+    overview = json.loads(lcm_tools.lcm_describe({}, engine=engine))
+
+    assert status["dag_nodes"] == node_count
+    assert payload["dag"]["total_nodes"] == node_count
+    assert payload["dag"]["depths"]["d0"] == {
+        "count": node_count,
+        "tokens": node_count,
+        "source_tokens": node_count * 2,
+    }
+    assert overview["depths"]["d0"]["count"] == node_count
+    assert overview["depths"]["d0"]["total_tokens"] == node_count
+    assert overview["depths"]["d0"]["total_source_tokens"] == node_count * 2
+    assert len(overview["depths"]["d0"]["nodes"]) == 20
+
+
+def test_lcm_status_json_reports_effective_config_sources(tmp_path, monkeypatch):
+    hermes_home = tmp_path / "hermes_home"
+    hermes_home.mkdir()
+    (hermes_home / "config.yaml").write_text(
+        "lcm:\n"
+        "  context_threshold: 0.61\n"
+        "  fresh_tail_count: 999\n"
+        "compression:\n"
+        "  threshold: 0.92\n"
+        "auxiliary:\n"
+        "  compression:\n"
+        "    timeout: 42\n"
+    )
+    monkeypatch.setenv("HERMES_HOME", str(hermes_home))
+    monkeypatch.delenv("LCM_CONTEXT_THRESHOLD", raising=False)
+    monkeypatch.delenv("LCM_SUMMARY_TIMEOUT_MS", raising=False)
+    monkeypatch.setenv("LCM_SUMMARY_SPEND_MAX_CALLS", "0")
+    monkeypatch.setenv("LCM_SUMMARY_SPEND_WINDOW_SECONDS", "123.5")
+    monkeypatch.setenv("LCM_SUMMARY_SPEND_BACKOFF_SECONDS", "456.5")
+    monkeypatch.setenv("LCM_FRESH_TAIL_COUNT", "17")
+
+    config = LCMConfig.from_env()
+    config.database_path = str(tmp_path / "lcm_sources.db")
+    engine = LCMEngine(config=config, hermes_home=str(hermes_home))
+    engine.on_session_start("source-session", platform="telegram", context_length=100000)
+
+    payload = json.loads(lcm_tools.lcm_status({}, engine=engine))
+
+    assert payload["config"]["fresh_tail_count"] == 17
+    assert payload["config"]["context_threshold"] == 0.61
+    assert payload["config"]["summary_timeout_ms"] == 42000
+    assert payload["config"]["summary_spend_max_calls"] == 0
+    assert payload["config"]["summary_spend_window_seconds"] == 123.5
+    assert payload["config"]["summary_spend_backoff_seconds"] == 456.5
+    assert payload["config_sources"]["fresh_tail_count"] == "env:LCM_FRESH_TAIL_COUNT"
+    assert payload["config_sources"]["context_threshold"] == "config_yaml:lcm.context_threshold"
+    assert payload["config_sources"]["summary_timeout_ms"] == "config_yaml:auxiliary.compression.timeout"
+    assert payload["config_sources"]["summary_spend_max_calls"] == "env:LCM_SUMMARY_SPEND_MAX_CALLS"
+    assert payload["config_sources"]["summary_spend_window_seconds"] == "env:LCM_SUMMARY_SPEND_WINDOW_SECONDS"
+    assert payload["config_sources"]["summary_spend_backoff_seconds"] == "env:LCM_SUMMARY_SPEND_BACKOFF_SECONDS"
+    assert engine._summary_spend_guard.max_calls == 0
+    assert "fresh_tail_count" in payload["ignored_config_yaml_lcm_keys"]
+
+
+def test_lcm_status_does_not_report_invalid_env_as_effective_source(tmp_path, monkeypatch):
+    hermes_home = tmp_path / "hermes_home"
+    hermes_home.mkdir()
+    monkeypatch.setenv("HERMES_HOME", str(hermes_home))
+    monkeypatch.setenv("LCM_LEAF_CHUNK_TOKENS", "not-an-int")
+    monkeypatch.delenv("LCM_CONTEXT_THRESHOLD", raising=False)
+
+    config = LCMConfig.from_env()
+    config.database_path = str(tmp_path / "lcm_invalid_source.db")
+    engine = LCMEngine(config=config, hermes_home=str(hermes_home))
+    engine.on_session_start("invalid-source-session", platform="telegram", context_length=100000)
+
+    payload = json.loads(lcm_tools.lcm_status({}, engine=engine))
+
+    assert payload["config"]["leaf_chunk_tokens"] == 20000
+    assert payload["config_sources"]["leaf_chunk_tokens"] == "default"
+    assert any("LCM_LEAF_CHUNK_TOKENS" in warning for warning in payload["config_source_warnings"])
+
+
+def test_lcm_status_text_reports_config_source_for_context_threshold(tmp_path, monkeypatch):
+    hermes_home = tmp_path / "hermes_home"
+    hermes_home.mkdir()
+    (hermes_home / "config.yaml").write_text("compression:\n  threshold: 0.44\n")
+    monkeypatch.setenv("HERMES_HOME", str(hermes_home))
+    monkeypatch.delenv("LCM_CONTEXT_THRESHOLD", raising=False)
+
+    config = LCMConfig.from_env()
+    config.database_path = str(tmp_path / "lcm_text_source.db")
+    engine = LCMEngine(config=config, hermes_home=str(hermes_home))
+    engine.on_session_start("text-source-session", platform="telegram", context_length=100000)
+
+    result = handle_lcm_command("status", engine)
+
+    assert "context_threshold: 0.44" in result
+    assert "context_threshold_source: config_yaml:compression.threshold" in result
+
+
+def test_lcm_doctor_warns_about_ignored_lcm_config_yaml_keys(tmp_path, monkeypatch):
+    hermes_home = tmp_path / "hermes_home"
+    hermes_home.mkdir()
+    (hermes_home / "config.yaml").write_text(
+        "lcm:\n"
+        "  context_threshold: 0.52\n"
+        "  leaf_chunk_tokens: 12345\n"
+    )
+    monkeypatch.setenv("HERMES_HOME", str(hermes_home))
+    monkeypatch.delenv("LCM_CONTEXT_THRESHOLD", raising=False)
+
+    config = LCMConfig.from_env()
+    config.database_path = str(tmp_path / "lcm_doctor_source.db")
+    engine = LCMEngine(config=config, hermes_home=str(hermes_home))
+    engine.on_session_start("doctor-source-session", platform="telegram", context_length=100000)
+
+    payload = json.loads(lcm_tools.lcm_doctor({}, engine=engine))
+    config_check = next(c for c in payload["checks"] if c["check"] == "config_validation")
+
+    assert payload["overall"] == "warnings"
+    assert config_check["status"] == "warn"
+    assert any("lcm.leaf_chunk_tokens" in warning for warning in config_check["detail"])
+
+
+def test_lcm_status_reports_last_compression_noop_reason(engine):
+    engine._last_compression_status = "noop"
+    engine._last_compression_noop_reason = "no eligible raw backlog outside fresh tail"
+
+    result = handle_lcm_command("status", engine)
+
+    assert "last_compression_status: noop" in result
+    assert (
+        "last_compression_noop_reason: no eligible raw backlog outside fresh tail"
+        in result
+    )
 
 
 def test_lcm_status_reports_cache_usage_metrics_when_host_provides_them(engine):
@@ -106,6 +400,11 @@ def test_lcm_status_explains_unbound_runtime_before_first_session(tmp_path):
     assert "LCM status" in result
     assert "session_id: (unbound)" in result
     assert "session_platform: (unbound)" in result
+    assert "model: (uninitialized)" in result
+    assert "provider: (uninitialized)" in result
+    assert "context_length: (uninitialized)" in result
+    assert "context_length_source: (uninitialized)" in result
+    assert f"context_threshold: {engine._config.context_threshold}" in result
     assert "threshold_tokens: (uninitialized)" in result
     assert "\nmessage_sessions_total:" not in result
     assert "\nmessages_total:" not in result
@@ -119,7 +418,7 @@ def test_lcm_status_reports_runtime_identity(engine):
     repo_root = Path(__file__).resolve().parent.parent
 
     assert "plugin_name: hermes-lcm" in result
-    assert "plugin_version: 0.10.2" in result
+    assert "plugin_version: 0.20.0" in result
     assert f"plugin_path: {repo_root}" in result
     assert "module_path:" in result
     assert "database_path_source: config.database_path" in result
@@ -159,9 +458,260 @@ def test_lcm_doctor_reports_health_checks(engine):
     assert "messages_fts: ok" in result
     assert "nodes_fts: ok" in result
     assert "plugin_name: hermes-lcm" in result
-    assert "plugin_version: 0.10.2" in result
+    assert "plugin_version: 0.20.0" in result
     assert f"plugin_path: {repo_root}" in result
     assert "plugin_git_commit:" in result
+    assert "triage_guidance:\n- none" in result
+
+
+def test_lcm_doctor_reports_heartbeat_noise_rows_without_mutating_or_leaking_content(engine):
+    engine._store.append("heartbeat-session", {"role": "assistant", "content": "Still working..."}, token_estimate=2)
+    engine._store.append("heartbeat-session", {"role": "user", "content": "Still working..."}, token_estimate=2)
+    before = engine._store.get_session_count("heartbeat-session")
+
+    result = handle_lcm_command("doctor", engine)
+    after = engine._store.get_session_count("heartbeat-session")
+
+    assert after == before
+    assert "heartbeat_noise_rows:" in result
+    assert "heartbeat_progress" in result
+    assert "Still working" not in result
+
+
+def test_lcm_doctor_tool_reports_heartbeat_noise_as_read_only_payload_detail(engine):
+    engine._store.append("heartbeat-session", {"role": "assistant", "content": "Still working..."}, token_estimate=2)
+    engine._store.append("heartbeat-session", {"role": "user", "content": "Still working..."}, token_estimate=2)
+
+    doctor = json.loads(lcm_tools.lcm_doctor({}, engine=engine))
+    payload = next(check for check in doctor["checks"] if check["check"] == "payload_storage")
+    rows = payload["detail"]["heartbeat_noise_rows"]
+
+    assert payload["status"] == "warn"
+    assert rows == [
+        {
+            "store_id": 1,
+            "session_id": "heartbeat-session",
+            "source": "unknown",
+            "role": "assistant",
+            "field": "content",
+            "length": 16,
+            "content_len": 16,
+            "suspicious_category": "heartbeat_progress",
+        }
+    ]
+    assert "Still working" not in json.dumps(payload)
+
+
+def test_lcm_doctor_tool_coordinates_write_capable_fts_checks(engine, monkeypatch):
+    coordinator = process_sqlite_write_lock(engine._store.db_path)
+    observations = []
+
+    def probe(conn, spec):
+        observations.append(coordinator._is_owned())
+        return {"status": "pass", "detail": "ok"}
+
+    monkeypatch.setattr(lcm_tools, "check_external_content_fts_integrity", probe)
+
+    json.loads(lcm_tools.lcm_doctor({}, engine=engine))
+
+    assert observations == [True, True]
+
+
+def test_lcm_doctor_repair_scan_coordinates_write_capable_fts_checks(engine, monkeypatch):
+    coordinator = process_sqlite_write_lock(engine._store.db_path)
+    observations = []
+
+    def probe(conn, spec):
+        observations.append(coordinator._is_owned())
+        return {"status": "pass", "detail": "ok"}
+
+    monkeypatch.setattr(command_mod, "check_external_content_fts_integrity", probe)
+
+    handle_lcm_command("doctor repair", engine)
+
+    assert observations == [True, True]
+
+
+def test_lcm_doctor_repair_apply_coordinates_fts_rebuilds(engine, monkeypatch):
+    coordinator = process_sqlite_write_lock(engine._store.db_path)
+    observations = []
+
+    monkeypatch.setattr(
+        command_mod,
+        "backup_database",
+        lambda engine: {
+            "ok": True,
+            "db_path": str(engine._store.db_path),
+            "backup_path": str(engine._store.db_path) + ".backup",
+            "backup_size": 1,
+        },
+    )
+    monkeypatch.setattr(command_mod, "join_background_integrity_scans", lambda: None)
+
+    def probe(conn, spec):
+        observations.append(coordinator._is_owned())
+        return {"rebuilt": False, "degraded": False, "triggers_recreated": False}
+
+    monkeypatch.setattr(command_mod, "repair_external_content_fts", probe)
+
+    handle_lcm_command("doctor repair apply", engine)
+
+    assert observations == [True, True]
+
+
+def test_lcm_doctor_context_pressure_uses_runtime_threshold(tmp_path):
+    config = LCMConfig(
+        context_threshold=0.68,
+        database_path=str(tmp_path / "doctor-runtime-threshold.db"),
+    )
+    config.config_sources["context_threshold"] = "config_yaml:compression.threshold"
+    engine = LCMEngine(config=config)
+    try:
+        engine.update_model("gpt-5.5", 400_000, provider="openai-codex")
+        engine.last_prompt_tokens = 225_000
+
+        doctor = json.loads(lcm_tools.lcm_doctor({}, engine=engine))
+        pressure = next(check for check in doctor["checks"] if check["check"] == "context_pressure")
+
+        assert pressure["status"] == "pass"
+        assert pressure["detail"] == "82.7% used, compaction triggers at 85.0%"
+    finally:
+        engine.shutdown()
+
+
+def test_lcm_doctor_config_validation_uses_runtime_threshold_for_autoraised_context(tmp_path):
+    config = LCMConfig(
+        context_threshold=0.20,
+        database_path=str(tmp_path / "doctor-runtime-validation.db"),
+    )
+    config.config_sources["context_threshold"] = "config_yaml:compression.threshold"
+    engine = LCMEngine(config=config)
+    try:
+        engine.update_model("gpt-5.5", 400_000, provider="openai-codex")
+
+        doctor = json.loads(lcm_tools.lcm_doctor({}, engine=engine))
+        validation = next(check for check in doctor["checks"] if check["check"] == "config_validation")
+
+        assert engine.context_threshold == 0.85
+        assert validation["status"] == "pass"
+        assert validation["detail"] == "all settings within normal ranges"
+    finally:
+        engine.shutdown()
+
+
+def test_lcm_doctor_text_reports_missing_externalized_payload_refs(engine):
+    storage_dir = Path(engine._hermes_home) / "lcm-large-outputs"
+    storage_dir.mkdir(parents=True)
+    (storage_dir / "referenced.json").write_text(json.dumps({"content": "stored", "content_chars": 6}))
+    (storage_dir / "unreferenced.json").write_text(json.dumps({"content": "orphaned", "content_chars": 8}))
+    engine._store.append(
+        "externalized-integrity-session",
+        {
+            "role": "assistant",
+            "content": "\n".join(
+                [
+                    "[Externalized LCM ingest payload: kind=ingest_payload; field=content; chars=6; bytes=6; ref=referenced.json]",
+                    "[GC'd externalized payload: kind=raw_payload; role=assistant; chars=10; ref=missing.json]",
+                ]
+            ),
+        },
+        token_estimate=2,
+    )
+
+    result = handle_lcm_command("doctor", engine)
+
+    assert "externalized_payload_refs_total: 2" in result
+    assert "externalized_payload_refs_existing: 1" in result
+    assert "externalized_payload_refs_missing: 1" in result
+    assert "externalized_payload_files_unreferenced: 1" in result
+    assert "missing_externalized_payload_refs:" in result
+    assert "missing.json" in result
+    assert "inspect missing externalized payload refs and restore from backups if needed" in result
+    assert "stored" not in result
+    assert "orphaned" not in result
+
+
+def test_lcm_doctor_finds_heartbeat_noise_after_many_short_nonmatches(engine):
+    for idx in range(120):
+        engine._store.append(
+            "heartbeat-session",
+            {"role": "assistant", "content": f"normal short status {idx}"},
+            token_estimate=2,
+        )
+    engine._store.append("heartbeat-session", {"role": "assistant", "content": "Still working..."}, token_estimate=2)
+
+    doctor = json.loads(lcm_tools.lcm_doctor({}, engine=engine))
+    payload = next(check for check in doctor["checks"] if check["check"] == "payload_storage")
+    rows = payload["detail"]["heartbeat_noise_rows"]
+
+    assert payload["status"] == "warn"
+    assert len(rows) == 1
+    assert rows[0]["suspicious_category"] == "heartbeat_progress"
+    assert rows[0]["store_id"] == 121
+    assert "Still working" not in json.dumps(payload)
+
+
+def test_lcm_doctor_flags_header_only_database_schema(engine):
+    db_path = _replace_with_header_only_sqlite_db(engine)
+
+    result = handle_lcm_command("doctor", engine)
+
+    assert "LCM doctor" in result
+    assert "status: issues-found" in result
+    assert f"database_path: {db_path}" in result
+    assert "schema_core_tables: missing" in result
+    assert "schema_missing_tables:" in result
+    assert "messages" in result
+    assert "summary_nodes" in result
+    assert "lcm_lifecycle_state" in result
+    assert "verify HERMES_HOME/LCM_DATABASE_PATH point at the database inspected by Hermes" in result
+
+
+def test_lcm_doctor_tool_flags_header_only_database_schema(engine):
+    db_path = _replace_with_header_only_sqlite_db(engine)
+
+    doctor = json.loads(lcm_tools.lcm_doctor({}, engine=engine))
+    schema_check = next(check for check in doctor["checks"] if check["check"] == "schema_core_tables")
+
+    assert doctor["overall"] == "unhealthy"
+    assert schema_check["status"] == "fail"
+    assert schema_check["detail"]["database_path"] == str(db_path)
+    assert schema_check["detail"]["existing_tables"] == []
+    assert "messages" in schema_check["detail"]["missing_tables"]
+    assert "summary_nodes" in schema_check["detail"]["missing_tables"]
+    assert "lcm_lifecycle_state" in schema_check["detail"]["missing_tables"]
+
+
+def test_lcm_doctor_handles_closed_store_connection(engine):
+    db_path = Path(engine._store.db_path)
+    engine.shutdown()
+
+    result = handle_lcm_command("doctor", engine)
+
+    assert "LCM doctor" in result
+    assert "status: issues-found" in result
+    assert f"database_path: {db_path}" in result
+    assert "schema_core_tables: error:" in result
+    assert "LCM store connection is not initialized" in result
+
+
+def test_lcm_doctor_prioritizes_schema_inspection_error(engine, monkeypatch):
+    def _schema_error(_conn, *, database_path="", required_tables=()):
+        return {
+            "database_path": database_path,
+            "required_tables": ["messages"],
+            "existing_tables": [],
+            "missing_tables": ["messages"],
+            "error": "database disk image is malformed",
+        }
+
+    monkeypatch.setattr(command_mod, "inspect_lcm_schema_health", _schema_error)
+
+    result = handle_lcm_command("doctor", engine)
+
+    assert "schema_core_tables: error: database disk image is malformed" in result
+    assert "schema_core_tables: missing" not in result
+    assert "verify SQLite can read sqlite_master for the database inspected by Hermes" in result
 
 
 def test_lcm_doctor_distinguishes_observations_from_recommended_actions(tmp_path):
@@ -185,6 +735,161 @@ def test_lcm_doctor_distinguishes_observations_from_recommended_actions(tmp_path
     assert "cleanup_candidates" in result
     assert "/lcm doctor clean" in result
     assert "/lcm backup" in result
+    assert "triage_guidance:" in result
+    assert "cleanup_candidates: backup-first cleanup" in result
+
+
+def test_lcm_doctor_tool_guidance_maps_warning_classes_to_operator_actions(engine):
+    engine._store.append("heartbeat-session", {"role": "assistant", "content": "Still working..."}, token_estimate=2)
+    engine._dag.add_node(
+        SummaryNode(
+            session_id="test-session",
+            depth=0,
+            summary="tiny",
+            token_count=1,
+            source_token_count=500,
+            source_ids=[],
+            source_type="messages",
+            created_at=0,
+        )
+    )
+
+    doctor = json.loads(lcm_tools.lcm_doctor({}, engine=engine))
+    guidance = {item["check"]: item for item in doctor["guidance"]}
+
+    assert guidance["payload_storage"]["action"] == "safe/ignore"
+    assert guidance["summary_quality"]["action"] == "inspect"
+    assert guidance["summary_quality"]["warning_only"] is True
+
+
+def test_lcm_doctor_payload_failure_guidance_requires_inspection():
+    guidance = doctor_guidance_for_check({
+        "check": "payload_storage",
+        "status": "fail",
+        "detail": "sqlite read error",
+    })
+
+    assert guidance is not None
+    assert guidance["action"] == "inspect"
+    assert guidance["warning_only"] is False
+    assert "could not read" in guidance["rationale"]
+
+
+def test_lcm_doctor_lifecycle_failure_guidance_requires_inspection():
+    guidance = doctor_guidance_for_check({
+        "check": "lifecycle_fragmentation",
+        "status": "fail",
+        "detail": {"error": "lifecycle read error"},
+    })
+
+    assert guidance is not None
+    assert guidance["action"] == "inspect"
+    assert guidance["warning_only"] is False
+    assert "could not read" in guidance["rationale"]
+
+
+@pytest.mark.parametrize("check_name", ["orphaned_dag_nodes", "summary_quality"])
+def test_lcm_doctor_dag_failure_guidance_requires_inspection(check_name):
+    guidance = doctor_guidance_for_check({
+        "check": check_name,
+        "status": "fail",
+        "detail": "dag read error",
+    })
+
+    assert guidance is not None
+    assert guidance["action"] == "inspect"
+    assert guidance["warning_only"] is False
+    assert "could not read" in guidance["rationale"]
+
+
+def test_lcm_doctor_source_lineage_failure_guidance_requires_inspection():
+    guidance = doctor_guidance_for_check({
+        "check": "source_lineage_hygiene",
+        "status": "fail",
+        "detail": "sqlite read error",
+    })
+
+    assert guidance is not None
+    assert guidance["action"] == "inspect"
+    assert "safe to ignore" not in guidance["operator_action"]
+    assert "source-lineage" in guidance["operator_action"]
+    assert guidance["warning_only"] is False
+
+
+def test_lcm_doctor_source_lineage_warning_preserves_legacy_blank_source_guidance():
+    guidance = doctor_guidance_for_check({
+        "check": "source_lineage_hygiene",
+        "status": "warn",
+        "detail": {"legacy_blank_source_messages": 2},
+    })
+
+    assert guidance is not None
+    assert guidance["action"] == "safe/ignore"
+    assert "legacy blank-source" in guidance["operator_action"]
+
+
+def test_lcm_doctor_tool_source_lineage_read_error_guidance_requires_inspection(engine, monkeypatch):
+    def fail_source_stats():
+        raise RuntimeError("sqlite read error")
+
+    monkeypatch.setattr(engine._store, "get_source_stats", fail_source_stats)
+
+    doctor = json.loads(lcm_tools.lcm_doctor({}, engine=engine))
+    guidance = {item["check"]: item for item in doctor["guidance"]}
+
+    assert doctor["overall"] == "unhealthy"
+    assert guidance["source_lineage_hygiene"]["action"] == "inspect"
+    assert "safe to ignore" not in guidance["source_lineage_hygiene"]["operator_action"]
+    assert "source-lineage" in guidance["source_lineage_hygiene"]["operator_action"]
+
+
+def test_lcm_doctor_command_lifecycle_read_error_guidance_is_failure(engine, monkeypatch):
+    def fail_lifecycle_stats(*_args, **_kwargs):
+        raise RuntimeError("lifecycle read error")
+
+    monkeypatch.setattr(engine._lifecycle, "get_fragmentation_stats", fail_lifecycle_stats)
+
+    result = handle_lcm_command("doctor", engine)
+
+    assert "status: issues-found" in result
+    assert "lifecycle_fragmentation: inspect —" in result
+    assert "lifecycle_fragmentation: inspect warning-only" not in result
+
+
+def test_lcm_doctor_command_payload_read_error_guidance_is_failure(engine, monkeypatch):
+    def fail_payload_scan(*_args, **_kwargs):
+        raise RuntimeError("payload read error")
+
+    monkeypatch.setattr(command_mod, "scan_sqlite_payload_risks", fail_payload_scan)
+
+    result = handle_lcm_command("doctor", engine)
+
+    assert "status: issues-found" in result
+    assert "payload_storage_error: payload read error" in result
+    assert "payload_storage: inspect —" in result
+    assert "payload_storage: inspect warning-only" not in result
+
+
+def test_lcm_doctor_command_payload_warning_drives_action_recommended(engine, monkeypatch):
+    def payload_warning(*_args, **_kwargs):
+        return {
+            "largest_content_rows": [],
+            "largest_tool_calls_rows": [],
+            "suspicious_data_uri_content_rows": [],
+            "suspicious_data_uri_tool_calls_rows": [],
+            "suspicious_base64_like_rows": [{"store_id": 1, "chars": 24000}],
+            "quarantined_assistant_rows": [],
+            "suspicious_repetitive_assistant_rows": [],
+            "heartbeat_noise_rows": [],
+        }
+
+    monkeypatch.setattr(command_mod, "scan_sqlite_payload_risks", payload_warning)
+
+    result = handle_lcm_command("doctor", engine)
+
+    assert "status: action-recommended" in result
+    assert "payload_storage: 1 suspicious inline/base64 payload row(s) need review" in result
+    assert "payload_storage: inspect warning-only" in result
 
 
 def test_lcm_doctor_reports_legacy_blank_source_as_observation_without_warning(engine):
@@ -311,16 +1016,22 @@ def test_lcm_doctor_reports_lifecycle_fragmentation_as_read_only_observation(eng
     assert "status: action-recommended" in result
     assert "lifecycle_fragmentation:" in result
     assert "lifecycle_rows=2" in result
+    assert "empty_lifecycle_rows=1" in result
     assert "current_missing_in_lcm_any=1" in result
     assert "current_missing_in_state=1" in result
     assert "node_sessions_missing_in_state=1" in result
     assert "state_sessions_missing_in_lcm_any=1" in result
+    assert "lifecycle_fragmentation_classification: warn; 4 categories need review" in result
+    assert "lifecycle_category stale_lifecycle_current: count=1 sample=missing-current" in result
+    assert "lifecycle_category stale_lifecycle_finalized: count=1 sample=missing-final" in result
+    assert "lifecycle_category lcm_node_sessions_missing_in_state: count=1 sample=node-missing-in-state" in result
+    assert "lifecycle_category state_only_sessions: count=1 sample=state-only" in result
     assert "inspect lifecycle fragmentation before any cleanup/repair behavior mutates state" in result
     assert "read-only" in result
     assert engine._lifecycle.row_count() == 2
 
 
-def test_lcm_doctor_warns_on_lcm_sessions_without_lifecycle_references(engine):
+def test_lcm_doctor_reports_lcm_sessions_without_lifecycle_references_as_observations(engine):
     engine.on_session_start("current-session", platform="cli", context_length=200000)
     engine._store.append("current-session", {"role": "user", "content": "covered"}, source="cli")
     engine._store.append("message-only-session", {"role": "user", "content": "missing lifecycle"}, source="cli")
@@ -337,11 +1048,14 @@ def test_lcm_doctor_warns_on_lcm_sessions_without_lifecycle_references(engine):
 
     result = handle_lcm_command("doctor", engine)
 
-    assert "status: action-recommended" in result
+    assert "status: ok" in result
+    assert "lifecycle_fragmentation: lifecycle_rows=1" in result
+    assert "empty_lifecycle_rows=0" in result
     assert "message_sessions_without_lifecycle_current=1" in result
     assert "message_sessions_without_lifecycle_reference=1" in result
     assert "node_sessions_without_lifecycle_reference=1" in result
-    assert "inspect lifecycle fragmentation before any cleanup/repair behavior mutates state" in result
+    assert "lifecycle_fragmentation_classification: notice; 2 categories need review" in result
+    assert "triage_guidance:\n- none" in result
 
 
 def test_lcm_doctor_does_not_warn_on_last_finalized_message_session(engine):
@@ -373,18 +1087,116 @@ def test_lcm_help_on_unknown_subcommand(engine):
     assert "Unknown subcommand: wat" in result
     assert "/lcm status" in result
     assert "/lcm doctor" in result
+    assert "/lcm doctor clean lifecycle" in result
+    assert "/lcm doctor clean lifecycle apply" in result
 
 
 def test_lcm_doctor_clean_rejects_unknown_extra_args(engine):
     result = handle_lcm_command("doctor clean foo", engine)
 
-    assert "currently supports `clean`, `clean apply`, `repair`, `repair apply`, `source`, `source apply`, and `retention`" in result
+    assert "currently supports `clean`, `clean apply`, `clean lifecycle`, `clean lifecycle apply`, `repair`, `repair apply`, `repair schema-stamp`, `repair schema-stamp apply`, `source`, `source apply`, and `retention`" in result
     assert "/lcm doctor clean apply" in result
+    assert "/lcm doctor clean lifecycle" in result
+    assert "/lcm doctor clean lifecycle apply" in result
     assert "/lcm doctor repair" in result
     assert "/lcm doctor repair apply" in result
     assert "/lcm doctor source" in result
     assert "/lcm doctor source apply" in result
     assert "/lcm doctor retention" in result
+
+
+def test_lcm_doctor_text_reports_same_count_stale_message_fts(engine):
+    engine._store.append(
+        "test-session",
+        {"role": "user", "content": "original searchable content"},
+        token_estimate=1,
+    )
+    engine._store._conn.execute("DROP TRIGGER msg_fts_update")
+    engine._store._conn.execute(
+        "UPDATE messages SET content = ? WHERE session_id = ?",
+        ("changed content", "test-session"),
+    )
+    engine._store._conn.commit()
+
+    fts_integrity = check_external_content_fts_integrity(engine._store._conn, build_message_fts_spec())
+    json_result = json.loads(lcm_tools.lcm_doctor({}, engine=engine))
+    text_result = handle_lcm_command("doctor", engine)
+
+    assert fts_integrity["status"] == "fail"
+    messages_check = next(check for check in json_result["checks"] if check["check"] == "messages_fts_integrity")
+    assert messages_check["status"] == "fail"
+    assert "status: issues-found" in text_result
+    assert "messages_fts: fail" in text_result
+    assert "/lcm doctor repair" in text_result
+
+
+def test_lcm_doctor_text_reports_unchecked_message_fts_as_warning(engine, monkeypatch):
+    def fake_fts_integrity(_conn, spec):
+        if spec.table_name == "messages_fts":
+            return {"status": "unchecked", "detail": "attempt to write a readonly database"}
+        return {"status": "pass", "detail": "ok"}
+
+    monkeypatch.setattr(command_mod, "check_external_content_fts_integrity", fake_fts_integrity)
+
+    text_result = handle_lcm_command("doctor", engine)
+
+    assert "status: action-recommended" in text_result
+    assert "messages_fts: unchecked" in text_result
+    assert "nodes_fts: ok" in text_result
+    assert "issues: none" in text_result
+    assert "messages_fts_integrity: inspect warning-only" in text_result
+    assert "read-write SQLite access" in text_result
+    assert "/lcm doctor repair" not in text_result
+
+
+def test_lcm_doctor_json_preserves_unchecked_fts_detail_for_guidance(engine, monkeypatch):
+    def fake_fts_integrity(_conn, spec):
+        if spec.table_name == "messages_fts":
+            return {"status": "unchecked", "detail": "attempt to write a readonly database"}
+        return {"status": "pass", "detail": "ok"}
+
+    monkeypatch.setattr(lcm_tools, "check_external_content_fts_integrity", fake_fts_integrity)
+
+    doctor = json.loads(lcm_tools.lcm_doctor({}, engine=engine))
+    messages_check = next(check for check in doctor["checks"] if check["check"] == "messages_fts_integrity")
+    guidance = {item["check"]: item for item in doctor["guidance"]}
+
+    assert messages_check["status"] == "warn"
+    assert messages_check["detail"] == {
+        "status": "unchecked",
+        "detail": "attempt to write a readonly database",
+    }
+    assert guidance["messages_fts_integrity"]["action"] == "inspect"
+    assert guidance["messages_fts_integrity"]["warning_only"] is True
+    assert "read-write SQLite access" in guidance["messages_fts_integrity"]["operator_action"]
+    assert "/lcm doctor repair" not in guidance["messages_fts_integrity"]["operator_action"]
+
+
+def test_lcm_doctor_surfaces_background_fts_integrity_failed_flag(engine, monkeypatch):
+    """A background integrity scan's persisted corruption flag (issue #6) must
+    surface in `/lcm doctor`, even when this run's live deep check reports clean."""
+    from hermes_lcm import db_bootstrap
+
+    db_bootstrap._record_integrity_failed(
+        engine._store._conn,
+        build_message_fts_spec(),
+        detail="fts5: index integrity-check failed",
+    )
+    engine._store._conn.commit()
+
+    # Live deep check reports clean so the persisted flag is the sole signal.
+    monkeypatch.setattr(
+        command_mod,
+        "check_external_content_fts_integrity",
+        lambda _conn, _spec: {"status": "pass", "detail": "ok"},
+    )
+
+    text_result = handle_lcm_command("doctor", engine)
+
+    assert "status: issues-found" in text_result
+    assert "issues: " in text_result and "messages_fts" in text_result
+    assert "background integrity scan flagged corruption" in text_result
+    assert "/lcm doctor repair apply" in text_result
 
 
 def test_lcm_doctor_repair_reports_fts_drift_without_mutating(tmp_path):
@@ -424,6 +1236,29 @@ def test_lcm_doctor_repair_reports_fts_drift_without_mutating(tmp_path):
     assert remaining_triggers == set()
 
 
+def test_lcm_doctor_repair_reports_same_count_deep_fts_drift(tmp_path):
+    config = LCMConfig(database_path=str(tmp_path / "lcm_repair_deep_drift.db"))
+    engine = LCMEngine(config=config, hermes_home=str(tmp_path / "hermes_home"))
+    engine._session_id = "live-session"
+    engine._session_platform = "telegram"
+    engine._conversation_id = "live-session"
+    engine._store.append("live-session", {"role": "user", "content": "original searchable content"}, token_estimate=4)
+    engine._store._conn.execute("DROP TRIGGER msg_fts_update")
+    engine._store._conn.execute(
+        "UPDATE messages SET content = ? WHERE session_id = ?",
+        ("changed searchable content", "live-session"),
+    )
+    engine._store._conn.commit()
+
+    result = handle_lcm_command("doctor repair", engine)
+
+    assert "LCM doctor repair" in result
+    assert "status: repair-needed" in result
+    assert "messages_fts: repair-needed" in result
+    assert "messages_fts_integrity_status: fail" in result
+    assert "note: use `/lcm doctor repair apply`" in result
+
+
 def test_lcm_doctor_repair_dry_run_works_with_read_only_database(tmp_path):
     db_path = tmp_path / "lcm_repair_readonly.db"
     config = LCMConfig(database_path=str(db_path))
@@ -450,6 +1285,10 @@ def test_lcm_doctor_repair_dry_run_works_with_read_only_database(tmp_path):
 
     class FakeStore:
         _conn = ro_conn
+
+        @property
+        def connection(self):
+            return self._conn
 
     class FakeEngine:
         _store = FakeStore()
@@ -785,6 +1624,76 @@ def test_lcm_doctor_clean_apply_rolls_back_if_delete_fails_after_backup(tmp_path
     assert engine._lifecycle.get_by_conversation("cron_20260414") is not None
 
 
+def test_clean_apply_stages_250001_sessions_and_bounds_node_purge_batches(tmp_path):
+    conn = sqlite3.connect(tmp_path / "large-clean-scope.db")
+    conn.executescript(
+        """
+        CREATE TABLE messages(
+            store_id INTEGER PRIMARY KEY,
+            session_id TEXT NOT NULL
+        );
+        CREATE TABLE summary_nodes(
+            node_id INTEGER PRIMARY KEY,
+            session_id TEXT NOT NULL,
+            depth INTEGER NOT NULL
+        );
+        CREATE INDEX idx_nodes_session_node
+            ON summary_nodes(session_id, node_id);
+        CREATE TABLE lcm_lifecycle_state(
+            conversation_id TEXT PRIMARY KEY,
+            current_session_id TEXT,
+            last_finalized_session_id TEXT
+        );
+        CREATE INDEX idx_lcm_lifecycle_current_session
+            ON lcm_lifecycle_state(current_session_id);
+        CREATE INDEX idx_lcm_lifecycle_last_finalized_session
+            ON lcm_lifecycle_state(last_finalized_session_id);
+        """
+    )
+    conn.executemany(
+        "INSERT INTO messages(store_id, session_id) VALUES(?, ?)",
+        ((index + 1, f"session-{index}") for index in range(3)),
+    )
+    conn.executemany(
+        "INSERT INTO summary_nodes(node_id, session_id, depth) VALUES(?, ?, 0)",
+        ((index + 1, f"session-{index % 3}") for index in range(600)),
+    )
+    conn.execute(
+        "INSERT INTO lcm_lifecycle_state VALUES('delete-me', 'session-0', 'session-1')"
+    )
+    conn.execute(
+        "INSERT INTO lcm_lifecycle_state VALUES('skip-me', 'session-0', 'outside')"
+    )
+    conn.commit()
+    batches: list[list[int]] = []
+
+    def purge(batch, *, connection):
+        assert connection is conn
+        batches.append(list(batch))
+
+    engine = SimpleNamespace(
+        _store=SimpleNamespace(connection=conn),
+        _session_id="",
+        _purge_embeddings_for_nodes=purge,
+    )
+    session_ids = {f"session-{index}" for index in range(250_001)}
+    try:
+        deleted = command_mod._delete_clean_candidates_atomically(engine, session_ids)
+        assert deleted == {
+            "messages_deleted": 3,
+            "nodes_deleted": 600,
+            "lifecycle_deleted": 1,
+            "lifecycle_skipped": 1,
+        }
+        assert batches
+        assert max(map(len, batches)) <= 256
+        assert sorted(node_id for batch in batches for node_id in batch) == list(
+            range(1, 601)
+        )
+    finally:
+        conn.close()
+
+
 def test_lcm_doctor_clean_apply_denied_by_default(tmp_path):
     config = LCMConfig(
         database_path=str(tmp_path / "lcm_clean_apply_denied.db"),
@@ -799,6 +1708,72 @@ def test_lcm_doctor_clean_apply_denied_by_default(tmp_path):
     assert "status: denied" in result
     assert "disabled by default" in result
     assert len(engine._store.get_range("cron_20260414")) == 1
+
+
+def test_lcm_doctor_clean_lifecycle_reports_empty_candidates(tmp_path):
+    config = LCMConfig(
+        database_path=str(tmp_path / "lcm_clean_lifecycle.db"),
+        empty_lifecycle_gc_enabled=True,
+        empty_lifecycle_gc_threshold=1,
+    )
+    engine = LCMEngine(config=config, hermes_home=str(tmp_path / "hermes_home"))
+    engine._lifecycle.bind_session("orphan-1")
+    engine._lifecycle.bind_session("orphan-2")
+
+    result = handle_lcm_command("doctor clean lifecycle", engine)
+
+    assert "LCM doctor clean lifecycle" in result
+    assert "status: candidates-found" in result
+    assert "empty_rows: 2" in result
+    assert "empty_current: 2" in result
+    assert "empty_finalized: 0" in result
+    assert "empty_protected: 0" in result
+    assert "no rows were deleted" in result
+
+
+def test_lcm_doctor_clean_lifecycle_apply_is_backup_first_and_deletes_safe_candidates(tmp_path):
+    config = LCMConfig(
+        database_path=str(tmp_path / "lcm_clean_lifecycle_apply.db"),
+        empty_lifecycle_gc_enabled=True,
+        empty_lifecycle_gc_threshold=1,
+        doctor_clean_apply_enabled=True,
+    )
+    engine = LCMEngine(config=config, hermes_home=str(tmp_path / "hermes_home"))
+    engine._session_id = "live-session"
+    engine._conversation_id = "live-session"
+    engine._lifecycle.bind_session("live-session")
+    engine._lifecycle.bind_session("orphan-1")
+    engine._lifecycle.bind_session("orphan-2")
+
+    result = handle_lcm_command("doctor clean lifecycle apply", engine)
+
+    assert "LCM doctor clean lifecycle apply" in result
+    assert "status: ok" in result
+    assert "lifecycle_rows_deleted: 2" in result
+    assert "lifecycle_rows_remaining: 1" in result
+    assert "backup_path:" in result
+    assert "backup_size_bytes:" in result
+
+    remaining = engine._lifecycle.get_by_conversation("live-session")
+    assert remaining is not None
+    assert remaining.current_session_id == "live-session"
+
+
+def test_lcm_doctor_clean_lifecycle_apply_denied_by_default(tmp_path):
+    config = LCMConfig(
+        database_path=str(tmp_path / "lcm_clean_lifecycle_apply_denied.db"),
+        empty_lifecycle_gc_enabled=True,
+        empty_lifecycle_gc_threshold=1,
+    )
+    engine = LCMEngine(config=config, hermes_home=str(tmp_path / "hermes_home"))
+    engine._lifecycle.bind_session("orphan-1")
+
+    result = handle_lcm_command("doctor clean lifecycle apply", engine)
+
+    assert "LCM doctor clean lifecycle apply" in result
+    assert "status: denied" in result
+    assert "disabled by default" in result
+    assert engine._lifecycle.row_count() == 1
 
 
 class _FakeCursor:
@@ -852,6 +1827,9 @@ def test_register_skips_slash_command_when_host_context_has_no_register_command(
         def register_context_engine(self, engine):
             self.engine = engine
 
+        def register_tool(self, name, toolset, schema, handler, description="", emoji=""):
+            pass
+
     ctx = _Ctx()
     module.register(ctx)
 
@@ -879,6 +1857,9 @@ def test_register_skips_lcm_slash_command_by_default(tmp_path, monkeypatch):
 
         def register_context_engine(self, engine):
             self.engine = engine
+
+        def register_tool(self, name, toolset, schema, handler, description="", emoji=""):
+            pass
 
         def register_command(self, name, handler, description=""):
             self.commands[name] = (handler, description)
@@ -911,6 +1892,9 @@ def test_register_allows_lcm_slash_command_when_explicitly_enabled(tmp_path, mon
 
         def register_context_engine(self, engine):
             self.engine = engine
+
+        def register_tool(self, name, toolset, schema, handler, description="", emoji=""):
+            pass
 
         def register_command(self, name, handler, description=""):
             self.commands[name] = (handler, description)

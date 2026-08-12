@@ -1,3 +1,5 @@
+from __future__ import annotations
+
 """Immutable-first message store — the source of truth.
 
 Every message is persisted durably in SQLite. The normal model is append-only,
@@ -11,15 +13,20 @@ import json
 import logging
 import sqlite3
 import time
+from contextlib import nullcontext
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Callable, Dict, List, Optional
 
 from .db_bootstrap import (
     ExternalContentFtsSpec,
+    add_column_if_missing,
     configure_connection,
     ensure_external_content_fts,
+    refuse_schema_version_too_new,
     run_versioned_migrations,
 )
+from .config import LCMConfig
+from .ingest_protection import protect_message_for_ingest, protect_messages_for_ingest
 from .search_query import (
     build_snippet,
     compute_search_candidate_cap,
@@ -39,6 +46,7 @@ from .search_query import (
     should_apply_directness_rank_adjustment,
 )
 from .message_content import normalize_content_value as _normalize_content_value
+from .sqlite_util import process_sqlite_write_lock
 from .tokens import count_message_tokens
 
 logger = logging.getLogger(__name__)
@@ -47,7 +55,7 @@ logger = logging.getLogger(__name__)
 _MESSAGE_ROLE_BIAS_SQL = "CASE m.role WHEN 'user' THEN 0 WHEN 'assistant' THEN 1 WHEN 'tool' THEN 2 ELSE 1 END"
 _MESSAGE_SELECT_COLUMNS = (
     "store_id, session_id, source, role, content, tool_call_id, "
-    "tool_calls, tool_name, timestamp, token_estimate, pinned"
+    "tool_calls, tool_name, timestamp, token_estimate, pinned, conversation_id"
 )
 _UNKNOWN_SOURCE = "unknown"
 
@@ -65,12 +73,23 @@ def _normalize_source_value(source: str | None) -> str:
     return normalized or _UNKNOWN_SOURCE
 
 
+def _normalize_conversation_id_value(conversation_id: str | None) -> str:
+    return (conversation_id or "").strip()
+
+
 def _source_filter_clause(column: str, source: str | None) -> tuple[str | None, list[str]]:
     normalized = _normalize_source_value(source) if source is not None else ""
     if not normalized:
         return None, []
     if normalized == _UNKNOWN_SOURCE:
         return f"({column} = ? OR {_legacy_blank_source_clause(column)})", [_UNKNOWN_SOURCE]
+    return f"{column} = ?", [normalized]
+
+
+def _conversation_filter_clause(column: str, conversation_id: str | None) -> tuple[str | None, list[str]]:
+    normalized = _normalize_conversation_id_value(conversation_id)
+    if not normalized:
+        return None, []
     return f"{column} = ?", [normalized]
 
 
@@ -201,20 +220,44 @@ def build_message_fts_spec() -> ExternalContentFtsSpec:
 class MessageStore:
     """SQLite-backed immutable message store."""
 
-    def __init__(self, db_path: str | Path):
+    def __init__(self, db_path: str | Path, *, ingest_protection_config=None, hermes_home: str = ""):
         self.db_path = Path(db_path)
         self.db_path.parent.mkdir(parents=True, exist_ok=True)
+        self._ingest_protection_config = ingest_protection_config or LCMConfig(database_path=str(self.db_path))
+        self._hermes_home = hermes_home or str(self.db_path.parent)
         self._conn: Optional[sqlite3.Connection] = None
-        self._init_db()
+        # ``self._conn`` is shared across threads (the connection is opened with
+        # ``check_same_thread=False``). SQLite's own C-level mutex serializes
+        # statements at the engine layer, but the Python ``sqlite3`` module
+        # releases the GIL while the C call runs. Under heavy thread contention
+        # with concurrent HTTPS clients in the same process, downstream
+        # operators have observed on-disk corruption that is consistent with
+        # external bytes landing inside SQLite's write path (e.g. the first
+        # 28 bytes of the database file replaced with a TLS record header +
+        # ciphertext while the "SQLit" magic remains intact).
+        #
+        # Coordinate every in-process helper/clone that writes this database,
+        # not only callers sharing this connection. SQLite still arbitrates
+        # external processes; this gate removes self-contention between the
+        # gateway's many per-agent LCM clones.
+        self._write_lock = process_sqlite_write_lock(self.db_path)
+        with self._write_lock:
+            self._init_db()
+        # Lifecycle metrics — registered *after* __init__ succeeds so a
+        # construction failure cannot inflate live counts.
+        from .lifecycle_metrics import register_message_store_created
+        register_message_store_created(self)
 
     def _init_db(self):
         self._conn = sqlite3.connect(str(self.db_path), timeout=5.0, check_same_thread=False)
+        refuse_schema_version_too_new(self._conn)
         configure_connection(self._conn)
         self._conn.executescript("""
             CREATE TABLE IF NOT EXISTS messages (
                 store_id INTEGER PRIMARY KEY AUTOINCREMENT,
                 session_id TEXT NOT NULL,
                 source TEXT DEFAULT '',
+                conversation_id TEXT DEFAULT '',
                 role TEXT NOT NULL,
                 content TEXT,
                 tool_call_id TEXT,
@@ -240,69 +283,121 @@ class MessageStore:
         )
         run_versioned_migrations(self._conn)
         self._ensure_source_column()
+        self._ensure_conversation_id_column()
         self._conn.commit()
 
     def _ensure_source_column(self) -> None:
         columns = {
             row[1] for row in self._conn.execute("PRAGMA table_info(messages)").fetchall()
         }
-        if "source" not in columns:
-            self._conn.execute("ALTER TABLE messages ADD COLUMN source TEXT DEFAULT ''")
+        add_column_if_missing(
+            self._conn, columns, "source",
+            "ALTER TABLE messages ADD COLUMN source TEXT DEFAULT ''",
+        )
         self._conn.execute(
             "CREATE INDEX IF NOT EXISTS idx_msg_source_session ON messages(source, session_id, store_id)"
+        )
+
+    def _ensure_conversation_id_column(self) -> None:
+        columns = {
+            row[1] for row in self._conn.execute("PRAGMA table_info(messages)").fetchall()
+        }
+        add_column_if_missing(
+            self._conn, columns, "conversation_id",
+            "ALTER TABLE messages ADD COLUMN conversation_id TEXT DEFAULT ''",
+        )
+        self._conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_msg_conversation_session ON messages(conversation_id, session_id, store_id)"
         )
 
     # -- Write operations ---------------------------------------------------
 
     def append(self, session_id: str, msg: Dict[str, Any],
-               token_estimate: int = 0, source: str = "") -> int:
+               token_estimate: int = 0, source: str = "",
+               conversation_id: str = "") -> int:
         """Persist a message and return its store_id."""
+        msg = protect_message_for_ingest(
+            msg,
+            config=self._ingest_protection_config,
+            hermes_home=self._hermes_home,
+            session_id=session_id,
+        )
         tool_calls = msg.get("tool_calls")
         tc_json = json.dumps(tool_calls) if tool_calls else None
 
-        cur = self._conn.execute(
-            """INSERT INTO messages
-               (session_id, source, role, content, tool_call_id, tool_calls,
-                tool_name, timestamp, token_estimate, pinned)
-               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
-            (
-                session_id,
-                _normalize_source_value(source),
-                msg.get("role", "unknown"),
-                _normalize_content_value(msg.get("content")),
-                msg.get("tool_call_id"),
-                tc_json,
-                msg.get("tool_name"),
-                time.time(),
-                token_estimate,
-                0,
-            ),
-        )
-        self._conn.commit()
-        return cur.lastrowid
+        with self._write_lock:
+            cur = self._conn.execute(
+                """INSERT INTO messages
+                   (session_id, source, conversation_id, role, content, tool_call_id, tool_calls,
+                    tool_name, timestamp, token_estimate, pinned)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                (
+                    session_id,
+                    _normalize_source_value(source),
+                    _normalize_conversation_id_value(conversation_id),
+                    msg.get("role", "unknown"),
+                    _normalize_content_value(msg.get("content")),
+                    msg.get("tool_call_id"),
+                    tc_json,
+                    msg.get("tool_name"),
+                    time.time(),
+                    token_estimate,
+                    0,
+                ),
+            )
+            self._conn.commit()
+            return cur.lastrowid
 
     def append_batch(self, session_id: str,
                      messages: List[Dict[str, Any]],
                      token_estimates: List[int] | None = None,
-                     source: str = "") -> List[int]:
+                     source: str = "",
+                     conversation_id: str = "") -> List[int]:
         """Persist multiple messages in one transaction. Returns store_ids."""
+        protected_messages = protect_messages_for_ingest(
+            messages,
+            config=self._ingest_protection_config,
+            hermes_home=self._hermes_home,
+            session_id=session_id,
+        )
+        return self._append_protected_batch(
+            session_id,
+            protected_messages,
+            token_estimates,
+            source=source,
+            conversation_id=conversation_id,
+        )
+
+    def _append_protected_batch(self, session_id: str,
+                                messages: List[Dict[str, Any]],
+                                token_estimates: List[int] | None = None,
+                                source: str = "",
+                                conversation_id: str = "") -> List[int]:
+        """Persist messages that already passed ingest protection.
+
+        This is an internal fast path for callers that need the protected form
+        before storage, for example to update active replay with raw-payload
+        stubs. Direct callers should use ``append_batch`` so storage-boundary
+        payload protection cannot be bypassed accidentally.
+        """
         if token_estimates is None:
             token_estimates = [0] * len(messages)
 
         ids = []
-        ts = time.time()
-        with self._conn:
+        with self._write_lock, self._conn:
             for msg, est in zip(messages, token_estimates):
                 tc = msg.get("tool_calls")
                 tc_json = json.dumps(tc) if tc else None
+                ts = time.time()
                 cur = self._conn.execute(
                     """INSERT INTO messages
-                       (session_id, source, role, content, tool_call_id, tool_calls,
+                       (session_id, source, conversation_id, role, content, tool_call_id, tool_calls,
                         tool_name, timestamp, token_estimate, pinned)
-                       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
                     (
                         session_id,
                         _normalize_source_value(source),
+                        _normalize_conversation_id_value(conversation_id),
                         msg.get("role", "unknown"),
                         _normalize_content_value(msg.get("content")),
                         msg.get("tool_call_id"),
@@ -320,61 +415,82 @@ class MessageStore:
         """Move all persisted messages from one session_id to another."""
         if not old_session_id or not new_session_id or old_session_id == new_session_id:
             return 0
-        cur = self._conn.execute(
-            "UPDATE messages SET session_id = ? WHERE session_id = ?",
-            (new_session_id, old_session_id),
-        )
-        self._conn.commit()
-        return cur.rowcount if cur.rowcount is not None else 0
+        with self._write_lock:
+            cur = self._conn.execute(
+                "UPDATE messages SET session_id = ? WHERE session_id = ?",
+                (new_session_id, old_session_id),
+            )
+            self._conn.commit()
+            return cur.rowcount if cur.rowcount is not None else 0
 
     def delete_session_messages(self, session_id: str) -> int:
         """Delete all messages for a session. Returns count deleted."""
-        cur = self._conn.execute(
-            "DELETE FROM messages WHERE session_id = ?",
-            (session_id,),
-        )
-        self._conn.commit()
-        deleted = cur.rowcount if cur.rowcount is not None else 0
-        return deleted
+        with self._write_lock:
+            cur = self._conn.execute(
+                "DELETE FROM messages WHERE session_id = ?",
+                (session_id,),
+            )
+            self._conn.commit()
+            deleted = cur.rowcount if cur.rowcount is not None else 0
+            return deleted
 
-    def gc_externalized_tool_result(self, store_id: int, placeholder: str) -> bool:
-        """Rewrite one unpinned tool-result row to a compact GC placeholder."""
-        row = self._conn.execute(
-            "SELECT role, pinned, content, tool_call_id FROM messages WHERE store_id = ?",
-            (store_id,),
-        ).fetchone()
-        if row is None:
-            return False
-        role, pinned, current_content, tool_call_id = row
-        if role != "tool" or bool(pinned) or current_content == placeholder:
-            return False
-        placeholder_tokens = count_message_tokens(
-            {
-                "role": "tool",
-                "content": placeholder,
-                "tool_call_id": tool_call_id,
-            }
-        )
-        self._conn.execute(
-            "UPDATE messages SET content = ?, token_estimate = ? WHERE store_id = ?",
-            (placeholder, placeholder_tokens, store_id),
-        )
-        self._conn.commit()
-        return True
+    def gc_externalized_tool_result(
+        self,
+        store_id: int,
+        placeholder: str,
+        *,
+        before_commit: "Callable[[sqlite3.Connection, int], None] | None" = None,
+    ) -> bool:
+        """Rewrite one unpinned tool-result row to a compact GC placeholder.
+
+        When ``before_commit`` is given it runs on this store's connection AFTER
+        the content rewrite and BEFORE the single commit, so a caller can archive
+        the row's now-stale chunks in the SAME transaction as the rewrite. Without
+        that atomicity a recall landing between the content-rewrite commit and a
+        later batch archive would slice the new (short) content at the old chunk
+        offsets, returning a garbled fragment (F2).
+        """
+        with self._write_lock:
+            row = self._conn.execute(
+                "SELECT role, pinned, content, tool_call_id FROM messages WHERE store_id = ?",
+                (store_id,),
+            ).fetchone()
+            if row is None:
+                return False
+            role, pinned, current_content, tool_call_id = row
+            if role != "tool" or bool(pinned) or current_content == placeholder:
+                return False
+            placeholder_tokens = count_message_tokens(
+                {
+                    "role": "tool",
+                    "content": placeholder,
+                    "tool_call_id": tool_call_id,
+                }
+            )
+            self._conn.execute(
+                "UPDATE messages SET content = ?, token_estimate = ? WHERE store_id = ?",
+                (placeholder, placeholder_tokens, store_id),
+            )
+            if before_commit is not None:
+                before_commit(self._conn, store_id)
+            self._conn.commit()
+            return True
 
     def pin(self, store_id: int) -> None:
 
         """Mark a message as pinned (protected from pruning)."""
-        self._conn.execute(
-            "UPDATE messages SET pinned = 1 WHERE store_id = ?", (store_id,)
-        )
-        self._conn.commit()
+        with self._write_lock:
+            self._conn.execute(
+                "UPDATE messages SET pinned = 1 WHERE store_id = ?", (store_id,)
+            )
+            self._conn.commit()
 
     def unpin(self, store_id: int) -> None:
-        self._conn.execute(
-            "UPDATE messages SET pinned = 0 WHERE store_id = ?", (store_id,)
-        )
-        self._conn.commit()
+        with self._write_lock:
+            self._conn.execute(
+                "UPDATE messages SET pinned = 0 WHERE store_id = ?", (store_id,)
+            )
+            self._conn.commit()
 
     # -- Read operations ----------------------------------------------------
 
@@ -401,22 +517,25 @@ class MessageStore:
 
     def get_range(self, session_id: str, start_id: int = 0,
                   end_id: int | None = None,
-                  limit: int = 1000) -> List[Dict[str, Any]]:
+                  limit: int = 1000,
+                  conversation_id: str | None = None) -> List[Dict[str, Any]]:
         """Get messages in a store_id range for a session."""
+        where = ["session_id = ?", "store_id >= ?"]
+        args: list[Any] = [session_id, start_id]
+        conversation_clause, conversation_args = _conversation_filter_clause("conversation_id", conversation_id)
+        if conversation_clause:
+            where.append(conversation_clause)
+            args.extend(conversation_args)
         if end_id is not None:
-            rows = self._conn.execute(
-                f"""SELECT {_MESSAGE_SELECT_COLUMNS} FROM messages
-                   WHERE session_id = ? AND store_id >= ? AND store_id <= ?
-                   ORDER BY store_id LIMIT ?""",
-                (session_id, start_id, end_id, limit),
-            ).fetchall()
-        else:
-            rows = self._conn.execute(
-                f"""SELECT {_MESSAGE_SELECT_COLUMNS} FROM messages
-                   WHERE session_id = ? AND store_id >= ?
-                   ORDER BY store_id LIMIT ?""",
-                (session_id, start_id, limit),
-            ).fetchall()
+            where.append("store_id <= ?")
+            args.append(end_id)
+        args.append(limit)
+        rows = self._conn.execute(
+            f"""SELECT {_MESSAGE_SELECT_COLUMNS} FROM messages
+               WHERE {' AND '.join(where)}
+               ORDER BY store_id LIMIT ?""",
+            args,
+        ).fetchall()
         return [self._row_to_dict(r) for r in rows]
 
     def _session_load_where(
@@ -505,6 +624,18 @@ class MessageStore:
         ).fetchall()
         return [self._row_to_dict(r) for r in rows]
 
+    def get_session_messages_after(self, session_id: str,
+                                   after_store_id: int = 0,
+                                   limit: int = 10000) -> List[Dict[str, Any]]:
+        """Get session messages after a store_id, ordered by store_id."""
+        rows = self._conn.execute(
+            f"""SELECT {_MESSAGE_SELECT_COLUMNS} FROM messages
+               WHERE session_id = ? AND store_id > ?
+               ORDER BY store_id LIMIT ?""",
+            (session_id, after_store_id, limit),
+        ).fetchall()
+        return [self._row_to_dict(r) for r in rows]
+
     def get_session_tail(self, session_id: str, limit: int = 1000) -> List[Dict[str, Any]]:
         """Get the latest messages for a session, returned in store order."""
         if limit <= 0:
@@ -571,6 +702,87 @@ class MessageStore:
             "effective_unknown_messages": normalized_unknown + legacy_blank,
         }
 
+    def scan_session_cleanup_stats(self) -> List[tuple]:
+        """Per-session ``(session_id, message_count, token_total, node_count)``
+        rows across messages and summary nodes, for ``/lcm doctor clean``
+        candidate scanning. Callers own the pattern/protection policy."""
+        return self._conn.execute(
+            """
+            WITH session_ids AS (
+                SELECT session_id FROM messages
+                UNION
+                SELECT session_id FROM summary_nodes
+            ),
+            message_stats AS (
+                SELECT session_id,
+                       COUNT(*) AS message_count,
+                       COALESCE(SUM(token_estimate), 0) AS token_total
+                FROM messages
+                GROUP BY session_id
+            ),
+            node_stats AS (
+                SELECT session_id, COUNT(*) AS node_count
+                FROM summary_nodes
+                GROUP BY session_id
+            )
+            SELECT s.session_id,
+                   COALESCE(m.message_count, 0) AS message_count,
+                   COALESCE(m.token_total, 0) AS token_total,
+                   COALESCE(n.node_count, 0) AS node_count
+            FROM session_ids s
+            LEFT JOIN message_stats m ON m.session_id = s.session_id
+            LEFT JOIN node_stats n ON n.session_id = s.session_id
+            ORDER BY s.session_id
+            """
+        ).fetchall()
+
+    def scan_session_retention_stats(self, session_id: str) -> List[tuple]:
+        """Per-session activity/token stats for one session (messages + summary
+        nodes), for ``/lcm doctor retention`` scanning. Callers own the
+        staleness/protection policy."""
+        return self._conn.execute(
+            """
+            WITH session_ids AS (
+                SELECT session_id FROM messages
+                UNION
+                SELECT session_id FROM summary_nodes
+            ),
+            message_stats AS (
+                SELECT session_id,
+                       COUNT(*) AS message_count,
+                       COALESCE(SUM(token_estimate), 0) AS token_total,
+                       MIN(timestamp) AS first_message_at,
+                       MAX(timestamp) AS last_message_at
+                FROM messages
+                GROUP BY session_id
+            ),
+            node_stats AS (
+                SELECT session_id,
+                       COUNT(*) AS node_count,
+                       COALESCE(SUM(token_count), 0) AS node_token_total,
+                       MIN(COALESCE(earliest_at, created_at)) AS first_node_at,
+                       MAX(COALESCE(latest_at, created_at)) AS last_node_at
+                FROM summary_nodes
+                GROUP BY session_id
+            )
+            SELECT s.session_id,
+                   COALESCE(m.message_count, 0) AS message_count,
+                   COALESCE(m.token_total, 0) AS token_total,
+                   COALESCE(n.node_count, 0) AS node_count,
+                   COALESCE(n.node_token_total, 0) AS node_token_total,
+                   m.first_message_at,
+                   m.last_message_at,
+                   n.first_node_at,
+                   n.last_node_at
+            FROM session_ids s
+            LEFT JOIN message_stats m ON m.session_id = s.session_id
+            LEFT JOIN node_stats n ON n.session_id = s.session_id
+            WHERE s.session_id = ?
+            ORDER BY s.session_id
+            """,
+            (session_id,),
+        ).fetchall()
+
     def get_source_normalization_plan(self) -> Dict[str, Any]:
         """Return a dry-run plan for normalizing legacy blank source values."""
         stats_before = self.get_source_stats()
@@ -596,7 +808,7 @@ class MessageStore:
         """Normalize legacy NULL/blank source rows to the explicit unknown bucket."""
         stats_before = self.get_source_stats()
         blank_clause = _legacy_blank_source_clause("source")
-        with self._conn:
+        with self._write_lock, self._conn:
             cur = self._conn.execute(
                 f"UPDATE messages SET source = ? WHERE {blank_clause}",
                 (_UNKNOWN_SOURCE,),
@@ -622,11 +834,111 @@ class MessageStore:
             return None, None
         return row[0], row[1]
 
+    # -- Metadata key/value JSON --------------------------------------------
+
+    def read_metadata_json(self, key: str) -> Any:
+        """Return the JSON-decoded value stored under ``key`` in the metadata table.
+
+        Returns ``None`` when the connection is closed, the key is absent, or the
+        stored value is empty. JSON decoding is deliberately *not* wrapped: a
+        malformed value raises, so callers keep the ``try``/``except`` scoping
+        that decides whether one bad key aborts a multi-key load or is skipped.
+        Reads are unlocked, matching the store's other read paths (``_write_lock``
+        guards writes only).
+        """
+        conn = self._conn
+        if conn is None:
+            return None
+        row = conn.execute(
+            "SELECT value FROM metadata WHERE key = ?",
+            (key,),
+        ).fetchone()
+        if not row or not row[0]:
+            return None
+        return json.loads(str(row[0]))
+
+    def write_metadata_json(
+        self,
+        keys: list[str],
+        serialized: str,
+        *,
+        skip_unchanged: bool = False,
+    ) -> bool:
+        """Write the pre-serialized JSON string ``serialized`` to every key in ``keys``.
+
+        Serialization stays with the caller so it keeps control of ``sort_keys``
+        and payload shape. Runs under the store write lock and issues at most one
+        commit. With ``skip_unchanged=True`` a key already holding ``serialized``
+        is left untouched and the commit is skipped entirely when nothing changed
+        -- the ingest-hot-path optimization used by the placeholder count/ordinal
+        writers. Returns ``True`` if any key was written.
+        """
+        conn = self._conn
+        if conn is None:
+            return False
+        wrote = False
+        with self._write_lock:
+            for key in keys:
+                if skip_unchanged:
+                    existing = conn.execute(
+                        "SELECT value FROM metadata WHERE key = ?", (key,)
+                    ).fetchone()
+                    if existing is not None and existing[0] == serialized:
+                        continue
+                conn.execute(
+                    """
+                    INSERT INTO metadata(key, value)
+                    VALUES(?, ?)
+                    ON CONFLICT(key) DO UPDATE SET value = excluded.value
+                    """,
+                    (key, serialized),
+                )
+                wrote = True
+            if wrote:
+                conn.commit()
+        return wrote
+
+    # -- Compaction telemetry ------------------------------------------------
+
+    @staticmethod
+    def _compaction_telemetry_key(conversation_id: str) -> str:
+        return f"compaction_telemetry:{conversation_id}"
+
+    def read_compaction_telemetry(self, conversation_id: str) -> Optional[Dict[str, Any]]:
+        """Return the persisted per-conversation compaction-telemetry record, or None.
+
+        Best-effort: a closed connection, missing/empty row, or malformed JSON all
+        yield None. Telemetry is diagnostic and must never block a turn. Reads are
+        unlocked, matching the store's other read paths.
+        """
+        if not conversation_id:
+            return None
+        try:
+            data = self.read_metadata_json(self._compaction_telemetry_key(conversation_id))
+        except (ValueError, TypeError):
+            return None
+        return data if isinstance(data, dict) else None
+
+    def write_compaction_telemetry(self, conversation_id: str, record: Dict[str, Any]) -> None:
+        """Upsert the per-conversation compaction-telemetry record.
+
+        Stored as a single JSON row in the existing metadata table (no dedicated
+        schema, no version bump) under the store write lock. The write -- and its
+        commit -- is skipped when the serialized payload is unchanged so idle
+        turns do not churn the row.
+        """
+        if not conversation_id:
+            return
+        serialized = json.dumps(record, sort_keys=True)
+        key = self._compaction_telemetry_key(conversation_id)
+        self.write_metadata_json([key], serialized, skip_unchanged=True)
+
     # -- Search -------------------------------------------------------------
 
     def search(self, query: str, session_id: str | None = None,
                limit: int = 20, sort: str | None = None,
                source: str | None = None,
+               conversation_id: str | None = None,
                role: str | None = None,
                time_from: float | None = None,
                time_to: float | None = None) -> List[Dict[str, Any]]:
@@ -639,6 +951,7 @@ class MessageStore:
         - ``source`` limits which raw rows inside those sessions are eligible
         - ``source='unknown'`` means the explicit unknown-source bucket, with
           legacy blank-source rows treated as equivalent for back-compat
+        - ``conversation_id`` limits rows to one gateway conversation/session key
         """
         safe_query = sanitize_fts5_query(query)
         terms = extract_search_terms(safe_query)
@@ -650,6 +963,7 @@ class MessageStore:
                 limit=limit,
                 sort=sort,
                 source=source,
+                conversation_id=conversation_id,
                 role=role,
                 time_from=time_from,
                 time_to=time_to,
@@ -665,6 +979,7 @@ class MessageStore:
         apply_directness_adjustment = should_apply_directness_rank_adjustment(terms, phrases)
         max_rank_bonus = compute_directness_rank_bonus_upper_bound(terms, phrases) * 3e-7
         source_clause, source_args = _source_filter_clause("m.source", source)
+        conversation_clause, conversation_args = _conversation_filter_clause("m.conversation_id", conversation_id)
         offset = 0
         scanned_rows = 0
         results: list[Dict[str, Any]] = []
@@ -678,6 +993,9 @@ class MessageStore:
                 if source_clause:
                     where.append(source_clause)
                     args.extend(source_args)
+                if conversation_clause:
+                    where.append(conversation_clause)
+                    args.extend(conversation_args)
                 if role is not None:
                     where.append("m.role = ?")
                     args.append(role)
@@ -690,7 +1008,7 @@ class MessageStore:
                 args.extend([fetch_limit, offset])
                 rows = self._conn.execute(
                     f"""SELECT m.store_id, m.session_id, m.source, m.role, m.content, m.tool_call_id,
-                              m.tool_calls, m.tool_name, m.timestamp, m.token_estimate, m.pinned,
+                              m.tool_calls, m.tool_name, m.timestamp, m.token_estimate, m.pinned, m.conversation_id,
                               rank as search_rank,
                               snippet(messages_fts, 0, '>>>', '<<<', '...', 40) as snippet
                        FROM messages_fts fts
@@ -708,6 +1026,7 @@ class MessageStore:
                     limit=limit,
                     sort=sort,
                     source=source,
+                    conversation_id=conversation_id,
                     role=role,
                     time_from=time_from,
                     time_to=time_to,
@@ -716,7 +1035,7 @@ class MessageStore:
             raw_primary_values: list[float] = []
             for r in rows:
                 d = self._row_to_dict(r)
-                base_columns = 11
+                base_columns = 12
                 d["search_rank"] = r[base_columns] if len(r) > base_columns else None
                 d["snippet"] = r[base_columns + 1] if len(r) > (base_columns + 1) else ""
                 d["_directness_score"] = _message_directness_score(d.get("role"), d.get("content"), terms, phrases)
@@ -748,6 +1067,7 @@ class MessageStore:
     def _search_like(self, query: str, session_id: str | None = None,
                      limit: int = 20, sort: str | None = None,
                      source: str | None = None,
+                     conversation_id: str | None = None,
                      role: str | None = None,
                      time_from: float | None = None,
                      time_to: float | None = None) -> List[Dict[str, Any]]:
@@ -767,6 +1087,10 @@ class MessageStore:
         if source_clause:
             where.append(source_clause)
             args.extend(source_args)
+        conversation_clause, conversation_args = _conversation_filter_clause("conversation_id", conversation_id)
+        if conversation_clause:
+            where.append(conversation_clause)
+            args.extend(conversation_args)
         if role is not None:
             where.append("role = ?")
             args.append(role)
@@ -788,16 +1112,16 @@ class MessageStore:
         collapse_risky_repeats = contains_risky_fts_ascii(query)
         order_by = ""
         order_args: list[Any] = []
+        role_bias = "CASE role WHEN 'user' THEN 0 WHEN 'assistant' THEN 1 WHEN 'tool' THEN 2 ELSE 1 END"
+
+        def count_expr(term: str) -> tuple[str, list[Any]]:
+            return (
+                "((LENGTH(LOWER(content)) - LENGTH(REPLACE(LOWER(content), LOWER(?), ''))) "
+                "/ NULLIF(LENGTH(?), 0))",
+                [term, term],
+            )
+
         if normalized_sort == "recency":
-            role_bias = "CASE role WHEN 'user' THEN 0 WHEN 'assistant' THEN 1 WHEN 'tool' THEN 2 ELSE 1 END"
-
-            def count_expr(term: str) -> tuple[str, list[Any]]:
-                return (
-                    "((LENGTH(LOWER(content)) - LENGTH(REPLACE(LOWER(content), LOWER(?), ''))) "
-                    "/ NULLIF(LENGTH(?), 0))",
-                    [term, term],
-                )
-
             score_exprs: list[str] = []
             for term in terms:
                 if collapse_risky_repeats:
@@ -922,14 +1246,56 @@ class MessageStore:
                         offset += len(tie_rows)
                     break
         else:
-            rows = self._conn.execute(
-                f"""SELECT {_MESSAGE_SELECT_COLUMNS}
-                    FROM messages
-                    WHERE {' AND '.join(where)}
-                    LIMIT ?""",
-                [*base_args, fetch_limit],
-            ).fetchall()
-            add_rows(rows)
+            # Deterministic relevance/hybrid candidate scan for LIKE fallback.
+            # Apply the same coarse score/directness ordering before the hard
+            # candidate cap that Python uses below; otherwise a recent-biased
+            # window can exclude older but materially better relevance matches.
+            score_exprs: list[str] = []
+            order_args = []
+            for term in terms:
+                if collapse_risky_repeats:
+                    score_exprs.append("CASE WHEN content LIKE ? ESCAPE '\\' THEN 1 ELSE 0 END")
+                    order_args.append(f"%{escape_like(term)}%")
+                else:
+                    expr, expr_args = count_expr(term)
+                    score_exprs.append(expr)
+                    order_args.extend(expr_args)
+            score_expr = " + ".join(score_exprs) if score_exprs else "0"
+            exact_query = (query or "").strip()
+            exact_expr = "CASE WHEN LOWER(content) = LOWER(?) THEN 1 ELSE 0 END" if exact_query else "0"
+            exact_args: list[Any] = [exact_query] if exact_query else []
+            directness_expr = "0.0 + 0"
+
+            if normalized_sort == "hybrid":
+                primary_expr = (
+                    f"(({score_expr}) / (1 + (MAX(0.0, "
+                    f"((strftime('%s','now') - timestamp) / 3600.0)) * {AGE_DECAY_RATE})))"
+                )
+            else:
+                primary_expr = f"({score_expr})"
+
+            order_by = (
+                f"ORDER BY {primary_expr} DESC, ({exact_expr}) DESC, ({directness_expr}) DESC, "
+                f"{role_bias} ASC, timestamp DESC, store_id DESC"
+            )
+            candidate_cap = compute_search_candidate_cap(limit)
+            offset = 0
+            while offset < candidate_cap:
+                batch_limit = min(fetch_limit, candidate_cap - offset)
+                rows = self._conn.execute(
+                    f"""SELECT {_MESSAGE_SELECT_COLUMNS}
+                        FROM messages
+                        WHERE {' AND '.join(where)}
+                        {order_by}
+                        LIMIT ? OFFSET ?""",
+                    [*base_args, *order_args, *exact_args, batch_limit, offset],
+                ).fetchall()
+                if not rows:
+                    break
+                add_rows(rows)
+                offset += len(rows)
+                if len(rows) < batch_limit:
+                    break
 
         results.sort(key=lambda result: _fallback_result_sort_key(result, sort))
         for result in results:
@@ -944,10 +1310,11 @@ class MessageStore:
             return {}
         cols = [
             "store_id", "session_id", "source", "role", "content", "tool_call_id",
-            "tool_calls", "tool_name", "timestamp", "token_estimate", "pinned",
+            "tool_calls", "tool_name", "timestamp", "token_estimate", "pinned", "conversation_id",
         ]
         d = dict(zip(cols, row[:len(cols)]))
         d["source"] = _normalize_source_value(d.get("source"))
+        d["conversation_id"] = _normalize_conversation_id_value(d.get("conversation_id"))
         # Deserialize tool_calls JSON
         if d.get("tool_calls"):
             try:
@@ -969,15 +1336,70 @@ class MessageStore:
             msg["name"] = stored["tool_name"]
         return msg
 
+    # -- Connection access --------------------------------------------------
+
+    @property
+    def connection(self) -> sqlite3.Connection | None:
+        """The live SQLite connection, or ``None`` once :meth:`close` has run.
+
+        Exposed for read-oriented diagnostics and inspection -- integrity /
+        quick checks, FTS sync counts, schema health -- that need ad-hoc
+        queries the store does not wrap in a purpose-built method. Callers must
+        treat it as read-only and tolerate ``None``; writes still go through the
+        store's own methods so the ``_write_lock`` contract stays in one place.
+        """
+        return self._conn
+
+    def commit(self) -> None:
+        """Commit pending writes on the store connection.
+
+        Used by the backup path's cross-connection flush so callers do not reach
+        the private connection. Requires a live connection: a closed store
+        raises, matching direct ``_conn.commit()`` use.
+        """
+        with self._write_lock:
+            self._conn.commit()
+
+    def backup(self, dest: sqlite3.Connection) -> None:
+        """Copy the store's database into the already-open ``dest`` connection.
+
+        Thin wrapper over ``sqlite3.Connection.backup`` so callers snapshot the
+        store without reaching its private connection. Requires a live
+        connection, matching direct ``_conn.backup(dest)`` use.
+        """
+        with self._write_lock:
+            self._conn.backup(dest)
+
     # -- Lifecycle ----------------------------------------------------------
 
-    def close(self):
-        conn = getattr(self, "_conn", None)
-        if conn:
-            conn.close()
-            self._conn = None
+    def close(self) -> None:
+        from .lifecycle_metrics import (
+            begin_message_store_close,
+            complete_message_store_close,
+            fail_message_store_close,
+        )
 
-    def __del__(self):  # pragma: no cover - defensive resource cleanup
+        begin_message_store_close(self)
+        conn = getattr(self, "_conn", None)
+        try:
+            with getattr(self, "_write_lock", nullcontext()):
+                if conn:
+                    # Graceful shutdown hygiene: checkpoint committed WAL frames before
+                    # releasing the connection.  This does not run on crash/kill, and
+                    # PASSIVE can leave frames behind when another reader is active.
+                    try:
+                        conn.execute("PRAGMA wal_checkpoint(PASSIVE)")
+                    except sqlite3.Error:
+                        pass  # best-effort only; don't let this mask the real close()
+                    conn.close()
+                    self._conn = None
+        except Exception:
+            fail_message_store_close(self)
+            raise
+        else:
+            complete_message_store_close(self)
+
+    def __del__(self) -> None:  # pragma: no cover - defensive resource cleanup
         try:
             self.close()
         except Exception:

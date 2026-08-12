@@ -1,0 +1,71 @@
+# Changelog
+
+This repo also publishes GitHub Releases. This file is the repo-root release surface for operators who want the recent release arc without leaving the checkout.
+
+## Unreleased
+
+## v0.20.0 - 2026-07-23
+
+Release focus: Lossless-Claw parity plus the merged cross-session recall and temporal retrieval stack.
+
+- Completed the five selected Lossless-Claw parity behaviors: recoverable active-replay stubs for large externalized tool results; token-bounded fresh tails that preserve the newest message and complete tool-call/result groups; dry-run-first historical tool-output backfill with guarded rollback; bounded active-session externalized-payload search with strict ownership and recoverability checks; and bounded atomic threshold full sweeps with one final active-context publication. (#380, #381, #382, #413)
+- Shipped the merged #413 recall and temporal surface: `lcm_recall`, `lcm_recent`, and `lcm_load_session`; semantic and hybrid retrieval over summaries and message chunks; temporal rollups with bounded fallback; optional proactive recall; and the corresponding benchmark and reproduction documentation.
+- Release boundary: stock installs keep large-output externalization, active-replay stubbing, embeddings, temporal rollups, proactive recall, and threshold full sweeps disabled by default. Payload search requires explicit `content_scope`; historical backfill remains an operator-invoked, dry-run-first command. Committed benchmark results are directional evidence under their documented model and harness, not a universal provider-parity claim. This release does not include the later work tracked in #423, #434, or #436.
+
+## v0.19.0 - 2026-07-07
+
+Release focus: data-safety hardening, operator diagnostics, import tooling, benchmarking, and the WS5 engine decomposition.
+
+- Hardened lossless storage and replay boundaries: GC tombstones preserve surrounding text, ingest failures surface in status/doctor, ignored-message drops are counted, persisted Hermes tool outputs and redacted durable retries replay losslessly, and auxiliary bypass/session fallback edge cases are covered. (#298, #308, #310, #312, #313)
+- Strengthened storage and downgrade safety with serialized lifecycle/DAG writes, monotonic frontiers, path-contained externalized payloads, ReDoS-safe redaction, wrapped-base64 handling, a summary spend guard, and a schema-too-new open guard. (#300, #301, #302)
+- Added operator and migration surfaces: read-only `lcm_inspect`, JSONL session export import, compression no-op status, compaction telemetry, benchmark-backed preset validation, and steady-state hot-path benchmarks. (#295, #303, #306, #307, #309, #320)
+- Added CI-backed ruff linting and release/validation-friendly tooling updates, including follow-up JSONL import hardening and metadata JSON access through `MessageStore`. (#314, #315, #316)
+- Began and documented the behaviour-preserving WS5 decomposition of the ~9k-line `engine.py`: stateful method clusters became `*Mixin` classes (`compaction.py`, `reconcile.py`, `aux_session.py`, `placeholder_ledger.py`) mixed back into `LCMEngine`, and pure/helper groups became plain modules (`engine_registry.py`, `codex_routing.py`, `sqlite_util.py`, `runtime_identity.py`, `message_analysis.py`). (#323, #324, #325, #326, #327, #328, #329, #330, #331, #332, #333, #334, #335, #336, #337, #338, #339)
+
+## v0.18.1 - 2026-06-30
+
+Release focus: compaction privacy, clone/hook integrity, doctor signal accuracy, and model-context safety.
+
+- Excluded ignored backlog and stripped injected context before compaction, preventing ignored or synthetic context from entering LCM summaries. (#283, #282)
+- Preserved Discord lane metadata, active LCM clone resolution, and context metadata through cloned engines and post hooks. (#292, #293, #289)
+- Hardened runtime identity, raw tool call integrity refs, payload integrity checks, and doctor path/lifecycle diagnostics. (#281, #278, #279, #291, #273, #280)
+- Updated Codex OAuth effective context window safety defaults. (#274, #276)
+- Completed focus-topic demotion behavior and preserved raw session ownership across compression rollover. (#268, #269)
+- Refreshed operator docs, community-health files, and release-validation guidance. (#272)
+
+## v0.18.0 - 2026-06-18
+
+Release focus: retrieval depth, durability, status provenance, and long-session correctness.
+
+- Added recursive evidence support for `lcm_expand_query`, improving synthesized answers from expanded LCM context. (#266)
+- Hardened externalized payload durability. (#265)
+- Avoided duplicate ingest protection work on hot paths. (#262)
+- Aggregated DAG status stats for cheaper health surfaces. (#264)
+- Preserved source lineage after long sessions. (#263)
+- Surfaced LCM config provenance in runtime status. (#261)
+- Fixed per-turn ingest for WebUI sessions and batch timestamp deduplication. (#260)
+
+## v0.17.0 - 2026-06-14
+
+Release focus: automatic focus-topic derivation and lifecycle hygiene.
+
+- Added auto-derived focus topics during compression.
+- Added empty lifecycle-row garbage collection to prevent unbounded accumulation. (#256)
+- Improved runtime context indicators.
+
+## v0.16.x - 2026-06
+
+Release focus: engine isolation, WAL durability, database-path clarity, and startup cost control.
+
+- Isolated LCM engine state per agent. (#247)
+- Preferred bound sessions on sibling chains when the host has zero DAG.
+- Tuned compaction defaults and clarified context-threshold ownership. (#245)
+- Clarified `LCM_DATABASE_PATH` override behavior. (#249)
+- Hardened WAL durability and graceful-close checkpoints. (#237)
+- Throttled startup FTS integrity checks to reduce launch time. (#236)
+
+## Links
+
+- GitHub Releases: https://github.com/stephenschoettler/hermes-lcm/releases
+- Release workflow: [`.github/workflows/release.yml`](.github/workflows/release.yml)
+- Validation expectations: [`CONTRIBUTING.md`](CONTRIBUTING.md)

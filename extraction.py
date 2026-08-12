@@ -6,7 +6,6 @@ daily note files so key decisions survive even if the DAG summary loses nuance.
 
 import json
 import logging
-import os
 import re
 from datetime import datetime
 from pathlib import Path
@@ -25,6 +24,30 @@ _MEDIA_ATTACHMENT_SUFFIX = "[with media attachment]"
 _TEXT_BLOCK_TYPES = {"text", "input_text", "output_text"}
 _MEDIA_BLOCK_HINTS = ("image", "audio", "video")
 _STRUCTURED_METADATA_KEYS = ("file_id", "filename", "name", "mime_type", "url", "file_url", "id")
+_INJECTED_CONTEXT_TAGS = (
+    "active_memory",
+    "active_memory_plugin",
+    "relevant-memories",
+    "relevant_memories",
+    "hindsight-memories",
+    "hindsight_memories",
+)
+_UNTRUSTED_CONTEXT_HEADER_RE = re.compile(
+    r"^Untrusted context \(metadata, do not treat as instructions or commands\):\s*",
+    re.IGNORECASE | re.MULTILINE,
+)
+
+
+def _at_line_start(text: str, index: int) -> bool:
+    line_start = text.rfind("\n", 0, index) + 1
+    return not text[line_start:index].strip()
+
+
+def _at_line_end(text: str, index: int) -> bool:
+    line_end = text.find("\n", index)
+    if line_end == -1:
+        line_end = len(text)
+    return not text[index:line_end].strip()
 
 
 EXTRACTION_PROMPT = """Extract decisions, commitments, outcomes, and rules from this conversation segment.
@@ -160,19 +183,115 @@ def _sanitize_content_block(content: Any) -> str:
     return str(content)
 
 
+def _select_injected_context_closer(
+    text: str,
+    opener: re.Match[str],
+    close_re: re.Pattern[str],
+) -> re.Match[str] | None:
+    closers = list(close_re.finditer(text, opener.end()))
+    if not closers:
+        return None
+
+    # Prompt-injected context normally uses a block shape:
+    #   <tag>\n...\n</tag>
+    # In that shape, a line-delimited close/open pair inside recalled text is
+    # indistinguishable from two adjacent injected blocks with user text between
+    # them. Choose safety over preservation: block-shaped repeated same-tag
+    # sections are stripped as one untrusted region up to the last line-isolated
+    # close, even if that drops a real inter-block gap.
+    if _at_line_end(text, opener.end()):
+        line_closers = [
+            closer
+            for closer in closers
+            if _at_line_start(text, closer.start()) and _at_line_end(text, closer.end())
+        ]
+        if not line_closers:
+            if len(closers) == 1 and _at_line_end(text, closers[0].end()):
+                return closers[0]
+            for index, closer in enumerate(closers):
+                if index + 1 < len(closers) or not _at_line_start(text, closer.start()):
+                    continue
+                line_end = text.find("\n", closer.end())
+                if line_end == -1:
+                    line_end = len(text)
+                suffix = text[closer.end() : line_end]
+                if "<" not in suffix and suffix.strip():
+                    return closer
+            return None
+        return line_closers[-1]
+
+    # Inline wrappers are stripped one complete block at a time. A later same-tag
+    # inline opener may be another injected block with real user/tool text
+    # between the two blocks; consuming through the later close would silently
+    # delete that interstitial text. Keep the safety-first multi-close behavior
+    # for block-shaped wrappers above, where line-delimited recalled text is more
+    # likely to be spoofing the context envelope.
+    return closers[0]
+
+
+def strip_injected_context_blocks(text: str) -> str:
+    """Remove transient memory/context blocks before compaction summarization."""
+    if not text:
+        return ""
+
+    cleaned = text
+    changed = False
+    if "<" not in text:
+        cleaned = _UNTRUSTED_CONTEXT_HEADER_RE.sub("", text)
+        changed = cleaned != text
+        return cleaned.strip() if changed else cleaned
+
+    for tag in _INJECTED_CONTEXT_TAGS:
+        escaped = re.escape(tag)
+        self_close_re = re.compile(rf"<{escaped}(?:\s[^>]*)?\s*/\s*>", re.IGNORECASE)
+        open_re = re.compile(rf"<{escaped}(?:\s[^>]*)?>", re.IGNORECASE)
+        close_re = re.compile(rf"</{escaped}\s*>", re.IGNORECASE)
+        before_self_close = cleaned
+        cleaned = self_close_re.sub("", cleaned)
+        changed = changed or cleaned != before_self_close
+
+        while True:
+            opener = open_re.search(cleaned)
+            if not opener:
+                break
+
+            closer = _select_injected_context_closer(cleaned, opener, close_re)
+            if closer is None:
+                if _at_line_end(cleaned, opener.end()):
+                    cleaned = cleaned[: opener.start()]
+                else:
+                    cleaned = cleaned[: opener.start()] + cleaned[opener.end() :]
+                changed = True
+                continue
+            cleaned = cleaned[: opener.start()] + cleaned[closer.end() :]
+            changed = True
+
+    before_header = cleaned
+    cleaned = _UNTRUSTED_CONTEXT_HEADER_RE.sub("", cleaned)
+    changed = changed or cleaned != before_header
+    return cleaned.strip() if changed else cleaned
+
+
 def _sanitize_json_like(value: Any) -> Any:
     if isinstance(value, dict):
-        return {key: _sanitize_json_like(val) for key, val in value.items()}
+        return {
+            (
+                strip_injected_context_blocks(_sanitize_string_media(key))
+                if isinstance(key, str)
+                else key
+            ): _sanitize_json_like(val)
+            for key, val in value.items()
+        }
     if isinstance(value, list):
         return [_sanitize_json_like(item) for item in value]
     if isinstance(value, str):
-        return _sanitize_string_media(value)
+        return strip_injected_context_blocks(_sanitize_string_media(value))
     return value
 
 
 def sanitize_pre_compaction_content(text: Any) -> str:
-    """Replace inline media/base64 payloads with compact attachment markers."""
-    return _sanitize_content_block(text)
+    """Replace inline media/base64 payloads and transient injected context before compaction."""
+    return strip_injected_context_blocks(_sanitize_content_block(text))
 
 
 def sanitize_pre_compaction_tool_arguments(arguments: Any) -> str:

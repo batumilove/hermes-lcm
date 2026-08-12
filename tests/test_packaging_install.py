@@ -1,7 +1,25 @@
 from pathlib import Path
 import importlib.util
+import logging
+import os
+import shutil
 import subprocess
 import sys
+import types
+
+
+EXPECTED_LCM_TOOLS = {
+    "lcm_grep",
+    "lcm_recall",
+    "lcm_recent",
+    "lcm_load_session",
+    "lcm_describe",
+    "lcm_expand",
+    "lcm_expand_query",
+    "lcm_status",
+    "lcm_inspect",
+    "lcm_doctor",
+}
 
 
 def _load_plugin_entrypoint_module(module_name: str):
@@ -12,8 +30,9 @@ def _load_plugin_entrypoint_module(module_name: str):
         submodule_search_locations=[str(repo_root)],
     )
     module = importlib.util.module_from_spec(spec)
-    sys.modules[module_name] = module
+    assert spec is not None
     assert spec.loader is not None
+    sys.modules[module_name] = module
     spec.loader.exec_module(module)
     return module
 
@@ -28,6 +47,9 @@ def _register_plugin_engine(module_name: str):
         def register_context_engine(self, engine):
             self.engine = engine
 
+        def register_tool(self, name, toolset, schema, handler, description="", emoji=""):
+            pass
+
     ctx = _Ctx()
     module.register(ctx)
     return ctx.engine
@@ -38,27 +60,122 @@ def test_standalone_install_scripts_exist_and_are_shell_scripts():
 
     install_script = repo_root / "scripts" / "install.sh"
     update_script = repo_root / "scripts" / "update.sh"
+    validate_script = repo_root / "scripts" / "validate_release.sh"
 
     assert install_script.exists(), "scripts/install.sh should exist"
     assert update_script.exists(), "scripts/update.sh should exist"
+    assert validate_script.exists(), "scripts/validate_release.sh should exist"
     assert install_script.read_text(encoding="utf-8").startswith("#!/usr/bin/env bash\n")
     assert update_script.read_text(encoding="utf-8").startswith("#!/usr/bin/env bash\n")
+    assert validate_script.read_text(encoding="utf-8").startswith("#!/usr/bin/env bash\n")
+
+
+def test_validate_release_routes_cache_artifacts_outside_checkout():
+    repo_root = Path(__file__).resolve().parent.parent
+    validate_script = (repo_root / "scripts" / "validate_release.sh").read_text(encoding="utf-8")
+
+    assert "PYTHONPYCACHEPREFIX=\"$OUTPUT_DIR/pycache\"" in validate_script
+    assert "PYTEST_ADDOPTS=\"-p no:cacheprovider" in validate_script
+    assert "dirty_start=\"$(git status --short" in validate_script
+    assert "dirty_end=\"$(git status --short" in validate_script
+    assert "validation changed git status" in validate_script
+    assert "run_pytest()" in validate_script
+    assert "ensure_agent_context_engine_importable()" in validate_script
+    assert "run_gate \"focused pytest\" run_pytest" in validate_script
+    assert "run_gate \"pytest full\" run_pytest" in validate_script
+    assert "run_low_fd_pytest" in validate_script
+    assert "ulimit -n 1024 &&" not in validate_script
+
+
+def test_validate_release_checks_committed_pr_diff_against_origin_main(tmp_path):
+    repo_root = Path(__file__).resolve().parent.parent
+    source_script = repo_root / "scripts" / "validate_release.sh"
+    true_bin = shutil.which("true")
+    assert true_bin is not None
+
+    repo = tmp_path / "repo"
+    scripts_dir = repo / "scripts"
+    scripts_dir.mkdir(parents=True)
+    shutil.copy2(source_script, scripts_dir / "validate_release.sh")
+
+    def git(*args):
+        subprocess.run(["git", *args], cwd=repo, check=True, capture_output=True, text=True)
+
+    git("init", "-b", "main")
+    git("config", "user.name", "Hermes Test")
+    git("config", "user.email", "hermes-test@example.invalid")
+    (repo / "README.md").write_text("clean\n", encoding="utf-8")
+    git("add", "README.md", "scripts/validate_release.sh")
+    git("commit", "-m", "base")
+    git("update-ref", "refs/remotes/origin/main", "HEAD")
+    git("checkout", "-b", "feature")
+    (repo / "bad.txt").write_text("committed trailing whitespace  \n", encoding="utf-8")
+    git("add", "bad.txt")
+    git("commit", "-m", "add bad whitespace")
+
+    output_dir = tmp_path / "validation-output"
+    result = subprocess.run(
+        ["bash", "scripts/validate_release.sh", "--output", str(output_dir)],
+        cwd=repo,
+        env={**os.environ, "PYTHON": true_bin},
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+
+    assert result.returncode != 0
+    assert "FAILED: git diff check (origin/main...HEAD)" in result.stderr
+    checklist = output_dir / "validation-checklist.md"
+    assert checklist.exists()
+    assert "diff_check_range: origin/main...HEAD" in checklist.read_text(encoding="utf-8")
+
+
+def test_validate_release_checks_last_commit_when_origin_main_missing(tmp_path):
+    repo_root = Path(__file__).resolve().parent.parent
+    source_script = repo_root / "scripts" / "validate_release.sh"
+    true_bin = shutil.which("true")
+    assert true_bin is not None
+
+    repo = tmp_path / "repo"
+    scripts_dir = repo / "scripts"
+    scripts_dir.mkdir(parents=True)
+    shutil.copy2(source_script, scripts_dir / "validate_release.sh")
+
+    def git(*args):
+        subprocess.run(["git", *args], cwd=repo, check=True, capture_output=True, text=True)
+
+    git("init", "-b", "main")
+    git("config", "user.name", "Hermes Test")
+    git("config", "user.email", "hermes-test@example.invalid")
+    (repo / "README.md").write_text("clean\n", encoding="utf-8")
+    git("add", "README.md", "scripts/validate_release.sh")
+    git("commit", "-m", "base")
+    (repo / "bad.txt").write_text("committed trailing whitespace  \n", encoding="utf-8")
+    git("add", "bad.txt")
+    git("commit", "-m", "add bad whitespace")
+
+    output_dir = tmp_path / "validation-output"
+    result = subprocess.run(
+        ["bash", "scripts/validate_release.sh", "--output", str(output_dir)],
+        cwd=repo,
+        env={**os.environ, "PYTHON": true_bin},
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+
+    assert result.returncode != 0
+    assert "FAILED: git diff check (HEAD^...HEAD)" in result.stderr
+    checklist = output_dir / "validation-checklist.md"
+    assert checklist.exists()
+    assert "diff_check_range: HEAD^...HEAD" in checklist.read_text(encoding="utf-8")
 
 
 def test_plugin_manifest_lists_all_registered_tools():
     repo_root = Path(__file__).resolve().parent.parent
     manifest = (repo_root / "plugin.yaml").read_text(encoding="utf-8")
 
-    expected_tools = {
-        "lcm_grep",
-        "lcm_load_session",
-        "lcm_describe",
-        "lcm_expand",
-        "lcm_expand_query",
-        "lcm_status",
-        "lcm_doctor",
-    }
-    for tool_name in expected_tools:
+    for tool_name in EXPECTED_LCM_TOOLS:
         assert f"  - {tool_name}\n" in manifest
 
 
@@ -115,6 +232,28 @@ def test_install_script_refuses_to_replace_existing_non_symlink_path(tmp_path):
     assert target.is_dir()
 
 
+def test_lcm_grep_time_filters_use_anyof_not_union_type_arrays():
+    engine = _register_plugin_engine("hermes_lcm_schema_shape")
+    assert engine is not None
+    schemas = {schema["name"]: schema for schema in engine.get_tool_schemas()}
+    properties = schemas["lcm_grep"]["parameters"]["properties"]
+
+    for name in ("time_from", "time_to"):
+        field = properties[name]
+        assert field["anyOf"] == [{"type": "number"}, {"type": "string"}]
+        assert "type" not in field
+
+
+def test_lcm_grep_declares_opt_in_externalized_content_scope():
+    engine = _register_plugin_engine("hermes_lcm_externalized_search_schema")
+    schema = next(item for item in engine.get_tool_schemas() if item["name"] == "lcm_grep")
+    properties = schema["parameters"]["properties"]
+
+    assert properties["content_scope"]["default"] == "history"
+    assert properties["content_scope"]["enum"] == ["history", "externalized", "both"]
+    assert properties["externalized_refs"]["maxItems"] == 256
+
+
 def test_plugin_entrypoint_registers_lcm_context_engine():
     engine = _register_plugin_engine("hermes_lcm_packaging_entrypoint")
 
@@ -123,7 +262,7 @@ def test_plugin_entrypoint_registers_lcm_context_engine():
     identity = engine.get_status()["runtime_identity"]
     repo_root = Path(__file__).resolve().parent.parent
     assert identity["plugin_name"] == "hermes-lcm"
-    assert identity["plugin_version"] == "0.10.2"
+    assert identity["plugin_version"] == "0.20.0"
     assert Path(identity["plugin_path"]) == repo_root
     assert identity["database_path_source"] in {"config.database_path", "hermes_home", "default_home"}
     assert identity["plugin_git_commit"]
@@ -133,21 +272,274 @@ def test_plugin_entrypoint_registers_lcm_context_engine():
     assert "plugin_git_dirty" in identity
 
     tool_names = {schema["name"] for schema in engine.get_tool_schemas()}
-    assert {
-        "lcm_grep",
-        "lcm_load_session",
-        "lcm_describe",
-        "lcm_expand",
-        "lcm_expand_query",
-        "lcm_status",
-        "lcm_doctor",
-    }.issubset(tool_names)
+    assert EXPECTED_LCM_TOOLS.issubset(tool_names)
+
+
+def test_plugin_entrypoint_loads_under_hermes_namespaced_module(tmp_path):
+    """The real host imports user plugins as ``hermes_plugins.<name>``.
+
+    Run in an isolated interpreter so the test suite's compatibility alias for
+    ``hermes_lcm`` cannot hide absolute intra-package imports.
+    """
+    repo_root = Path(__file__).resolve().parent.parent
+    script = r"""
+import importlib.util
+from pathlib import Path
+import sys
+import types
+
+repo_root = Path(sys.argv[1])
+package_name = "hermes_plugins.hermes_lcm"
+
+agent_package = types.ModuleType("agent")
+agent_package.__path__ = []
+context_engine_module = types.ModuleType("agent.context_engine")
+
+class ContextEngine:
+    def __init__(self, **kwargs):
+        self.compression_count = 0
+        self.last_prompt_tokens = 0
+
+context_engine_module.ContextEngine = ContextEngine
+agent_package.context_engine = context_engine_module
+sys.modules["agent"] = agent_package
+sys.modules["agent.context_engine"] = context_engine_module
+
+namespace = types.ModuleType("hermes_plugins")
+namespace.__path__ = []
+sys.modules["hermes_plugins"] = namespace
+spec = importlib.util.spec_from_file_location(
+    package_name,
+    repo_root / "__init__.py",
+    submodule_search_locations=[str(repo_root)],
+)
+assert spec is not None and spec.loader is not None
+module = importlib.util.module_from_spec(spec)
+sys.modules[package_name] = module
+spec.loader.exec_module(module)
+
+class Ctx:
+    context_engine_tool_handlers_receive_messages = False
+
+    def __init__(self):
+        self.engine = None
+
+    def register_context_engine(self, engine):
+        self.engine = engine
+
+    def register_tool(self, *args, **kwargs):
+        pass
+
+ctx = Ctx()
+module.register(ctx)
+assert ctx.engine is not None
+assert ctx.engine.name == "lcm"
+ctx.engine.shutdown()
+"""
+    hermes_home = tmp_path / "hermes-home"
+    result = subprocess.run(
+        [sys.executable, "-I", "-c", script, str(repo_root)],
+        cwd=tmp_path,
+        env={**os.environ, "HOME": str(tmp_path), "HERMES_HOME": str(hermes_home)},
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+
+    assert result.returncode == 0, result.stderr
+
+
+def test_plugin_entrypoint_registers_declared_lcm_tools():
+    module = _load_plugin_entrypoint_module("hermes_lcm_packaging_tool_registration")
+    registered = []
+
+    class _Ctx:
+        context_engine_tool_handlers_receive_messages = True
+
+        def __init__(self):
+            self.engine = None
+
+        def register_context_engine(self, engine):
+            self.engine = engine
+
+        def register_tool(self, name, toolset, schema, handler, description="", emoji=""):
+            registered.append(
+                {
+                    "name": name,
+                    "toolset": toolset,
+                    "schema": schema,
+                    "handler": handler,
+                    "description": description,
+                    "emoji": emoji,
+                }
+            )
+
+    ctx = _Ctx()
+    module.register(ctx)
+
+    assert ctx.engine is not None
+    assert {entry["name"] for entry in registered} == EXPECTED_LCM_TOOLS
+    assert {entry["toolset"] for entry in registered} == {"context_engine"}
+    for entry in registered:
+        assert entry["schema"]["name"] == entry["name"]
+        assert entry["description"] == entry["schema"].get("description", "")
+        assert callable(entry["handler"])
+
+
+def test_plugin_entrypoint_skips_registered_lcm_tools_without_message_forwarding():
+    module = _load_plugin_entrypoint_module("hermes_lcm_packaging_tool_registration_unsafe_host")
+    registered = {}
+
+    class _HermesAgentLikeCtx:
+        def __init__(self):
+            self.engine = None
+
+        def register_context_engine(self, engine):
+            self.engine = engine
+
+        def register_tool(self, name, toolset, schema, handler, description="", emoji=""):
+            registered[name] = {
+                "handler": handler,
+                "toolset": toolset,
+            }
+
+        def registry_dispatch(self, name, args):
+            return registered[name]["handler"](
+                args,
+                task_id="task-1",
+                user_task="find current turn",
+            )
+
+    ctx = _HermesAgentLikeCtx()
+    module.register(ctx)
+
+    assert ctx.engine is not None
+    assert registered == {}
+    assert EXPECTED_LCM_TOOLS.issubset({schema["name"] for schema in ctx.engine.get_tool_schemas()})
+
+
+def test_capability_false_host_log_describes_expected_path_b_fallback(caplog):
+    module = _load_plugin_entrypoint_module("hermes_lcm_packaging_expected_path_b_fallback")
+    registered = []
+
+    class _HermesAgentV016LikeCtx:
+        def __init__(self):
+            self.engine = None
+
+        def register_context_engine(self, engine):
+            self.engine = engine
+
+        def register_tool(self, name, toolset, schema, handler, description="", emoji=""):
+            registered.append(name)
+
+    ctx = _HermesAgentV016LikeCtx()
+    caplog.set_level(logging.INFO)
+
+    module.register(ctx)
+
+    messages = "\n".join(record.getMessage() for record in caplog.records)
+    assert ctx.engine is not None
+    assert registered == []
+    assert EXPECTED_LCM_TOOLS.issubset({schema["name"] for schema in ctx.engine.get_tool_schemas()})
+    assert "LCM tools are available through context-engine schemas" in messages
+    assert "expected Path B fallback" in messages
+    assert "tool registration skipped because" not in messages
+
+
+def test_register_gracefully_degrades_when_host_lacks_register_tool():
+    module = _load_plugin_entrypoint_module("hermes_lcm_packaging_no_register_tool")
+
+    class _CtxNoTool:
+        def __init__(self):
+            self.engine = None
+
+        def register_context_engine(self, engine):
+            self.engine = engine
+
+    ctx = _CtxNoTool()
+    module.register(ctx)
+
+    assert ctx.engine is not None
+    assert ctx.engine.name == "lcm"
+
+
+def test_register_gracefully_degrades_when_register_tool_hook_raises():
+    module = _load_plugin_entrypoint_module("hermes_lcm_packaging_register_tool_raises")
+
+    class _CtxRaisesTool:
+        context_engine_tool_handlers_receive_messages = True
+
+        def __init__(self):
+            self.engine = None
+            self.register_tool_calls = []
+
+        def register_context_engine(self, engine):
+            self.engine = engine
+
+        def register_tool(self, name, toolset, schema, handler, description="", emoji=""):
+            self.register_tool_calls.append(name)
+            raise TypeError("host register_tool signature mismatch")
+
+    ctx = _CtxRaisesTool()
+    module.register(ctx)
+
+    assert ctx.engine is not None
+    assert ctx.engine.name == "lcm"
+    assert ctx.register_tool_calls
+
+
+def test_registered_tool_handlers_route_through_engine_handle_tool_call(monkeypatch):
+    module = _load_plugin_entrypoint_module("hermes_lcm_packaging_tool_handler_route")
+    registered = {}
+
+    class _Ctx:
+        context_engine_tool_handlers_receive_messages = True
+
+        def __init__(self):
+            self.engine = None
+
+        def register_context_engine(self, engine):
+            self.engine = engine
+
+        def register_tool(self, name, toolset, schema, handler, description="", emoji=""):
+            registered[name] = handler
+
+        def registry_dispatch(self, name, args, messages):
+            return registered[name](
+                args,
+                task_id="task-1",
+                user_task="find current turn",
+                messages=messages,
+            )
+
+    ctx = _Ctx()
+    module.register(ctx)
+    assert ctx.engine is not None
+    assert set(registered) == EXPECTED_LCM_TOOLS
+
+    calls = []
+
+    def spy_handle_tool_call(name, args, **kwargs):
+        calls.append((name, args, kwargs))
+        return f"handled:{name}"
+
+    monkeypatch.setattr(ctx.engine, "handle_tool_call", spy_handle_tool_call)
+    messages = [{"role": "user", "content": "find current turn"}]
+
+    for tool_name in registered:
+        args = {"query": "current turn"}
+        assert ctx.registry_dispatch(tool_name, args, messages) == f"handled:{tool_name}"
+
+    assert {name for name, _, _ in calls} == EXPECTED_LCM_TOOLS
+    for name, args, kwargs in calls:
+        assert args == {"query": "current turn"}
+        assert kwargs["messages"] == messages
 
 
 def test_git_runtime_identity_preserves_unknown_dirty_state_when_git_probe_fails(tmp_path, monkeypatch):
     module_name = "hermes_lcm_packaging_entrypoint_git_probe_failure"
     _register_plugin_engine(module_name)
-    engine_module = sys.modules[f"{module_name}.engine"]
+    identity_module = sys.modules[f"{module_name}.runtime_identity"]
 
     checkout = tmp_path / "checkout"
     (checkout / ".git").mkdir(parents=True)
@@ -155,10 +547,9 @@ def test_git_runtime_identity_preserves_unknown_dirty_state_when_git_probe_fails
     def fail_git(*args, **kwargs):
         raise OSError("git unavailable")
 
-    monkeypatch.setattr(engine_module.subprocess, "run", fail_git)
+    monkeypatch.setattr(identity_module.subprocess, "run", fail_git)
 
-    identity = engine_module._git_runtime_identity(checkout)
-
+    identity = identity_module._git_runtime_identity(checkout)
     assert identity["plugin_git_commit"] == ""
     assert identity["plugin_git_branch"] == ""
     assert identity["plugin_git_dirty"] is None
@@ -166,28 +557,29 @@ def test_git_runtime_identity_preserves_unknown_dirty_state_when_git_probe_fails
 
 
 def test_git_runtime_identity_reports_untracked_files_as_dirty(tmp_path, monkeypatch):
-    module_name = "hermes_lcm_packaging_entrypoint_git_untracked_dirty"
+    module_name = "hermes_lcm_packaging_entrypoint_git_untracked"
     _register_plugin_engine(module_name)
-    engine_module = sys.modules[f"{module_name}.engine"]
+    identity_module = sys.modules[f"{module_name}.runtime_identity"]
 
     checkout = tmp_path / "checkout"
     (checkout / ".git").mkdir(parents=True)
+    (checkout / "untracked.txt").write_text("hi", encoding="utf-8")
 
-    def fake_git(args, **kwargs):
-        if "status" in args:
-            assert "--untracked-files=no" not in args
-            return subprocess.CompletedProcess(args, 0, stdout="?? scratch.txt\n", stderr="")
-        if args[-2:] == ["rev-parse", "HEAD"]:
-            return subprocess.CompletedProcess(args, 0, stdout="abc123\n", stderr="")
-        if args[-3:] == ["rev-parse", "--abbrev-ref", "HEAD"]:
-            return subprocess.CompletedProcess(args, 0, stdout="main\n", stderr="")
-        if args[-4:] == ["config", "--get", "remote.origin.url"]:
-            return subprocess.CompletedProcess(args, 0, stdout="https://github.com/example/repo.git\n", stderr="")
-        return subprocess.CompletedProcess(args, 1, stdout="", stderr="unexpected")
+    def fake_git(*args, **kwargs):
+        cmd = args[0]
+        if cmd[-2:] == ["status", "--porcelain"]:
+            return subprocess.CompletedProcess(cmd, 0, stdout="?? untracked.txt\n", stderr="")
+        if cmd[-2:] == ["rev-parse", "HEAD"]:
+            return subprocess.CompletedProcess(cmd, 0, stdout="abc123\n", stderr="")
+        if cmd[-3:] == ["rev-parse", "--abbrev-ref", "HEAD"]:
+            return subprocess.CompletedProcess(cmd, 0, stdout="main\n", stderr="")
+        if cmd[-4:] == ["config", "--get", "remote.origin.url"]:
+            return subprocess.CompletedProcess(cmd, 0, stdout="https://github.com/example/repo.git\n", stderr="")
+        return subprocess.CompletedProcess(cmd, 1, stdout="", stderr="unexpected")
 
-    monkeypatch.setattr(engine_module.subprocess, "run", fake_git)
+    monkeypatch.setattr(identity_module.subprocess, "run", fake_git)
 
-    identity = engine_module._git_runtime_identity(checkout)
+    identity = identity_module._git_runtime_identity(checkout)
 
     assert identity["plugin_git_dirty"] is True
 
@@ -197,3 +589,352 @@ def test_plugin_entrypoint_registration_is_repeatable_and_returns_lcm_engine():
 
     assert engine is not None
     assert engine.name == "lcm"
+
+
+def test_register_gracefully_degrades_when_legacy_host_lacks_register_tool():
+    """Guard regression: register() must not raise when ctx lacks register_tool."""
+    module = _load_plugin_entrypoint_module("hermes_lcm_no_register_tool")
+
+    class _CtxNoTool:
+        def __init__(self):
+            self.engine = None
+        def register_context_engine(self, engine):
+            self.engine = engine
+
+    ctx = _CtxNoTool()
+    # Must not raise AttributeError on hosts without register_tool
+    module.register(ctx)
+    assert ctx.engine is not None
+    assert ctx.engine.name == "lcm"
+
+
+def test_register_continues_when_register_tool_raises_type_error():
+    """Regression: register() must not abort when register_tool exists but raises TypeError."""
+    module = _load_plugin_entrypoint_module("hermes_lcm_type_error_tool")
+
+    class _CtxRaisingTool:
+        context_engine_tool_handlers_receive_messages = True
+
+        def __init__(self):
+            self.engine = None
+        def register_context_engine(self, engine):
+            self.engine = engine
+        def register_tool(self, name, toolset, schema, handler, description="", emoji=""):
+            raise TypeError("host register_tool signature mismatch")
+
+    ctx = _CtxRaisingTool()
+    # Must not raise — should log warning and continue
+    module.register(ctx)
+    assert ctx.engine is not None
+    assert ctx.engine.name == "lcm"
+
+
+def test_registered_tool_handler_forwards_messages_to_engine_handle_tool_call(monkeypatch):
+    """Regression: registered tool handlers must forward kwargs (incl. messages=...)
+    to engine.handle_tool_call(), preserving equivalent current-turn ingest behavior.
+
+    Note: This test uses a _CtxRecord with **kwargs to simulate a host that
+    supports message-forwarding. With the new gating logic, hosts with rigid
+    register_tool signatures will NOT have tools registered — they rely on
+    the native context-engine path instead.
+    """
+    module = _load_plugin_entrypoint_module("hermes_lcm_handler_forward")
+
+    registered = {}  # tool_name -> handler
+
+    class _CtxRecord:
+        context_engine_tool_handlers_receive_messages = True
+
+        def __init__(self):
+            self.engine = None
+        def register_context_engine(self, engine):
+            self.engine = engine
+        def register_tool(self, name, toolset, schema, handler, **kwargs):
+            registered[name] = handler
+
+    ctx = _CtxRecord()
+    module.register(ctx)
+    assert ctx.engine is not None
+
+    # Spy on handle_tool_call
+    calls = []
+    original_handle = ctx.engine.handle_tool_call
+    def spy_handle(name, args, **kwargs):
+        calls.append((name, args, kwargs))
+        return original_handle(name, args, **kwargs)
+    monkeypatch.setattr(ctx.engine, "handle_tool_call", spy_handle)
+
+    # Call each registered handler with messages=... kwarg
+    test_messages = [{"role": "user", "content": "test"}]
+    for tool_name in ("lcm_grep", "lcm_status", "lcm_inspect", "lcm_doctor"):
+        handler = registered.get(tool_name)
+        assert handler is not None, f"handler for {tool_name} not registered"
+        result = handler({"query": tool_name}, messages=test_messages)
+        assert isinstance(result, str), f"{tool_name} handler should return str"
+        assert len(result) > 0, f"{tool_name} handler should return non-empty result"
+
+    # Verify handle_tool_call was invoked for each
+    called_names = {c[0] for c in calls}
+    assert "lcm_grep" in called_names
+    assert "lcm_status" in called_names
+    assert "lcm_doctor" in called_names
+
+    # Verify messages=... kwarg was forwarded
+    for name, args, kwargs in calls:
+        assert "messages" in kwargs, f"{name}: messages kwarg not forwarded"
+        # Depending on whether engine passes it through, at minimum verify it arrived
+        assert kwargs["messages"] == test_messages, f"{name}: messages content mismatch"
+
+
+def test_post_llm_hook_resolves_registered_active_clone_without_host_context_compressor(monkeypatch, tmp_path):
+    module = _load_plugin_entrypoint_module("hermes_lcm_post_hook_registered_clone")
+    manager = types.SimpleNamespace(_hooks={})
+    fake_plugins = types.SimpleNamespace(get_plugin_manager=lambda: manager)
+    fake_hermes_cli = types.SimpleNamespace(plugins=fake_plugins)
+    monkeypatch.setitem(sys.modules, "hermes_cli", fake_hermes_cli)
+    monkeypatch.setitem(sys.modules, "hermes_cli.plugins", fake_plugins)
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / "hermes_home"))
+
+    class _CtxNoTool:
+        def __init__(self):
+            self.engine = None
+
+        def register_context_engine(self, engine):
+            self.engine = engine
+
+    ctx = _CtxNoTool()
+    module.register(ctx)
+    assert ctx.engine is not None
+
+    active_clone = ctx.engine.clone_for_agent()
+    active_clone.on_session_start(
+        "discord-session",
+        platform="discord",
+        conversation_id="agent:main:discord:thread:t:t",
+    )
+    hook = manager._hooks["post_llm_call"][-1]
+    history = [{"role": "user", "content": "registered clone canary"}]
+
+    clone_ingests = []
+    singleton_ingests = []
+
+    def spy_clone_ingest(messages):
+        clone_ingests.append(list(messages))
+
+    def spy_singleton_ingest(messages):
+        singleton_ingests.append(list(messages))
+
+    monkeypatch.setattr(active_clone, "ingest", spy_clone_ingest)
+    monkeypatch.setattr(ctx.engine, "ingest", spy_singleton_ingest)
+
+    hook(
+        session_id="discord-session",
+        conversation_id="agent:main:discord:thread:t:t",
+        platform="discord",
+        conversation_history=history,
+    )
+
+    assert clone_ingests == [history]
+    assert singleton_ingests == []
+    assert active_clone.current_session_id == "discord-session"
+    assert active_clone.current_conversation_id == "agent:main:discord:thread:t:t"
+    assert ctx.engine.current_session_id == ""
+    active_clone.shutdown()
+    ctx.engine.shutdown()
+
+
+def test_post_llm_hook_ignores_stale_registered_clone_after_rebind(monkeypatch, tmp_path):
+    for lookup_mode in ("session", "conversation", "mismatched_conversation"):
+        module = _load_plugin_entrypoint_module(f"hermes_lcm_post_hook_stale_{lookup_mode}")
+        manager = types.SimpleNamespace(_hooks={})
+        fake_plugins = types.SimpleNamespace(get_plugin_manager=lambda: manager)
+        fake_hermes_cli = types.SimpleNamespace(plugins=fake_plugins)
+        monkeypatch.setitem(sys.modules, "hermes_cli", fake_hermes_cli)
+        monkeypatch.setitem(sys.modules, "hermes_cli.plugins", fake_plugins)
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path / f"hermes_home_{lookup_mode}"))
+
+        class _CtxNoTool:
+            def __init__(self):
+                self.engine = None
+
+            def register_context_engine(self, engine):
+                self.engine = engine
+
+        ctx = _CtxNoTool()
+        module.register(ctx)
+        active_clone = ctx.engine.clone_for_agent()
+        active_clone.on_session_start(
+            "session-a",
+            platform="discord",
+            conversation_id="agent:main:discord:thread:a:a",
+        )
+        active_clone.on_session_start(
+            "session-b",
+            platform="discord",
+            conversation_id="agent:main:discord:thread:b:b",
+        )
+
+        clone_ingests = []
+        singleton_ingests = []
+        monkeypatch.setattr(active_clone, "ingest", lambda messages: clone_ingests.append(list(messages)))
+        monkeypatch.setattr(ctx.engine, "ingest", lambda messages: singleton_ingests.append(list(messages)))
+
+        history = [{"role": "user", "content": f"old {lookup_mode}"}]
+        kwargs = {
+            "conversation_id": "agent:main:discord:thread:a:a",
+            "platform": "discord",
+            "conversation_history": history,
+        }
+        if lookup_mode == "session":
+            kwargs["session_id"] = "session-a"
+        elif lookup_mode == "mismatched_conversation":
+            kwargs["session_id"] = "session-b"
+
+        manager._hooks["post_llm_call"][-1](**kwargs)
+
+        if lookup_mode == "mismatched_conversation":
+            assert clone_ingests == [history]
+            assert singleton_ingests == []
+        else:
+            assert clone_ingests == []
+            assert singleton_ingests == [history]
+        assert active_clone.current_session_id == "session-b"
+        assert active_clone.current_conversation_id == "agent:main:discord:thread:b:b"
+
+        if lookup_mode == "mismatched_conversation":
+            clone_ingests.clear()
+            manager._hooks["post_llm_call"][-1](
+                session_id="session-b",
+                platform="discord",
+                conversation_history=[{"role": "user", "content": "session only"}],
+            )
+            assert clone_ingests == [[{"role": "user", "content": "session only"}]]
+        active_clone.shutdown()
+        ctx.engine.shutdown()
+
+
+def test_post_llm_hook_prefers_active_lcm_clone(monkeypatch, tmp_path):
+    module = _load_plugin_entrypoint_module("hermes_lcm_post_hook_active_clone")
+    manager = types.SimpleNamespace(_hooks={})
+    fake_plugins = types.SimpleNamespace(get_plugin_manager=lambda: manager)
+    fake_hermes_cli = types.SimpleNamespace(plugins=fake_plugins)
+    monkeypatch.setitem(sys.modules, "hermes_cli", fake_hermes_cli)
+    monkeypatch.setitem(sys.modules, "hermes_cli.plugins", fake_plugins)
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / "hermes_home"))
+
+    class _CtxNoTool:
+        def __init__(self):
+            self.engine = None
+
+        def register_context_engine(self, engine):
+            self.engine = engine
+
+    ctx = _CtxNoTool()
+    module.register(ctx)
+    assert ctx.engine is not None
+
+    class _ActiveClone:
+        name = "lcm"
+
+        def __init__(self):
+            self.current_session_id = ""
+            self.current_conversation_id = ""
+            self.starts = []
+            self.ingested = []
+
+        def on_session_start(self, session_id, **kwargs):
+            self.current_session_id = session_id
+            self.current_conversation_id = kwargs.get("conversation_id") or session_id
+            self.starts.append((session_id, kwargs))
+
+        def ingest(self, history):
+            self.ingested.append(list(history))
+
+    active = _ActiveClone()
+    hook = manager._hooks["post_llm_call"][-1]
+    history = [{"role": "user", "content": "discord lane canary"}]
+
+    hook(
+        context_compressor=active,
+        session_id="discord-session",
+        conversation_id="agent:main:discord:thread:t:t",
+        platform="discord",
+        conversation_history=history,
+    )
+
+    assert active.starts == [
+        (
+            "discord-session",
+            {
+                "platform": "discord",
+                "conversation_id": "agent:main:discord:thread:t:t",
+            },
+        )
+    ]
+    assert active.ingested == [history]
+    assert ctx.engine.current_session_id == ""
+    ctx.engine.shutdown()
+
+
+def test_post_llm_hook_rebinds_legacy_singleton_between_gateway_lanes(monkeypatch, tmp_path):
+    module = _load_plugin_entrypoint_module("hermes_lcm_post_hook_singleton_rebind")
+    manager = types.SimpleNamespace(_hooks={})
+    fake_plugins = types.SimpleNamespace(get_plugin_manager=lambda: manager)
+    fake_hermes_cli = types.SimpleNamespace(plugins=fake_plugins)
+    monkeypatch.setitem(sys.modules, "hermes_cli", fake_hermes_cli)
+    monkeypatch.setitem(sys.modules, "hermes_cli.plugins", fake_plugins)
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / "hermes_home"))
+
+    class _CtxNoTool:
+        def __init__(self):
+            self.engine = None
+
+        def register_context_engine(self, engine):
+            self.engine = engine
+
+    ctx = _CtxNoTool()
+    module.register(ctx)
+    assert ctx.engine is not None
+    hook = manager._hooks["post_llm_call"][-1]
+
+    ingests = []
+
+    def spy_ingest(history):
+        ingests.append(
+            (
+                ctx.engine.current_session_id,
+                ctx.engine.current_conversation_id,
+                ctx.engine.current_session_platform,
+                list(history),
+            )
+        )
+
+    monkeypatch.setattr(ctx.engine, "ingest", spy_ingest)
+    hook(
+        session_id="discord-topic-a",
+        conversation_id="agent:main:discord:thread:a:a",
+        platform="discord",
+        conversation_history=[{"role": "user", "content": "topic a"}],
+    )
+    hook(
+        session_id="telegram-dm",
+        conversation_id="agent:main:telegram:private:1782862480",
+        platform="telegram",
+        conversation_history=[{"role": "user", "content": "telegram dm"}],
+    )
+
+    assert ingests == [
+        (
+            "discord-topic-a",
+            "agent:main:discord:thread:a:a",
+            "discord",
+            [{"role": "user", "content": "topic a"}],
+        ),
+        (
+            "telegram-dm",
+            "agent:main:telegram:private:1782862480",
+            "telegram",
+            [{"role": "user", "content": "telegram dm"}],
+        ),
+    ]
+    ctx.engine.shutdown()

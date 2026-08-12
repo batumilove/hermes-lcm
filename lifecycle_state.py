@@ -10,13 +10,30 @@ This is the smallest viable substrate for cross-turn/session lifecycle state:
 
 from __future__ import annotations
 
+import functools
 import sqlite3
 import time
+from contextlib import nullcontext
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Optional
 
-from .db_bootstrap import configure_connection, run_versioned_migrations
+from .db_bootstrap import configure_connection, refuse_schema_version_too_new, run_versioned_migrations
+from .sqlite_util import process_sqlite_write_lock
+
+
+def _synchronized(method):
+    """Serialize a read-modify-write method on the store's reentrant lock.
+
+    The lifecycle connection is shared across threads (check_same_thread=False,
+    autocommit). Without serialization, two callers reading state and then
+    writing can interleave and clobber each other's update.
+    """
+    @functools.wraps(method)
+    def wrapper(self, *args, **kwargs):
+        with self._lock:
+            return method(self, *args, **kwargs)
+    return wrapper
 
 
 @dataclass
@@ -42,7 +59,14 @@ class LifecycleStateStore:
         self.db_path = Path(db_path)
         self.db_path.parent.mkdir(parents=True, exist_ok=True)
         self._conn: Optional[sqlite3.Connection] = None
-        self._init_db()
+        # Serialize this store's read-modify-write flows and coordinate them
+        # with every other in-process helper writing the same database.
+        self._lock = process_sqlite_write_lock(self.db_path)
+        with self._lock:
+            self._init_db()
+        # Lifecycle metrics — registered *after* __init__ succeeds.
+        from .lifecycle_metrics import register_lifecycle_state_store_created
+        register_lifecycle_state_store_created(self)
 
     def _init_db(self) -> None:
         self._conn = sqlite3.connect(
@@ -51,22 +75,52 @@ class LifecycleStateStore:
             check_same_thread=False,
             isolation_level=None,
         )
+        refuse_schema_version_too_new(self._conn)
         configure_connection(self._conn)
         self._conn.row_factory = sqlite3.Row
         run_versioned_migrations(self._conn)
         self._conn.commit()
 
     def close(self) -> None:
+        from .lifecycle_metrics import (
+            begin_lifecycle_state_store_close,
+            complete_lifecycle_state_store_close,
+            fail_lifecycle_state_store_close,
+        )
+
+        begin_lifecycle_state_store_close(self)
         conn = getattr(self, "_conn", None)
-        if conn is not None:
-            conn.close()
-            self._conn = None
+        try:
+            with getattr(self, "_lock", nullcontext()):
+                if conn is not None:
+                    try:
+                        conn.execute("PRAGMA wal_checkpoint(PASSIVE)")
+                    except sqlite3.Error:
+                        pass
+                    conn.close()
+                    self._conn = None
+        except Exception:
+            fail_lifecycle_state_store_close(self)
+            raise
+        else:
+            complete_lifecycle_state_store_close(self)
 
     def __del__(self) -> None:  # pragma: no cover - defensive resource cleanup
         try:
             self.close()
         except Exception:
             pass
+
+    @property
+    def connection(self) -> sqlite3.Connection | None:
+        """The live SQLite connection, or ``None`` once :meth:`close` has run.
+
+        Exposed for read-oriented diagnostics -- for example the doctor's
+        maintenance-debt scan -- that need ad-hoc queries the store does not wrap
+        in a purpose-built method. Callers must treat it as read-only; writes go
+        through the store's own methods.
+        """
+        return getattr(self, "_conn", None)
 
     def row_count(self) -> int:
         row = self._conn.execute("SELECT COUNT(*) AS count FROM lcm_lifecycle_state").fetchone()
@@ -116,6 +170,7 @@ class LifecycleStateStore:
         ).fetchone()
         return self._row_to_state(row)
 
+    @_synchronized
     def bind_session(
         self,
         session_id: str,
@@ -222,6 +277,7 @@ class LifecycleStateStore:
         assert state is not None
         return state
 
+    @_synchronized
     def finalize_session(
         self,
         conversation_id: str | None,
@@ -267,6 +323,7 @@ class LifecycleStateStore:
         self._conn.commit()
         return self.get_by_conversation(state.conversation_id)
 
+    @_synchronized
     def record_rollover(
         self,
         conversation_id: str,
@@ -338,6 +395,7 @@ class LifecycleStateStore:
         Hermes host state. Repair/cleanup flows must stay explicit and separate.
         """
         conn = self._conn
+        assert conn is not None
 
         def _count(query: str, params: tuple[Any, ...] = ()) -> int:
             row = conn.execute(query, params).fetchone()
@@ -353,6 +411,8 @@ class LifecycleStateStore:
         message_sessions = _session_ids("SELECT DISTINCT session_id FROM messages WHERE session_id IS NOT NULL")
         node_sessions = _session_ids("SELECT DISTINCT session_id FROM summary_nodes WHERE session_id IS NOT NULL")
         lcm_any_sessions = message_sessions | node_sessions
+        state_sessions: set[str] = set()
+        state_db_read_success = False
         lifecycle_current_sessions = _session_ids(
             "SELECT DISTINCT current_session_id FROM lcm_lifecycle_state WHERE current_session_id IS NOT NULL"
         )
@@ -361,9 +421,25 @@ class LifecycleStateStore:
         )
         lifecycle_referenced_sessions = lifecycle_current_sessions | lifecycle_last_finalized_sessions
 
+        empty_lifecycle_rows = 0
+        for row in conn.execute(
+            """
+            SELECT current_session_id, last_finalized_session_id
+            FROM lcm_lifecycle_state
+            """
+        ).fetchall():
+            refs = {
+                str(value)
+                for value in (row["current_session_id"], row["last_finalized_session_id"])
+                if value
+            }
+            if not refs or refs.isdisjoint(lcm_any_sessions):
+                empty_lifecycle_rows += 1
+
         stats: dict[str, Any] = {
             "read_only": True,
             "lifecycle_rows": _count("SELECT COUNT(*) FROM lcm_lifecycle_state"),
+            "empty_lifecycle_rows": empty_lifecycle_rows,
             "messages_total": _count("SELECT COUNT(*) FROM messages"),
             "summary_nodes_total": _count("SELECT COUNT(*) FROM summary_nodes"),
             "distinct_message_sessions": len(message_sessions),
@@ -403,6 +479,7 @@ class LifecycleStateStore:
                     finally:
                         state_conn.close()
                     state_sessions = {str(row[0]) for row in state_rows if row[0]}
+                    state_db_read_success = True
                     stats.update({
                         "state_sessions_total": len(state_sessions),
                         "lifecycle_current_missing_in_state": len(lifecycle_current_sessions - state_sessions),
@@ -419,8 +496,127 @@ class LifecycleStateStore:
             else:
                 stats["state_db_error"] = f"state database not found: {path}"
 
+        stats["classification"] = self._classify_fragmentation(
+            lifecycle_rows=stats["lifecycle_rows"],
+            lifecycle_current_sessions=lifecycle_current_sessions,
+            lifecycle_last_finalized_sessions=lifecycle_last_finalized_sessions,
+            message_sessions=message_sessions,
+            node_sessions=node_sessions,
+            lcm_any_sessions=lcm_any_sessions,
+            lifecycle_referenced_sessions=lifecycle_referenced_sessions,
+            state_sessions=state_sessions,
+            state_db_read_success=state_db_read_success,
+        )
+
         return stats
 
+    @staticmethod
+    def _classify_fragmentation(
+        *,
+        lifecycle_rows: int,
+        lifecycle_current_sessions: set[str],
+        lifecycle_last_finalized_sessions: set[str],
+        message_sessions: set[str],
+        node_sessions: set[str],
+        lcm_any_sessions: set[str],
+        lifecycle_referenced_sessions: set[str],
+        state_sessions: set[str],
+        state_db_read_success: bool,
+    ) -> dict[str, Any]:
+        """Bucket lifecycle mismatches into operator-readable read-only categories."""
+
+        def sample(session_ids: set[str], limit: int = 5) -> list[str]:
+            return sorted(session_ids)[:limit]
+
+        categories: list[dict[str, Any]] = []
+
+        def add_category(
+            name: str,
+            session_ids: set[str],
+            *,
+            severity: str,
+            description: str,
+            recommended_action: str,
+        ) -> None:
+            if not session_ids:
+                return
+            categories.append({
+                "name": name,
+                "severity": severity,
+                "count": len(session_ids),
+                "sample_session_ids": sample(session_ids),
+                "description": description,
+                "recommended_action": recommended_action,
+            })
+
+        add_category(
+            "stale_lifecycle_current",
+            lifecycle_current_sessions - lcm_any_sessions,
+            severity="warn",
+            description="Lifecycle current-session references that no longer have raw messages or summary nodes in LCM.",
+            recommended_action="Inspect samples before cleanup; these are often old or ephemeral lifecycle rows, not automatic corruption.",
+        )
+        add_category(
+            "stale_lifecycle_finalized",
+            lifecycle_last_finalized_sessions - lcm_any_sessions,
+            severity="warn",
+            description="Lifecycle finalized-session references that no longer have raw messages or summary nodes in LCM.",
+            recommended_action="Inspect samples before cleanup; only remove with an explicit backup-first lifecycle cleanup flow.",
+        )
+        if lifecycle_rows > 0:
+            add_category(
+                "lcm_message_sessions_without_lifecycle_reference",
+                message_sessions - lifecycle_referenced_sessions,
+                severity="notice",
+                description="Raw-message sessions exist in LCM but are not referenced by current or finalized lifecycle state.",
+                recommended_action="Usually safe as historical retained context; investigate only if the sessions should belong to an active conversation.",
+            )
+            add_category(
+                "lcm_node_sessions_without_lifecycle_reference",
+                node_sessions - lifecycle_referenced_sessions,
+                severity="notice",
+                description="Summary-node sessions exist in LCM but are not referenced by current or finalized lifecycle state.",
+                recommended_action="Usually safe as historical retained context; verify expand/search still work before considering cleanup.",
+            )
+
+        if state_db_read_success:
+            add_category(
+                "lcm_message_sessions_missing_in_state",
+                message_sessions - state_sessions,
+                severity="notice",
+                description="LCM raw-message sessions are absent from the Hermes session database.",
+                recommended_action="Treat as retained or imported context unless the session should still be browsable in host session history.",
+            )
+            add_category(
+                "lcm_node_sessions_missing_in_state",
+                node_sessions - state_sessions,
+                severity="notice",
+                description="LCM summary-node sessions are absent from the Hermes session database.",
+                recommended_action="Keep read-only; this can happen after host session pruning while LCM retained summaries remain useful.",
+            )
+            add_category(
+                "state_only_sessions",
+                state_sessions - lcm_any_sessions,
+                severity="notice",
+                description="Hermes host sessions exist without raw messages or summary nodes in LCM.",
+                recommended_action="Usually benign for sessions outside LCM scope, ignored sessions, or sessions that never reached durable LCM ingest.",
+            )
+
+        warn_count = sum(1 for item in categories if item["severity"] == "warn")
+        status = "warn" if warn_count else ("notice" if categories else "pass")
+        summary = (
+            "no lifecycle fragmentation categories detected"
+            if not categories
+            else f"{len(categories)} lifecycle fragmentation categories need review"
+        )
+        return {
+            "read_only": True,
+            "status": status,
+            "summary": summary,
+            "categories": categories,
+        }
+
+    @_synchronized
     def record_debt(
         self,
         conversation_id: str | None,
@@ -448,6 +644,7 @@ class LifecycleStateStore:
         self._conn.commit()
         return self.get_by_conversation(conversation_id)
 
+    @_synchronized
     def clear_debt(self, conversation_id: str | None) -> LifecycleState | None:
         if not conversation_id:
             return None
@@ -469,6 +666,7 @@ class LifecycleStateStore:
         self._conn.commit()
         return self.get_by_conversation(conversation_id)
 
+    @_synchronized
     def record_maintenance_attempt(self, conversation_id: str | None) -> LifecycleState | None:
         if not conversation_id:
             return None
@@ -488,6 +686,7 @@ class LifecycleStateStore:
         self._conn.commit()
         return self.get_by_conversation(conversation_id)
 
+    @_synchronized
     def record_reset(self, conversation_id: str | None) -> LifecycleState | None:
         if not conversation_id:
             return None
@@ -510,6 +709,125 @@ class LifecycleStateStore:
         self._conn.commit()
         return self.get_by_conversation(conversation_id)
 
+    @_synchronized
+    def prune_empty_sessions(
+        self,
+        *,
+        protected_session_ids: set[str] | list[str] | tuple[str, ...] | None = None,
+        max_age_hours: float | None = None,
+    ) -> int:
+        """Delete lifecycle rows for sessions with no stored data.
+
+        A row is eligible when BOTH referenced session IDs
+        (``current_session_id`` and ``last_finalized_session_id``)
+        have zero messages AND zero summary_nodes in the main store.
+
+        Only the lifecycle table is modified — messages, nodes, and FTS
+        indexes are untouched (they already contain no data for these sessions).
+
+        Args:
+            protected_session_ids: Sessions that must never be deleted
+                (typically the actively-bound engine session).
+            max_age_hours: Only delete rows older than this many hours.
+                ``None`` means delete all eligible rows regardless of age.
+
+        Returns:
+            Number of rows deleted.
+        """
+        conn = self._conn
+        assert conn is not None
+        protected = {str(s) for s in (protected_session_ids or ()) if s}
+
+        conn.execute("BEGIN IMMEDIATE")
+        try:
+            sessions_with_data: set[str] = set()
+            tables = {
+                row[0] for row in conn.execute(
+                    "SELECT name FROM sqlite_master WHERE type='table'"
+                ).fetchall()
+            }
+
+            def _session_has_data(session_id: str) -> bool:
+                if not session_id:
+                    return False
+                if "messages" in tables and conn.execute(
+                    "SELECT 1 FROM messages WHERE session_id = ? LIMIT 1",
+                    (session_id,),
+                ).fetchone():
+                    return True
+                if "summary_nodes" in tables and conn.execute(
+                    "SELECT 1 FROM summary_nodes WHERE session_id = ? LIMIT 1",
+                    (session_id,),
+                ).fetchone():
+                    return True
+                return False
+
+            if "messages" in tables:
+                for row in conn.execute(
+                    "SELECT DISTINCT session_id FROM messages"
+                ).fetchall():
+                    sessions_with_data.add(str(row[0]))
+            if "summary_nodes" in tables:
+                for row in conn.execute(
+                    "SELECT DISTINCT session_id FROM summary_nodes"
+                ).fetchall():
+                    sessions_with_data.add(str(row[0]))
+
+            now = time.time()
+            max_age_seconds = (
+                float(max_age_hours) * 3600.0
+                if max_age_hours is not None
+                else None
+            )
+            deleted = 0
+
+            rows = conn.execute(
+                "SELECT * FROM lcm_lifecycle_state"
+            ).fetchall()
+            for row in rows:
+                cur = str(row["current_session_id"] or "")
+                fin = str(row["last_finalized_session_id"] or "")
+
+                if ((cur and cur in sessions_with_data)
+                        or (fin and fin in sessions_with_data)):
+                    continue
+
+                refs = {r for r in (cur, fin) if r}
+                if refs & protected:
+                    continue
+
+                if max_age_seconds is not None:
+                    row_age = (
+                        row["current_bound_at"]
+                        or row["last_finalized_at"]
+                        or row["updated_at"]
+                    )
+                    if row_age is not None and (now - float(row_age)) < max_age_seconds:
+                        continue
+
+                # Recheck against the tables right before deletion. BEGIN
+                # IMMEDIATE blocks concurrent writers while this transaction is
+                # open; this fresh query also keeps the safety check honest if
+                # the broad snapshot logic above changes later.
+                if _session_has_data(cur) or _session_has_data(fin):
+                    continue
+
+                conn.execute(
+                    "DELETE FROM lcm_lifecycle_state WHERE conversation_id = ?",
+                    (row["conversation_id"],),
+                )
+                deleted += 1
+
+            if deleted:
+                conn.commit()
+            else:
+                conn.rollback()
+            return deleted
+        except Exception:
+            conn.rollback()
+            raise
+
+    @_synchronized
     def delete_safe_rows_for_sessions(
         self,
         session_ids: set[str] | list[str] | tuple[str, ...],
@@ -554,19 +872,27 @@ class LifecycleStateStore:
     ) -> LifecycleState | None:
         if not conversation_id:
             return None
-        state = self.get_by_conversation(conversation_id)
-        if state is None or state.current_session_id != session_id:
-            return state
-        frontier = max(int(frontier_store_id or 0), state.current_frontier_store_id)
-        now = time.time()
-        self._conn.execute(
-            """
-            UPDATE lcm_lifecycle_state
-            SET current_frontier_store_id = ?,
-                updated_at = ?
-            WHERE conversation_id = ?
-            """,
-            (frontier, now, conversation_id),
-        )
-        self._conn.commit()
-        return self.get_by_conversation(conversation_id)
+        with self._lock:
+            state = self.get_by_conversation(conversation_id)
+            if state is None or state.current_session_id != session_id:
+                return state
+            now = time.time()
+            conn = self._conn
+            assert conn is not None
+            # MAX() in SQL keeps the advance monotonic even if a concurrent
+            # writer bumped the frontier between the read above and this write.
+            # A Python-side max() over the stale read could otherwise regress
+            # the checkpoint and force the same range to be compacted twice.
+            cursor = conn.execute(
+                """
+                UPDATE lcm_lifecycle_state
+                SET current_frontier_store_id = MAX(current_frontier_store_id, ?),
+                    updated_at = ?
+                WHERE conversation_id = ? AND current_session_id = ?
+                """,
+                (int(frontier_store_id or 0), now, conversation_id, session_id),
+            )
+            if cursor.rowcount == 0:
+                return self.get_by_conversation(conversation_id)
+            conn.commit()
+            return self.get_by_conversation(conversation_id)

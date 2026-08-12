@@ -1,5 +1,7 @@
 """Tests for LCM core components: store, DAG, tokens, config, escalation."""
 
+import copy
+import hashlib
 import json
 import re
 import sqlite3
@@ -15,9 +17,17 @@ from hermes_lcm.config import LCMConfig
 from hermes_lcm.tokens import count_tokens, count_message_tokens, count_messages_tokens
 from hermes_lcm.store import MessageStore
 from hermes_lcm.dag import SummaryDAG, SummaryNode
-from hermes_lcm.escalation import _deterministic_truncate
+from hermes_lcm.escalation import (
+    _build_l1_focus_brief,
+    _build_l2_focus_brief,
+    _deterministic_truncate,
+)
 from hermes_lcm.lifecycle_state import LifecycleStateStore
-from hermes_lcm.db_bootstrap import ExternalContentFtsSpec, ensure_external_content_fts
+from hermes_lcm.db_bootstrap import (
+    ExternalContentFtsSpec,
+    SCHEMA_VERSION,
+    ensure_external_content_fts,
+)
 from hermes_lcm.search_query import sanitize_fts5_query
 from hermes_lcm.session_patterns import (
     build_session_match_keys,
@@ -30,6 +40,27 @@ from hermes_lcm.message_patterns import (
     compile_message_patterns,
     matches_message_pattern,
 )
+
+
+class TestFocusBriefFormatting:
+    def test_l1_focus_brief_preserves_literal_braces_in_focus_topic(self):
+        topic = 'Investigate JSON payload {"mode": "force", "items": [1, 2]} and placeholder {0}'
+
+        brief = _build_l1_focus_brief(topic)
+
+        assert topic in brief
+        assert "Replacement index" not in brief
+        assert "## Historical Task Snapshot" in brief
+        assert "mark them under one of these historical headings:" in brief
+
+    def test_l2_focus_brief_preserves_literal_braces_in_focus_topic(self):
+        topic = "Reconcile tool output with braces: {'force': true, 'topic': '{markers}'}"
+
+        brief = _build_l2_focus_brief(topic)
+
+        assert topic in brief
+        assert "## Historical Remaining Work" in brief
+        assert "Place non-current work under:" in brief
 
 
 class TestModelRouting:
@@ -128,6 +159,20 @@ class TestModelRouting:
 
         assert route.provider == "my-provider"
         assert route.model == "model-a"
+
+    def test_custom_prefixed_named_provider_is_split_when_provider_resolves(self, monkeypatch):
+        from hermes_lcm.model_routing import parse_lcm_model_override
+
+        self._install_fake_provider_modules(
+            monkeypatch,
+            named_custom={"lcpp": {"base_url": "http://127.0.0.1:8081/v1"}},
+            registry={"openai-codex": object()},
+        )
+
+        route = parse_lcm_model_override("custom:LCPP/4B-Qwen3-2507-compressor")
+
+        assert route.provider == "lcpp"
+        assert route.model == "4B-Qwen3-2507-compressor"
 
     def test_openrouter_organization_slug_stays_model_only(self):
         from hermes_lcm.model_routing import parse_lcm_model_override
@@ -238,6 +283,212 @@ class TestProviderPrefixedAuxiliaryCalls:
         assert "provider" not in seen
         assert seen["model"] == "meta-llama/Llama-3.3-70B-Instruct"
 
+    def test_summary_call_passes_custom_prefixed_provider_and_stripped_model(self, monkeypatch):
+        from hermes_lcm.escalation import _call_llm_for_summary
+
+        seen = {}
+
+        def fake_call_llm(**kwargs):
+            seen.update(kwargs)
+            return self._fake_response("summary")
+
+        self._install_fake_auxiliary_client(monkeypatch, fake_call_llm)
+
+        hermes_cli = ModuleType("hermes_cli")
+        hermes_cli.__path__ = []
+        runtime_provider = ModuleType("hermes_cli.runtime_provider")
+        runtime_provider._get_named_custom_provider = (
+            lambda provider: {"name": "LCPP", "base_url": "http://127.0.0.1:8081/v1"}
+            if provider == "lcpp"
+            else None
+        )
+        auth = ModuleType("hermes_cli.auth")
+        auth.PROVIDER_REGISTRY = {}
+        hermes_cli.runtime_provider = runtime_provider
+        hermes_cli.auth = auth
+        monkeypatch.setitem(sys.modules, "hermes_cli", hermes_cli)
+        monkeypatch.setitem(sys.modules, "hermes_cli.runtime_provider", runtime_provider)
+        monkeypatch.setitem(sys.modules, "hermes_cli.auth", auth)
+
+        result = _call_llm_for_summary(
+            "summarize",
+            200,
+            model="custom:LCPP/4B-Qwen3-2507-compressor",
+        )
+
+        assert result == "summary"
+        assert seen["provider"] == "lcpp"
+        assert seen["model"] == "4B-Qwen3-2507-compressor"
+
+    def test_summary_fallback_chain_uses_next_model_after_primary_failure(self, monkeypatch):
+        from hermes_lcm import escalation
+
+        calls = []
+
+        def fake_summary_call(prompt, max_tokens, model="", timeout=None):
+            calls.append(model)
+            if model == "primary-model":
+                return None
+            return "fallback summary"
+
+        monkeypatch.setattr(escalation, "_call_llm_for_summary", fake_summary_call)
+
+        summary, level = escalation.summarize_with_escalation(
+            "source text " * 80,
+            source_tokens=200,
+            token_budget=50,
+            model="primary-model",
+            fallback_models=["fallback-model"],
+        )
+
+        assert summary == "fallback summary"
+        assert level == 1
+        assert calls == ["primary-model", "fallback-model"]
+
+    def test_summary_fallback_chain_uses_next_model_after_non_compressing_primary(self, monkeypatch):
+        from hermes_lcm import escalation
+
+        calls = []
+
+        def fake_summary_call(prompt, max_tokens, model="", timeout=None):
+            calls.append(model)
+            if model == "primary-model":
+                return "primary verbose text " * 300
+            return "short fallback"
+
+        monkeypatch.setattr(escalation, "_call_llm_for_summary", fake_summary_call)
+
+        summary, level = escalation.summarize_with_escalation(
+            "source text " * 80,
+            source_tokens=200,
+            token_budget=50,
+            model="primary-model",
+            fallback_models=["fallback-model"],
+        )
+
+        assert summary == "short fallback"
+        assert level == 1
+        assert calls == ["primary-model", "fallback-model"]
+
+    def test_summary_fallback_chain_escalates_past_reasoning_only_primary(self, monkeypatch):
+        """A reasoning-only primary output is sanitized to "" by
+        _call_llm_for_summary; summarize_with_escalation must escalate to the
+        next model rather than accept the empty result."""
+        from hermes_lcm import escalation
+
+        calls = []
+
+        def fake_summary_call(prompt, max_tokens, model="", timeout=None):
+            calls.append(model)
+            if model == "primary-model":
+                # What _call_llm_for_summary now returns for an unclosed
+                # <think> block / reasoning-only response.
+                return ""
+            return "clean fallback summary"
+
+        monkeypatch.setattr(escalation, "_call_llm_for_summary", fake_summary_call)
+
+        summary, level = escalation.summarize_with_escalation(
+            "source text " * 80,
+            source_tokens=200,
+            token_budget=50,
+            model="primary-model",
+            fallback_models=["fallback-model"],
+        )
+
+        assert summary == "clean fallback summary"
+        assert level == 1
+        assert calls == ["primary-model", "fallback-model"]
+
+
+    def test_summary_circuit_breaker_skips_temporarily_open_route(self, monkeypatch):
+        from hermes_lcm import escalation
+        from hermes_lcm.escalation import SummaryCircuitBreaker
+
+        calls = []
+        breaker = SummaryCircuitBreaker(failure_threshold=1, cooldown_seconds=60)
+
+        def fake_summary_call(prompt, max_tokens, model="", timeout=None):
+            calls.append(model)
+            if model == "primary-model":
+                return None
+            return "fallback summary"
+
+        monkeypatch.setattr(escalation, "_call_llm_for_summary", fake_summary_call)
+
+        first_summary, first_level = escalation.summarize_with_escalation(
+            "source text " * 80,
+            source_tokens=200,
+            token_budget=50,
+            model="primary-model",
+            fallback_models=["fallback-model"],
+            circuit_breaker=breaker,
+        )
+        second_summary, second_level = escalation.summarize_with_escalation(
+            "source text " * 80,
+            source_tokens=200,
+            token_budget=50,
+            model="primary-model",
+            fallback_models=["fallback-model"],
+            circuit_breaker=breaker,
+        )
+
+        assert (first_summary, first_level) == ("fallback summary", 1)
+        assert (second_summary, second_level) == ("fallback summary", 1)
+        assert calls == ["primary-model", "fallback-model", "fallback-model"]
+
+    def test_spend_guard_trips_and_backs_off(self):
+        from hermes_lcm.escalation import SummarySpendGuard
+
+        g = SummarySpendGuard(max_calls=3, window_seconds=100, backoff_seconds=50)
+        t = 1000.0
+        for _ in range(3):
+            assert g.allows(now=t) is True
+            g.record_call(now=t)
+        assert g.allows(now=t) is False        # budget exhausted -> backoff
+        assert g.allows(now=t + 49) is False   # still backing off
+        assert g.allows(now=t + 51) is True    # backoff elapsed, window reset
+
+    def test_spend_guard_clear_and_disable(self):
+        from hermes_lcm.escalation import SummarySpendGuard
+
+        g = SummarySpendGuard(max_calls=1, window_seconds=100, backoff_seconds=100)
+        g.record_call(now=0)
+        assert g.allows(now=10) is False
+        g.clear()
+        assert g.allows(now=10) is True
+
+        disabled = SummarySpendGuard(max_calls=0)
+        for _ in range(5):
+            disabled.record_call(now=0)
+        assert disabled.allows(now=0) is True
+
+    def test_summarize_falls_to_l3_when_spend_guard_backs_off(self, monkeypatch):
+        from hermes_lcm import escalation
+        from hermes_lcm.escalation import SummarySpendGuard
+
+        calls = []
+
+        def fake_summary_call(prompt, max_tokens, model="", timeout=None):
+            calls.append(model)
+            return "should never be used"
+
+        monkeypatch.setattr(escalation, "_call_llm_for_summary", fake_summary_call)
+
+        guard = SummarySpendGuard(max_calls=1, window_seconds=3600, backoff_seconds=3600)
+        guard.record_call()
+
+        summary, level = escalation.summarize_with_escalation(
+            "source text " * 80,
+            source_tokens=200,
+            token_budget=50,
+            model="primary-model",
+            spend_guard=guard,
+        )
+
+        assert level == 3          # deterministic fallback, no spend
+        assert calls == []         # LLM never invoked while backing off
+
     def test_extraction_call_passes_provider_and_stripped_model(self, monkeypatch):
         from hermes_lcm.extraction import _call_extraction_llm
 
@@ -284,9 +535,11 @@ class TestProviderPrefixedAuxiliaryCalls:
 class TestConfig:
     def test_defaults(self):
         c = LCMConfig()
-        assert c.fresh_tail_count == 64
+        assert c.fresh_tail_count == 32
+        assert c.fresh_tail_max_tokens == 0
         assert c.leaf_chunk_tokens == 20_000
-        assert c.context_threshold == 0.75
+        assert c.context_threshold == 0.35
+        assert c.incremental_max_depth == 3
         assert c.condensation_fanin == 4
         assert c.dynamic_leaf_chunk_enabled is False
         assert c.dynamic_leaf_chunk_max == 40_000
@@ -296,13 +549,20 @@ class TestConfig:
         assert c.extraction_enabled is False
         assert c.extraction_model == ""
         assert c.extraction_output_path == ""
+        assert c.sensitive_patterns_enabled is False
+        assert c.sensitive_patterns == ["api_key", "bearer_token", "password_assignment", "private_key"]
+        assert c.sensitive_patterns_source == "default"
         assert c.large_output_externalization_enabled is False
         assert c.large_output_externalization_threshold_chars == 12_000
         assert c.large_output_externalization_path == ""
+        assert c.large_output_active_replay_stubbing_enabled is False
+        assert c.large_output_active_replay_stub_threshold_tokens == 25_000
         assert c.large_output_transcript_gc_enabled is False
         assert c.deferred_maintenance_enabled is False
         assert c.deferred_maintenance_max_passes == 4
         assert c.critical_budget_pressure_ratio == 0.0
+        assert c.threshold_full_sweep_enabled is False
+        assert c.summary_prefix_target_tokens == 0
         assert c.ignore_session_patterns == []
         assert c.stateless_session_patterns == []
         assert c.ignore_message_patterns == []
@@ -310,6 +570,9 @@ class TestConfig:
         assert c.stateless_session_patterns_source == "default"
         assert c.ignore_message_patterns_source == "default"
         assert c.summary_model == ""
+        assert c.summary_fallback_models == []
+        assert c.summary_circuit_breaker_failure_threshold == 2
+        assert c.summary_circuit_breaker_cooldown_seconds == 300
         assert c.expansion_model == ""
         assert c.expansion_context_tokens == 32_000
         assert c.summary_timeout_ms == 60_000
@@ -317,6 +580,7 @@ class TestConfig:
 
     def test_from_env(self, monkeypatch):
         monkeypatch.setenv("LCM_FRESH_TAIL_COUNT", "32")
+        monkeypatch.setenv("LCM_FRESH_TAIL_MAX_TOKENS", "12000")
         monkeypatch.setenv("LCM_CONTEXT_THRESHOLD", "0.80")
         monkeypatch.setenv("LCM_IGNORE_SESSION_PATTERNS", "cron:*,subagent:**")
         monkeypatch.setenv("LCM_STATELESS_SESSION_PATTERNS", "telegram:*, cli:debug")
@@ -325,6 +589,9 @@ class TestConfig:
             "^Cronjob Response:,^>>>Cronjob Response<<<:",
         )
         monkeypatch.setenv("LCM_EXPANSION_MODEL", "openai/gpt-5.4-mini")
+        monkeypatch.setenv("LCM_SUMMARY_FALLBACK_MODELS", "fast-model, reliable-model")
+        monkeypatch.setenv("LCM_SUMMARY_CIRCUIT_BREAKER_FAILURE_THRESHOLD", "3")
+        monkeypatch.setenv("LCM_SUMMARY_CIRCUIT_BREAKER_COOLDOWN_SECONDS", "120")
         monkeypatch.setenv("LCM_EXPANSION_CONTEXT_TOKENS", "64000")
         monkeypatch.setenv("LCM_SUMMARY_TIMEOUT_MS", "45000")
         monkeypatch.setenv("LCM_EXPANSION_TIMEOUT_MS", "90000")
@@ -333,16 +600,23 @@ class TestConfig:
         monkeypatch.setenv("LCM_CACHE_FRIENDLY_CONDENSATION_ENABLED", "1")
         monkeypatch.setenv("LCM_CACHE_FRIENDLY_MIN_DEBT_GROUPS", "3")
         monkeypatch.setenv("LCM_CRITICAL_BUDGET_PRESSURE_RATIO", "0.92")
+        monkeypatch.setenv("LCM_THRESHOLD_FULL_SWEEP_ENABLED", "true")
+        monkeypatch.setenv("LCM_SUMMARY_PREFIX_TARGET_TOKENS", "18000")
         monkeypatch.setenv("LCM_CUSTOM_INSTRUCTIONS", "Write as a neutral documenter.")
         monkeypatch.setenv("LCM_EXTRACTION_ENABLED", "true")
         monkeypatch.setenv("LCM_EXTRACTION_MODEL", "openai/gpt-5.4-mini")
         monkeypatch.setenv("LCM_EXTRACTION_OUTPUT_PATH", "/tmp/extractions")
+        monkeypatch.setenv("LCM_SENSITIVE_PATTERNS_ENABLED", "true")
+        monkeypatch.setenv("LCM_SENSITIVE_PATTERNS", "api_key,bearer_token")
         monkeypatch.setenv("LCM_LARGE_OUTPUT_EXTERNALIZATION_ENABLED", "true")
         monkeypatch.setenv("LCM_LARGE_OUTPUT_EXTERNALIZATION_THRESHOLD_CHARS", "4096")
         monkeypatch.setenv("LCM_LARGE_OUTPUT_EXTERNALIZATION_PATH", "/tmp/lcm-large-outputs")
+        monkeypatch.setenv("LCM_LARGE_OUTPUT_ACTIVE_REPLAY_STUBBING_ENABLED", "true")
+        monkeypatch.setenv("LCM_LARGE_OUTPUT_ACTIVE_REPLAY_STUB_THRESHOLD_TOKENS", "8192")
         monkeypatch.setenv("LCM_LARGE_OUTPUT_TRANSCRIPT_GC_ENABLED", "true")
         c = LCMConfig.from_env()
         assert c.fresh_tail_count == 32
+        assert c.fresh_tail_max_tokens == 12_000
         assert c.context_threshold == 0.80
         assert c.ignore_session_patterns == ["cron:*", "subagent:**"]
         assert c.stateless_session_patterns == ["telegram:*", "cli:debug"]
@@ -353,6 +627,9 @@ class TestConfig:
         assert c.ignore_session_patterns_source == "env"
         assert c.stateless_session_patterns_source == "env"
         assert c.ignore_message_patterns_source == "env"
+        assert c.summary_fallback_models == ["fast-model", "reliable-model"]
+        assert c.summary_circuit_breaker_failure_threshold == 3
+        assert c.summary_circuit_breaker_cooldown_seconds == 120
         assert c.expansion_model == "openai/gpt-5.4-mini"
         assert c.expansion_context_tokens == 64_000
         assert c.summary_timeout_ms == 45_000
@@ -362,18 +639,26 @@ class TestConfig:
         assert c.cache_friendly_condensation_enabled is True
         assert c.cache_friendly_min_debt_groups == 3
         assert c.critical_budget_pressure_ratio == 0.92
+        assert c.threshold_full_sweep_enabled is True
+        assert c.summary_prefix_target_tokens == 18_000
         assert c.custom_instructions == "Write as a neutral documenter."
         assert c.extraction_enabled is True
         assert c.extraction_model == "openai/gpt-5.4-mini"
         assert c.extraction_output_path == "/tmp/extractions"
+        assert c.sensitive_patterns_enabled is True
+        assert c.sensitive_patterns == ["api_key", "bearer_token"]
+        assert c.sensitive_patterns_source == "env"
         assert c.large_output_externalization_enabled is True
         assert c.large_output_externalization_threshold_chars == 4096
         assert c.large_output_externalization_path == "/tmp/lcm-large-outputs"
+        assert c.large_output_active_replay_stubbing_enabled is True
+        assert c.large_output_active_replay_stub_threshold_tokens == 8192
         assert c.large_output_transcript_gc_enabled is True
 
     def test_from_env_invalid_numeric_values_fall_back_to_defaults(self, monkeypatch, tmp_path):
         monkeypatch.setenv("HERMES_HOME", str(tmp_path / "empty-hermes-home"))
         monkeypatch.setenv("LCM_FRESH_TAIL_COUNT", "not-a-number")
+        monkeypatch.setenv("LCM_FRESH_TAIL_MAX_TOKENS", "not-a-number")
         monkeypatch.setenv("LCM_LEAF_CHUNK_TOKENS", "")
         monkeypatch.setenv("LCM_CONTEXT_THRESHOLD", "bad-float")
         monkeypatch.setenv("LCM_MAX_ASSEMBLY_TOKENS", "nope")
@@ -383,9 +668,10 @@ class TestConfig:
 
         c = LCMConfig.from_env()
 
-        assert c.fresh_tail_count == 64
+        assert c.fresh_tail_count == 32
+        assert c.fresh_tail_max_tokens == 0
         assert c.leaf_chunk_tokens == 20_000
-        assert c.context_threshold == 0.75
+        assert c.context_threshold == 0.35
         assert c.max_assembly_tokens == 0
         assert c.reserve_tokens_floor == 0
         assert c.expansion_context_tokens == 32_000
@@ -402,6 +688,83 @@ class TestConfig:
 
         assert c.context_threshold == 0.68
 
+    def test_from_env_reads_hermes_codex_gpt55_autoraise_flag(self, monkeypatch, tmp_path):
+        hermes_home = tmp_path / "hermes"
+        hermes_home.mkdir()
+        (hermes_home / "config.yaml").write_text(
+            "compression:\n  threshold: 0.68\n  codex_gpt55_autoraise: false\n"
+        )
+        monkeypatch.setenv("HERMES_HOME", str(hermes_home))
+        monkeypatch.delenv("LCM_CONTEXT_THRESHOLD", raising=False)
+
+        c = LCMConfig.from_env()
+
+        assert c.context_threshold == 0.68
+        assert c.codex_gpt55_autoraise_enabled is False
+        assert c.config_sources["codex_gpt55_autoraise_enabled"] == "config_yaml:compression.codex_gpt55_autoraise"
+
+    def test_from_env_reads_hermes_auxiliary_compression_timeout_when_lcm_env_missing(self, monkeypatch, tmp_path):
+        hermes_home = tmp_path / "hermes"
+        hermes_home.mkdir()
+        (hermes_home / "config.yaml").write_text(
+            "auxiliary:\n  compression:\n    timeout: 120\n"
+        )
+        monkeypatch.setenv("HERMES_HOME", str(hermes_home))
+        monkeypatch.delenv("LCM_SUMMARY_TIMEOUT_MS", raising=False)
+
+        c = LCMConfig.from_env()
+
+        assert c.summary_timeout_ms == 120_000
+
+    def test_from_env_summary_timeout_env_overrides_hermes_auxiliary_timeout(self, monkeypatch, tmp_path):
+        hermes_home = tmp_path / "hermes"
+        hermes_home.mkdir()
+        (hermes_home / "config.yaml").write_text(
+            "auxiliary:\n  compression:\n    timeout: 120\n"
+        )
+        monkeypatch.setenv("HERMES_HOME", str(hermes_home))
+        monkeypatch.setenv("LCM_SUMMARY_TIMEOUT_MS", "45000")
+
+        c = LCMConfig.from_env()
+
+        assert c.summary_timeout_ms == 45_000
+
+    def test_from_env_reads_auxiliary_timeout_without_pyyaml(self, monkeypatch, tmp_path):
+        import hermes_lcm.config as config_mod
+
+        hermes_home = tmp_path / "hermes"
+        hermes_home.mkdir()
+        (hermes_home / "config.yaml").write_text(
+            "auxiliary:\n  compression:\n    timeout: '120'\n"
+        )
+        monkeypatch.setenv("HERMES_HOME", str(hermes_home))
+        monkeypatch.delenv("LCM_SUMMARY_TIMEOUT_MS", raising=False)
+        monkeypatch.setattr(config_mod, "yaml", None)
+
+        c = LCMConfig.from_env()
+
+        assert c.summary_timeout_ms == 120_000
+
+    def test_from_env_auxiliary_timeout_without_pyyaml_ignores_sibling_timeout(self, monkeypatch, tmp_path):
+        import hermes_lcm.config as config_mod
+
+        hermes_home = tmp_path / "hermes"
+        hermes_home.mkdir()
+        (hermes_home / "config.yaml").write_text(
+            "auxiliary:\n"
+            "  compression:\n"
+            "    model: gpt-5.5\n"
+            "  extraction:\n"
+            "    timeout: '120'\n"
+        )
+        monkeypatch.setenv("HERMES_HOME", str(hermes_home))
+        monkeypatch.delenv("LCM_SUMMARY_TIMEOUT_MS", raising=False)
+        monkeypatch.setattr(config_mod, "yaml", None)
+
+        c = LCMConfig.from_env()
+
+        assert c.summary_timeout_ms == 60_000
+
     def test_from_env_lcm_threshold_env_overrides_hermes_config(self, monkeypatch, tmp_path):
         hermes_home = tmp_path / "hermes"
         hermes_home.mkdir()
@@ -412,6 +775,106 @@ class TestConfig:
         c = LCMConfig.from_env()
 
         assert c.context_threshold == 0.82
+
+    def test_from_env_ignores_disabled_hermes_compression_threshold(self, monkeypatch, tmp_path):
+        hermes_home = tmp_path / "hermes"
+        hermes_home.mkdir()
+        (hermes_home / "config.yaml").write_text(
+            "compression:\n  enabled: false\n  threshold: 0.50\n"
+        )
+        monkeypatch.setenv("HERMES_HOME", str(hermes_home))
+        monkeypatch.delenv("LCM_CONTEXT_THRESHOLD", raising=False)
+
+        c = LCMConfig.from_env()
+
+        assert c.context_threshold == 0.35
+
+    def test_from_env_ignores_numeric_zero_disabled_hermes_threshold(self, monkeypatch, tmp_path):
+        hermes_home = tmp_path / "hermes"
+        hermes_home.mkdir()
+        (hermes_home / "config.yaml").write_text(
+            "compression:\n  enabled: 0\n  threshold: 0.50\n"
+        )
+        monkeypatch.setenv("HERMES_HOME", str(hermes_home))
+        monkeypatch.delenv("LCM_CONTEXT_THRESHOLD", raising=False)
+
+        c = LCMConfig.from_env()
+
+        assert c.context_threshold == 0.35
+
+    def test_from_env_ignores_numeric_zero_float_disabled_hermes_threshold(self, monkeypatch, tmp_path):
+        hermes_home = tmp_path / "hermes"
+        hermes_home.mkdir()
+        (hermes_home / "config.yaml").write_text(
+            "compression:\n  enabled: 0.0\n  threshold: 0.50\n"
+        )
+        monkeypatch.setenv("HERMES_HOME", str(hermes_home))
+        monkeypatch.delenv("LCM_CONTEXT_THRESHOLD", raising=False)
+
+        c = LCMConfig.from_env()
+
+        assert c.context_threshold == 0.35
+
+    def test_from_env_numeric_one_keeps_hermes_threshold_fallback(self, monkeypatch, tmp_path):
+        hermes_home = tmp_path / "hermes"
+        hermes_home.mkdir()
+        (hermes_home / "config.yaml").write_text(
+            "compression:\n  enabled: 1\n  threshold: 0.50\n"
+        )
+        monkeypatch.setenv("HERMES_HOME", str(hermes_home))
+        monkeypatch.delenv("LCM_CONTEXT_THRESHOLD", raising=False)
+
+        c = LCMConfig.from_env()
+
+        assert c.context_threshold == 0.50
+
+    def test_from_env_ignores_disabled_hermes_threshold_without_pyyaml(self, monkeypatch, tmp_path):
+        import hermes_lcm.config as config_mod
+
+        hermes_home = tmp_path / "hermes"
+        hermes_home.mkdir()
+        (hermes_home / "config.yaml").write_text(
+            "compression:\n  enabled: false\n  threshold: '0.50'\n"
+        )
+        monkeypatch.setenv("HERMES_HOME", str(hermes_home))
+        monkeypatch.delenv("LCM_CONTEXT_THRESHOLD", raising=False)
+        monkeypatch.setattr(config_mod, "yaml", None)
+
+        c = LCMConfig.from_env()
+
+        assert c.context_threshold == 0.35
+
+    def test_from_env_ignores_numeric_zero_float_without_pyyaml(self, monkeypatch, tmp_path):
+        import hermes_lcm.config as config_mod
+
+        hermes_home = tmp_path / "hermes"
+        hermes_home.mkdir()
+        (hermes_home / "config.yaml").write_text(
+            "compression:\n  enabled: 0.0\n  threshold: '0.50'\n"
+        )
+        monkeypatch.setenv("HERMES_HOME", str(hermes_home))
+        monkeypatch.delenv("LCM_CONTEXT_THRESHOLD", raising=False)
+        monkeypatch.setattr(config_mod, "yaml", None)
+
+        c = LCMConfig.from_env()
+
+        assert c.context_threshold == 0.35
+
+    def test_from_env_numeric_one_float_keeps_threshold_without_pyyaml(self, monkeypatch, tmp_path):
+        import hermes_lcm.config as config_mod
+
+        hermes_home = tmp_path / "hermes"
+        hermes_home.mkdir()
+        (hermes_home / "config.yaml").write_text(
+            "compression:\n  enabled: 1.0\n  threshold: '0.50'\n"
+        )
+        monkeypatch.setenv("HERMES_HOME", str(hermes_home))
+        monkeypatch.delenv("LCM_CONTEXT_THRESHOLD", raising=False)
+        monkeypatch.setattr(config_mod, "yaml", None)
+
+        c = LCMConfig.from_env()
+
+        assert c.context_threshold == 0.50
 
     def test_from_env_reads_hermes_threshold_without_pyyaml(self, monkeypatch, tmp_path):
         import hermes_lcm.config as config_mod
@@ -426,6 +889,78 @@ class TestConfig:
         c = LCMConfig.from_env()
 
         assert c.context_threshold == 0.68
+
+    def test_from_env_lcm_section_overrides_compression_section(self, monkeypatch, tmp_path):
+        """lcm.context_threshold in config.yaml takes priority over compression.threshold."""
+        hermes_home = tmp_path / "hermes"
+        hermes_home.mkdir()
+        (hermes_home / "config.yaml").write_text(
+            "lcm:\n  context_threshold: 0.40\ncompression:\n  enabled: true\n  threshold: 0.80\n"
+        )
+        monkeypatch.setenv("HERMES_HOME", str(hermes_home))
+        monkeypatch.delenv("LCM_CONTEXT_THRESHOLD", raising=False)
+
+        c = LCMConfig.from_env()
+
+        assert c.context_threshold == 0.40
+
+    def test_from_env_lcm_section_overrides_without_pyyaml(self, monkeypatch, tmp_path):
+        """lcm: section parsed correctly when pyyaml is unavailable."""
+        import hermes_lcm.config as config_mod
+
+        hermes_home = tmp_path / "hermes"
+        hermes_home.mkdir()
+        (hermes_home / "config.yaml").write_text(
+            "lcm:\n  context_threshold: '0.42'\ncompression:\n  enabled: true\n  threshold: '0.80'\n"
+        )
+        monkeypatch.setenv("HERMES_HOME", str(hermes_home))
+        monkeypatch.delenv("LCM_CONTEXT_THRESHOLD", raising=False)
+        monkeypatch.setattr(config_mod, "yaml", None)
+
+        c = LCMConfig.from_env()
+
+        assert c.context_threshold == 0.42
+
+    def test_from_env_nested_lcm_context_threshold_ignored(self, monkeypatch, tmp_path):
+        """Deeply nested context_threshold under lcm: should NOT be matched.
+
+        Regression test: the no-yaml fallback parser must track indentation
+        so that only direct children of the lcm: section are considered.
+        """
+        import hermes_lcm.config as config_mod
+
+        hermes_home = tmp_path / "hermes"
+        hermes_home.mkdir()
+        # context_threshold nested under lcm > subsection — must be ignored
+        (hermes_home / "config.yaml").write_text(
+            "lcm:\n  subsection:\n    context_threshold: 0.99\n"
+            "compression:\n  enabled: true\n  threshold: 0.60\n"
+        )
+        monkeypatch.setenv("HERMES_HOME", str(hermes_home))
+        monkeypatch.delenv("LCM_CONTEXT_THRESHOLD", raising=False)
+        monkeypatch.setattr(config_mod, "yaml", None)
+
+        c = LCMConfig.from_env()
+
+        # Must fall through to compression.threshold, NOT the nested 0.99
+        assert c.context_threshold == 0.60
+
+    def test_from_env_nested_compression_threshold_ignored(self, monkeypatch, tmp_path):
+        """Deeply nested threshold under compression: should NOT be matched."""
+        import hermes_lcm.config as config_mod
+
+        hermes_home = tmp_path / "hermes"
+        hermes_home.mkdir()
+        (hermes_home / "config.yaml").write_text(
+            "compression:\n  enabled: true\n  subsection:\n    threshold: 0.99\n  threshold: 0.55\n"
+        )
+        monkeypatch.setenv("HERMES_HOME", str(hermes_home))
+        monkeypatch.delenv("LCM_CONTEXT_THRESHOLD", raising=False)
+        monkeypatch.setattr(config_mod, "yaml", None)
+
+        c = LCMConfig.from_env()
+
+        assert c.context_threshold == 0.55
 
 
 class TestSessionPatterns:
@@ -608,12 +1143,127 @@ class TestTokens:
         assert count_message_tokens(msg) == count_message_tokens(normalized_msg)
         assert count_message_tokens(msg) > 100
 
+    def test_count_tokens_is_memoized(self):
+        from hermes_lcm.tokens import _count_tokens_cached
+
+        text = "a repeated content string used across a turn " * 20
+        first = count_tokens(text)
+        before = _count_tokens_cached.cache_info()
+        for _ in range(5):
+            assert count_tokens(text) == first
+        after = _count_tokens_cached.cache_info()
+        assert after.hits >= before.hits + 5
+
+    def test_fallback_token_estimate_ascii_fast_path_skips_character_scan(self):
+        from hermes_lcm.tokens import _fallback_token_estimate
+
+        text = "a" * 80_000
+
+        assert _fallback_token_estimate(text) == len(text) // 4 + 1
+
+    def test_fallback_token_estimate_scales_up_for_cjk(self):
+        from hermes_lcm.tokens import _fallback_token_estimate
+
+        latin = "the quick brown fox " * 20
+        cjk = "検索対象データ処理" * 20
+        assert _fallback_token_estimate(latin) == len(latin) // 4 + 1
+        assert _fallback_token_estimate(cjk) > len(cjk) // 4 + 1
+
+    def test_count_tokens_cache_boundary_is_literal_32_kib(self, monkeypatch):
+        from hermes_lcm import tokens as token_module
+
+        assert token_module._MAX_CACHEABLE_TOKEN_TEXT_CHARS == 32_768
+
+        monkeypatch.setattr(token_module, "_get_encoder", lambda: None)
+        token_module._count_tokens_cached.cache_clear()
+
+        boundary = "x" * 32_768
+        first = token_module.count_tokens(boundary)
+        before = token_module._count_tokens_cached.cache_info()
+        assert before.currsize == 1
+        assert token_module.count_tokens(boundary) == first
+        after_boundary = token_module._count_tokens_cached.cache_info()
+        assert after_boundary.currsize == 1
+        assert after_boundary.hits == before.hits + 1
+
+        oversized = "x" * 32_769
+        assert token_module.count_tokens(oversized) > 0
+        before_oversized_repeat = token_module._count_tokens_cached.cache_info()
+        assert token_module.count_tokens(oversized) > 0
+        after_oversized_repeat = token_module._count_tokens_cached.cache_info()
+
+        assert after_oversized_repeat.currsize == before_oversized_repeat.currsize == 1
+        assert after_oversized_repeat.hits == before_oversized_repeat.hits
+
+    def test_count_tokens_tolerates_non_string_unhashable_input(self):
+        assert count_tokens({"api_key": 1}) >= 0
+        msg = {
+            "role": "assistant",
+            "content": "calling",
+            "tool_calls": [
+                {"function": {"name": "lookup", "arguments": {"api_key": 1}}}
+            ],
+        }
+        assert count_message_tokens(msg) > 0
+
     def test_count_messages_tokens(self):
         msgs = [
             {"role": "user", "content": "hello"},
             {"role": "assistant", "content": "world"},
         ]
         assert count_messages_tokens(msgs) > 0
+
+    def test_l3_truncate_text_to_tokens_respects_budget(self):
+        from hermes_lcm.escalation import _truncate_text_to_tokens
+
+        text = "the quick brown fox jumps over the lazy dog " * 50
+        head = _truncate_text_to_tokens(text, 20)
+        assert count_tokens(head) <= 20
+        assert text.startswith(head[: min(len(head), 10)])
+        tail = _truncate_text_to_tokens(text, 20, from_end=True)
+        assert count_tokens(tail) <= 20
+        # Short text and non-positive budgets are handled.
+        assert _truncate_text_to_tokens("short", 100) == "short"
+        assert _truncate_text_to_tokens("anything", 0) == ""
+
+
+class TestDeterministicTruncate:
+    def test_honours_token_budget_for_cjk_without_tiktoken(self, monkeypatch):
+        from hermes_lcm.escalation import _deterministic_truncate, _L3_TRUNCATION_MARKER
+        from hermes_lcm import tokens as token_module
+
+        monkeypatch.setattr(token_module, "_get_encoder", lambda: None)
+        token_module._count_tokens_cached.cache_clear()
+
+        # Dense CJK: tokenizes far more densely than 4 chars/token, so the old
+        # chars*4 budget overshot the token budget ~2-4x. Force the fallback
+        # counter because that path is where per-part counts are non-additive.
+        cjk = "这是一段需要压缩的中文技术文本内容。" * 200
+        for max_tokens in (80, 100, 150, 200, 512):
+            assert token_module.count_tokens(cjk) > max_tokens  # precondition: truncation happens
+
+            out = _deterministic_truncate(cjk, max_tokens)
+
+            assert _L3_TRUNCATION_MARKER in out
+            assert token_module.count_tokens(out) <= max_tokens
+            assert token_module.count_tokens(out) < token_module.count_tokens(cjk)  # converged
+
+    def test_ascii_truncation_converges_and_keeps_head_and_tail(self):
+        from hermes_lcm.escalation import _deterministic_truncate
+
+        text = "alpha " + ("filler word " * 500) + " omega"
+        max_tokens = 60
+        out = _deterministic_truncate(text, max_tokens)
+        assert count_tokens(out) < count_tokens(text)
+        assert count_tokens(out) <= max_tokens
+        assert out.startswith("alpha")
+        assert out.rstrip().endswith("omega")
+
+    def test_short_text_is_returned_unchanged(self):
+        from hermes_lcm.escalation import _deterministic_truncate
+
+        text = "already small enough"
+        assert _deterministic_truncate(text, 1000) == text
 
 
 class TestMessageStore:
@@ -674,6 +1324,36 @@ class TestMessageStore:
         result = store.get_range("sess1", start_id=ids[3], end_id=ids[7])
         assert len(result) == 5
 
+    def test_get_range_can_filter_by_conversation_id(self, store):
+        first = store.append(
+            "sess1",
+            {"role": "user", "content": "conv a first"},
+            conversation_id="conv-a",
+        )
+        store.append(
+            "sess1",
+            {"role": "user", "content": "conv b"},
+            conversation_id="conv-b",
+        )
+        last = store.append(
+            "sess1",
+            {"role": "assistant", "content": "conv a second"},
+            conversation_id="conv-a",
+        )
+
+        unfiltered = store.get_range("sess1", start_id=first, end_id=last)
+        filtered = store.get_range("sess1", start_id=first, end_id=last, conversation_id="conv-a")
+
+        assert [row["content"] for row in unfiltered] == [
+            "conv a first",
+            "conv b",
+            "conv a second",
+        ]
+        assert [row["content"] for row in filtered] == [
+            "conv a first",
+            "conv a second",
+        ]
+
     def test_session_count(self, store):
         store.append("sess1", {"role": "user", "content": "a"})
         store.append("sess1", {"role": "assistant", "content": "b"})
@@ -707,6 +1387,53 @@ class TestMessageStore:
         assert scoped_results == []
         assert {result["session_id"] for result in all_results} == {"sess1", "sess2"}
 
+    def test_like_fallback_relevance_sort_does_not_drop_older_best_match_at_candidate_cap(self, store):
+        # Regression: relevance LIKE fallback must order by relevance before
+        # applying the candidate cap. A recent-first window can miss an older
+        # row with a higher term score.
+        needle_id = store.append(
+            "sess1", {"role": "user", "content": "検索対象 検索対象 検索対象 older best match"}
+        )
+        for i in range(520):
+            store.append("sess1", {"role": "user", "content": f"検索対象 recent filler {i}"})
+
+        results = store.search("検索対象", session_id="sess1", limit=5, sort="relevance")
+
+        assert results, "expected LIKE-fallback matches"
+        assert results[0]["store_id"] == needle_id
+
+    @pytest.mark.parametrize("sort", ["relevance", "hybrid"])
+    def test_like_fallback_relevance_sort_binds_order_args_before_exact_match(self, store, monkeypatch, sort):
+        import hermes_lcm.store as store_module
+
+        monkeypatch.setattr(store_module, "compute_search_candidate_cap", lambda _limit: 10)
+        needle_id = store.append("sess1", {"role": "user", "content": "alpha beta older best"})
+        for i in range(20):
+            store.append("sess1", {"role": "user", "content": f"alpha recent filler {i}"})
+
+        results = store.search("alpha-beta", session_id="sess1", limit=5, sort=sort)
+
+        assert [result["store_id"] for result in results][:1] == [needle_id]
+        assert any(result["store_id"] == needle_id for result in results)
+
+    def test_like_fallback_relevance_sort_finds_recent_match_beyond_first_page(self, store):
+        # Regression: with more matching rows than the candidate fetch limit,
+        # the relevance/hybrid LIKE fallback fetched an arbitrary storage-order
+        # (oldest-first) slice with no ORDER BY, so the most relevant recent
+        # match beyond the first page was never scored. It must now scan
+        # recent-first up to the candidate cap. The CJK query forces the LIKE
+        # fallback path (FTS cannot tokenize it).
+        for i in range(60):
+            store.append("sess1", {"role": "user", "content": f"検索対象 background note {i}"})
+        needle_id = store.append(
+            "sess1", {"role": "user", "content": "検索対象 検索対象 検索対象 top match"}
+        )
+
+        results = store.search("検索対象", session_id="sess1", limit=5, sort="relevance")
+
+        assert results, "expected LIKE-fallback matches"
+        assert results[0]["store_id"] == needle_id
+
     def test_source_stored_and_filterable(self, store):
         store.append("sess1", {"role": "user", "content": "docker in cli"}, source="cli")
         store.append("sess2", {"role": "user", "content": "docker in discord"}, source="discord")
@@ -721,6 +1448,59 @@ class TestMessageStore:
         assert len(discord_results) == 1
         assert discord_results[0]["source"] == "discord"
         assert discord_results[0]["session_id"] == "sess2"
+
+    def test_conversation_id_stored_and_filterable_for_discord_lanes(self, store):
+        main_id = store.append(
+            "sess-main",
+            {"role": "user", "content": "docker in discord main lane"},
+            source="discord",
+            conversation_id="agent:main:discord:group:main:user",
+        )
+        thread_id = store.append(
+            "sess-thread",
+            {"role": "user", "content": "docker in discord forum topic"},
+            source="discord",
+            conversation_id="agent:main:discord:thread:topic:topic",
+        )
+
+        main_results = store.search(
+            "docker",
+            source="discord",
+            conversation_id="agent:main:discord:group:main:user",
+        )
+        thread_results = store.search(
+            "docker",
+            source="discord",
+            conversation_id="agent:main:discord:thread:topic:topic",
+        )
+
+        assert [result["store_id"] for result in main_results] == [main_id]
+        assert main_results[0]["conversation_id"] == "agent:main:discord:group:main:user"
+        assert [result["store_id"] for result in thread_results] == [thread_id]
+        assert thread_results[0]["conversation_id"] == "agent:main:discord:thread:topic:topic"
+        assert store.get(main_id)["conversation_id"] == "agent:main:discord:group:main:user"
+
+    def test_like_fallback_filters_by_conversation_id(self, store):
+        store.append(
+            "sess-main",
+            {"role": "user", "content": "foo bar lane main"},
+            source="discord",
+            conversation_id="agent:main:discord:group:main:user",
+        )
+        thread_id = store.append(
+            "sess-thread",
+            {"role": "user", "content": "foo bar lane topic"},
+            source="discord",
+            conversation_id="agent:main:discord:thread:topic:topic",
+        )
+
+        results = store.search(
+            'foo"bar',
+            source="discord",
+            conversation_id="agent:main:discord:thread:topic:topic",
+        )
+
+        assert [result["store_id"] for result in results] == [thread_id]
 
     def test_missing_source_is_normalized_to_unknown_and_filterable(self, store):
         store_id = store.append("sess-unknown", {"role": "user", "content": "docker with unknown source"})
@@ -894,6 +1674,48 @@ class TestMessageStore:
         assert rewritten is False
         assert store.get(store_id)["content"] == "raw payload blob should stay"
 
+    def test_gc_before_commit_hook_runs_atomically_with_rewrite(self, store):
+        """before_commit runs after the rewrite, before the single commit (F2).
+
+        The chunk archive must be atomic with the content rewrite: at hook time
+        the content is already the placeholder and the connection is still in the
+        rewrite's open transaction, so the hook's writes commit together with it.
+        """
+        placeholder = "[GC'd externalized tool output: tool_call_id=call_gc; ref=payload.json]"
+        store_id = store.append(
+            "sess1",
+            {"role": "tool", "tool_call_id": "call_gc", "content": "raw payload blob"},
+            token_estimate=50,
+        )
+
+        observed = {}
+
+        def hook(conn, sid):
+            row = conn.execute(
+                "SELECT content FROM messages WHERE store_id = ?", (sid,)
+            ).fetchone()
+            observed["content_at_hook"] = row[0]
+            observed["in_transaction"] = conn.in_transaction
+            conn.execute(
+                "INSERT INTO metadata(key, value) VALUES('gc_hook_marker', ?)",
+                (str(sid),),
+            )
+
+        rewritten = store.gc_externalized_tool_result(
+            store_id, placeholder, before_commit=hook
+        )
+
+        assert rewritten is True
+        # The rewrite was already applied when the hook ran, in the same open txn.
+        assert observed["content_at_hook"] == placeholder
+        assert observed["in_transaction"] is True
+        # The hook's sibling write committed atomically with the rewrite.
+        assert store.get(store_id)["content"] == placeholder
+        marker = store.connection.execute(
+            "SELECT value FROM metadata WHERE key = 'gc_hook_marker'"
+        ).fetchone()
+        assert marker is not None and marker[0] == str(store_id)
+
     def test_init_repairs_malformed_message_fts_and_sets_schema_version(self, tmp_path):
         db_path = tmp_path / "legacy-store.db"
         conn = sqlite3.connect(db_path)
@@ -931,7 +1753,7 @@ class TestMessageStore:
         version = store._conn.execute(
             "SELECT value FROM metadata WHERE key = 'schema_version'"
         ).fetchone()
-        assert version == ("4",)
+        assert version == (str(SCHEMA_VERSION),)
 
         results = store.search("docker", session_id="sess1")
         assert len(results) == 1
@@ -980,7 +1802,7 @@ class TestMessageStore:
         version = store._conn.execute(
             "SELECT value FROM metadata WHERE key = 'schema_version'"
         ).fetchone()
-        assert version == ("4",)
+        assert version == (str(SCHEMA_VERSION),)
 
         migration_state = store._conn.execute(
             "SELECT step_name FROM lcm_migration_state ORDER BY step_name"
@@ -1309,6 +2131,31 @@ class TestMessageStore:
         assert len(results) == 1
         assert results[0]["store_id"] == target
         assert results[0]["snippet"]
+
+    def test_search_simple_hyphenated_terms_use_fts(self, store):
+        target = store.append(
+            "sess1",
+            {
+                "role": "user",
+                "content": "durable Hermes LCM promotion post-restart acceptance",
+            },
+        )
+
+        traced: list[str] = []
+        store._conn.set_trace_callback(traced.append)
+        try:
+            results = store.search(
+                "durable Hermes LCM promotion post-restart acceptance",
+                session_id="sess1",
+                limit=5,
+                sort="relevance",
+            )
+        finally:
+            store._conn.set_trace_callback(None)
+
+        assert [result["store_id"] for result in results] == [target]
+        assert any("FROM messages_fts" in statement for statement in traced)
+        assert not any("content LIKE" in statement for statement in traced)
 
     def test_search_like_fallback_applies_sql_limit(self, store):
         for idx in range(80):
@@ -1657,7 +2504,7 @@ class TestMessageStore:
         assert [result["store_id"] for result in results] == [direct_id]
 
     def test_search_recency_same_timestamp_pool_is_limit_stable(self, store):
-        ids = store.append_batch(
+        store.append_batch(
             "sess1",
             [
                 {
@@ -1672,13 +2519,35 @@ class TestMessageStore:
                 }
             ],
         )
-        timestamp = store.get(ids[0])["timestamp"]
 
         short_results = store.search("alpha beta gamma", session_id="sess1", limit=5, sort="recency")
         long_results = store.search("alpha beta gamma", session_id="sess1", limit=200, sort="recency")
 
-        assert [result["timestamp"] for result in short_results] == [timestamp] * len(short_results)
+        # With per-message timestamps (fix for batch timestamp dedup), messages
+        # no longer share identical timestamps.  The stability invariant is that
+        # the top-N results from a limited search match the first N of an
+        # unlimited search — i.e. the sort order is deterministic.
         assert [result["store_id"] for result in short_results] == [result["store_id"] for result in long_results[:5]]
+
+    def test_append_batch_timestamps_are_unique_per_row(self, store):
+        """Regression: each message in a batch must get its own timestamp.
+
+        The old code called time.time() once before the loop, giving every
+        message in the batch the same timestamp.  This broke date-based
+        queries (journal entries, time-range filtering).
+        """
+        n = 50
+        ids = store.append_batch(
+            "ts-sess",
+            [{"role": "user", "content": f"msg {i}"} for i in range(n)],
+        )
+        timestamps = [store.get(sid)["timestamp"] for sid in ids]
+        # All timestamps must be distinct — no two rows share the same value.
+        assert len(set(timestamps)) == n, (
+            f"Expected {n} unique timestamps, got {len(set(timestamps))}"
+        )
+        # Strictly non-decreasing (clock may tick between rows).
+        assert timestamps == sorted(timestamps)
 
     def test_search_hybrid_clamps_future_timestamps_consistently(self, store):
         now = time.time()
@@ -1742,6 +2611,95 @@ class TestMessageStore:
         assert msg["role"] == "assistant"
         assert len(msg["tool_calls"]) == 1
 
+    def test_write_lock_serializes_concurrent_appends(self, tmp_path):
+        """All writes through ``self._conn`` must serialize on ``self._write_lock``.
+
+        ``MessageStore._conn`` is opened with ``check_same_thread=False`` and is
+        shared across threads. SQLite's C-level mutex protects engine-internal
+        state, but the Python ``sqlite3`` module releases the GIL during the
+        C call. Without an explicit Python-side write lock, downstream
+        operators have observed on-disk corruption that is consistent with
+        concurrent in-process clients (notably HTTPS API libraries that
+        operate on TLS buffers in the same address space) intersecting
+        SQLite's write path. The fix is a re-entrant Python lock around all
+        callers that mutate ``self._conn``.
+
+        This test verifies the contract two ways:
+
+        1. The store exposes a ``_write_lock`` attribute (an ``RLock``).
+        2. Heavy concurrent ``append`` and ``append_batch`` traffic from
+           multiple threads completes with no SQLite errors and produces
+           the exact expected row count — which would not be the case if
+           inserts were racing.
+        """
+        store = MessageStore(tmp_path / "concurrency.db")
+        assert hasattr(store, "_write_lock"), "MessageStore must expose _write_lock"
+        # ``threading.RLock`` is a factory; the returned object is a private
+        # type. Assert behavior rather than exact class identity.
+        with store._write_lock:
+            with store._write_lock:  # re-entrancy is required for nested call sites
+                pass
+
+        n_threads = 8
+        per_thread_singles = 25
+        per_thread_batch_size = 5
+        per_thread_batches = 5
+
+        errors: list[BaseException] = []
+
+        def worker(thread_id: int) -> None:
+            try:
+                for i in range(per_thread_singles):
+                    store.append(
+                        f"sess-t{thread_id}",
+                        {"role": "user", "content": f"single-{thread_id}-{i}"},
+                        token_estimate=1,
+                    )
+                for b in range(per_thread_batches):
+                    msgs = [
+                        {"role": "user", "content": f"batch-{thread_id}-{b}-{j}"}
+                        for j in range(per_thread_batch_size)
+                    ]
+                    store.append_batch(f"sess-t{thread_id}", msgs, [1] * per_thread_batch_size)
+            except BaseException as exc:  # pragma: no cover - failure path
+                errors.append(exc)
+
+        threads = [
+            threading.Thread(target=worker, args=(i,), daemon=True)
+            for i in range(n_threads)
+        ]
+        for t in threads:
+            t.start()
+
+        # Slow hardware can make a single worker exceed the old fixed
+        # per-thread 30s join while the write-lock contract is still healthy.
+        # Use one larger wall-clock deadline for the whole storm: enough
+        # headroom for constrained machines, but still bounded for real hangs.
+        deadline = time.monotonic() + 120
+        for t in threads:
+            remaining = max(0.0, deadline - time.monotonic())
+            t.join(timeout=remaining)
+        alive_threads = [t.name for t in threads if t.is_alive()]
+        assert alive_threads == [], f"worker threads did not finish in time: {alive_threads!r}"
+
+        assert errors == [], f"concurrent workers raised: {errors!r}"
+
+        expected_rows = n_threads * (
+            per_thread_singles + per_thread_batches * per_thread_batch_size
+        )
+        actual_rows = store._conn.execute("SELECT COUNT(*) FROM messages").fetchone()[0]
+        assert actual_rows == expected_rows, (
+            f"expected {expected_rows} rows, got {actual_rows} — concurrent appends "
+            "lost or duplicated rows, indicating broken serialization"
+        )
+
+        # Database file must be a valid SQLite database after the storm.
+        # quick_check is a cheap structural sanity check.
+        qc = store._conn.execute("PRAGMA quick_check").fetchone()[0]
+        assert qc == "ok", f"quick_check failed: {qc!r}"
+
+        store.close()
+
 
 class TestLifecycleStateStore:
     def test_init_creates_lifecycle_state_table(self, tmp_path):
@@ -1757,6 +2715,65 @@ class TestLifecycleStateStore:
         assert state.get_by_session("missing") is None
 
         state.close()
+
+    def test_advance_frontier_is_monotonic_under_stale_read(self, tmp_path):
+        import dataclasses
+
+        store = LifecycleStateStore(tmp_path / "lifecycle-frontier.db")
+        try:
+            store.bind_session("s1", conversation_id="c1")
+            store.advance_frontier("c1", "s1", 10)
+            assert store.get_by_conversation("c1").current_frontier_store_id == 10
+
+            # Simulate a racing caller whose read predates the advance to 10:
+            # it sees a stale frontier of 0 and tries to advance to a lower
+            # value. SQL-side MAX must keep the checkpoint monotonic instead of
+            # regressing it (which would force the same range to compact twice).
+            stale = dataclasses.replace(
+                store.get_by_conversation("c1"), current_frontier_store_id=0
+            )
+            store.get_by_conversation = lambda cid: stale
+            try:
+                store.advance_frontier("c1", "s1", 5)
+            finally:
+                del store.get_by_conversation
+
+            assert store.get_by_conversation("c1").current_frontier_store_id == 10
+        finally:
+            store.close()
+
+    def test_advance_frontier_refuses_stale_session_after_rebind(self, tmp_path):
+        db_path = tmp_path / "lifecycle-frontier-rebind.db"
+        store = LifecycleStateStore(db_path)
+        racer = LifecycleStateStore(db_path)
+        try:
+            store.bind_session("s1", conversation_id="c1")
+            original_get = store.get_by_conversation
+            state_seen_before_rebind = []
+
+            def get_and_rebind_once(conversation_id):
+                state = original_get(conversation_id)
+                if not state_seen_before_rebind:
+                    state_seen_before_rebind.append(state.current_session_id)
+                    racer.bind_session("s2", conversation_id="c1")
+                return state
+
+            store.get_by_conversation = get_and_rebind_once
+            try:
+                returned = store.advance_frontier("c1", "s1", 123)
+            finally:
+                del store.get_by_conversation
+
+            final = store.get_by_conversation("c1")
+            assert state_seen_before_rebind == ["s1"]
+            assert returned is not None
+            assert returned.current_session_id == "s2"
+            assert returned.current_frontier_store_id == 0
+            assert final.current_session_id == "s2"
+            assert final.current_frontier_store_id == 0
+        finally:
+            store.close()
+            racer.close()
 
     def test_init_upgrades_legacy_db_and_keeps_missing_state_safe(self, tmp_path):
         db_path = tmp_path / "legacy-lifecycle.db"
@@ -1778,7 +2795,7 @@ class TestLifecycleStateStore:
         version = state._conn.execute(
             "SELECT value FROM metadata WHERE key = 'schema_version'"
         ).fetchone()[0]
-        assert version == "4"
+        assert version == str(SCHEMA_VERSION)
 
         tables = {
             row[0]
@@ -1868,8 +2885,8 @@ class TestLifecycleStateStore:
         state_db = tmp_path / "state.db"
         # Initialize all shared LCM tables; fragmentation diagnostics compare
         # lifecycle rows against raw-message and summary-DAG session coverage.
-        store = MessageStore(db_path)
-        dag = SummaryDAG(db_path)
+        _store = MessageStore(db_path)
+        _dag = SummaryDAG(db_path)
         state = LifecycleStateStore(db_path)
         conn = state._conn
         conn.execute(
@@ -1923,10 +2940,52 @@ class TestLifecycleStateStore:
         assert stats["state_sessions_missing_in_lcm_any"] == 1
         assert stats["state_db_checked"] is True
         assert stats["state_db_error"] == ""
+        classification = stats["classification"]
+        assert classification["status"] == "warn"
+        assert classification["read_only"] is True
+        assert classification["summary"] == "4 lifecycle fragmentation categories need review"
+        categories = {item["name"]: item for item in classification["categories"]}
+        assert categories["stale_lifecycle_current"]["count"] == 1
+        assert categories["stale_lifecycle_current"]["sample_session_ids"] == ["missing-current"]
+        assert categories["stale_lifecycle_finalized"]["count"] == 1
+        assert categories["stale_lifecycle_finalized"]["sample_session_ids"] == ["missing-final"]
+        assert categories["lcm_node_sessions_missing_in_state"]["count"] == 1
+        assert categories["lcm_node_sessions_missing_in_state"]["sample_session_ids"] == ["node-only"]
+        assert categories["state_only_sessions"]["count"] == 1
+        assert categories["state_only_sessions"]["sample_session_ids"] == ["state-only"]
+        assert categories["stale_lifecycle_current"]["recommended_action"]
+        assert not any(item["name"] == "lcm_message_sessions_without_lifecycle_reference" for item in classification["categories"])
 
         # Read-only diagnostic: no lifecycle rows were mutated or removed.
         assert state.row_count() == 2
         assert state.get_by_conversation("conv-missing").current_session_id == "missing-current"
+
+        state.close()
+
+    def test_lifecycle_fragmentation_stats_does_not_classify_legacy_lcm_rows_without_lifecycle_state(self, tmp_path):
+        db_path = tmp_path / "legacy-lcm-without-lifecycle.db"
+        store = MessageStore(db_path)
+        dag = SummaryDAG(db_path)
+        state = LifecycleStateStore(db_path)
+        store.append("legacy-message-session", {"role": "user", "content": "legacy"}, source="cli")
+        dag.add_node(SummaryNode(
+            session_id="legacy-node-session",
+            depth=0,
+            summary="legacy summary",
+            token_count=5,
+            source_token_count=5,
+            source_ids=[],
+            source_type="messages",
+            created_at=1.0,
+        ))
+
+        stats = state.get_fragmentation_stats()
+
+        assert stats["lifecycle_rows"] == 0
+        assert stats["message_sessions_without_lifecycle_reference"] == 1
+        assert stats["node_sessions_without_lifecycle_reference"] == 1
+        assert stats["classification"]["status"] == "pass"
+        assert stats["classification"]["categories"] == []
 
         state.close()
 
@@ -1948,15 +3007,28 @@ class TestLifecycleStateStore:
         assert stats["message_sessions_without_lifecycle_current"] == 1
         assert stats["message_sessions_without_lifecycle_reference"] == 0
         assert stats["node_sessions_without_lifecycle_reference"] == 0
+        assert stats["classification"]["status"] == "pass"
+        assert stats["classification"]["categories"] == []
 
         state.close()
 
     def test_lifecycle_fragmentation_stats_reports_existing_malformed_state_db(self, tmp_path):
         db_path = tmp_path / "lifecycle-malformed-state.db"
         state_db = tmp_path / "state.db"
-        MessageStore(db_path)
-        SummaryDAG(db_path)
+        store = MessageStore(db_path)
+        dag = SummaryDAG(db_path)
         state = LifecycleStateStore(db_path)
+        store.append("message-session", {"role": "user", "content": "stored"}, source="cli")
+        dag.add_node(SummaryNode(
+            session_id="node-session",
+            depth=0,
+            summary="stored node",
+            token_count=5,
+            source_token_count=5,
+            source_ids=[],
+            source_type="messages",
+            created_at=1.0,
+        ))
         state_db.write_text("not sqlite")
 
         stats = state.get_fragmentation_stats(state_db_path=state_db)
@@ -1964,6 +3036,10 @@ class TestLifecycleStateStore:
         assert stats["state_db_checked"] is True
         assert stats["state_db_error"]
         assert stats["read_only"] is True
+        categories = {item["name"]: item for item in stats["classification"]["categories"]}
+        assert "lcm_message_sessions_missing_in_state" not in categories
+        assert "lcm_node_sessions_missing_in_state" not in categories
+        assert "state_only_sessions" not in categories
         assert state.row_count() == 0
 
         state.close()
@@ -2005,6 +3081,100 @@ class TestLifecycleStateStore:
         assert after_reset.debt_size_estimate == 0
         assert after_reset.last_reset_at is not None
 
+        state.close()
+
+    def test_prune_empty_sessions_deletes_row_with_zero_data(self, tmp_path):
+        state = LifecycleStateStore(tmp_path / "prune-empty.db")
+        state.bind_session("orphan-session")
+        assert state.row_count() == 1
+
+        deleted = state.prune_empty_sessions()
+        assert deleted == 1
+        assert state.row_count() == 0
+        state.close()
+
+    def test_prune_empty_sessions_preserves_row_with_messages(self, tmp_path):
+        db_path = tmp_path / "prune-msg.db"
+        state = LifecycleStateStore(db_path)
+        store = MessageStore(db_path)
+        store.append("live-session", {"role": "user", "content": "hello"}, source="cli")
+        state.bind_session("live-session")
+
+        deleted = state.prune_empty_sessions()
+        assert deleted == 0
+        assert state.row_count() == 1
+        state.close()
+
+    def test_prune_empty_sessions_preserves_row_with_nodes(self, tmp_path):
+        db_path = tmp_path / "prune-node.db"
+        state = LifecycleStateStore(db_path)
+        dag = SummaryDAG(db_path)
+        dag.add_node(SummaryNode(
+            session_id="live-session", depth=0, summary="test",
+            token_count=5, source_ids=[1], source_type="messages",
+        ))
+        state.bind_session("live-session")
+
+        deleted = state.prune_empty_sessions()
+        assert deleted == 0
+        assert state.row_count() == 1
+        state.close()
+
+    def test_prune_empty_sessions_respects_protected_sessions(self, tmp_path):
+        state = LifecycleStateStore(tmp_path / "prune-protected.db")
+        state.bind_session("protected-session")
+
+        deleted = state.prune_empty_sessions(
+            protected_session_ids={"protected-session"},
+        )
+        assert deleted == 0
+        assert state.row_count() == 1
+        state.close()
+
+    def test_prune_empty_sessions_respects_max_age_hours(self, tmp_path):
+        state = LifecycleStateStore(tmp_path / "prune-age.db")
+        state.bind_session("old-orphan")
+
+        # Recent row should survive with max_age_hours=1
+        deleted = state.prune_empty_sessions(max_age_hours=1)
+        assert deleted == 0
+        assert state.row_count() == 1
+        state.close()
+
+    def test_prune_empty_sessions_handles_mixed_state(self, tmp_path):
+        db_path = tmp_path / "prune-mixed.db"
+        state = LifecycleStateStore(db_path)
+        store = MessageStore(db_path)
+        store.append("live-session", {"role": "user", "content": "hello"}, source="cli")
+        state.bind_session("live-session")
+        state.bind_session("orphan-1")
+        state.bind_session("orphan-2")
+        assert state.row_count() == 3
+
+        deleted = state.prune_empty_sessions()
+        assert deleted == 2
+        assert state.row_count() == 1
+        remaining = state.get_by_conversation("live-session")
+        assert remaining is not None
+        state.close()
+
+    def test_prune_empty_sessions_returns_zero_on_no_candidates(self, tmp_path):
+        db_path = tmp_path / "prune-nocand.db"
+        state = LifecycleStateStore(db_path)
+        store = MessageStore(db_path)
+        store.append("s1", {"role": "user", "content": "hi"}, source="cli")
+        state.bind_session("s1")
+
+        deleted = state.prune_empty_sessions()
+        assert deleted == 0
+        state.close()
+
+    def test_prune_empty_sessions_handles_empty_table(self, tmp_path):
+        state = LifecycleStateStore(tmp_path / "prune-empty-table.db")
+        assert state.row_count() == 0
+
+        deleted = state.prune_empty_sessions()
+        assert deleted == 0
         state.close()
 
 
@@ -2205,7 +3375,7 @@ class TestSummaryDAG:
         version = dag._conn.execute(
             "SELECT value FROM metadata WHERE key = 'schema_version'"
         ).fetchone()
-        assert version == ("4",)
+        assert version == (str(SCHEMA_VERSION),)
 
         results = dag.search("docker", session_id="s1")
         assert len(results) == 1
@@ -2257,7 +3427,7 @@ class TestSummaryDAG:
         version = dag._conn.execute(
             "SELECT value FROM metadata WHERE key = 'schema_version'"
         ).fetchone()
-        assert version == ("4",)
+        assert version == (str(SCHEMA_VERSION),)
 
         migration_state = dag._conn.execute(
             "SELECT step_name FROM lcm_migration_state ORDER BY step_name"
@@ -2935,6 +4105,59 @@ class TestEscalation:
     def test_truncate_short(self):
         assert _deterministic_truncate("hello", 1000) == "hello"
 
+    def test_focus_topic_builds_structured_l1_brief(self):
+        from hermes_lcm.escalation import _build_l1_prompt
+        prompt = _build_l1_prompt(
+            "test content", 500, depth=0,
+            focus_topic="database migrations",
+        )
+        assert "Focus brief:" in prompt
+        assert "Primary focus: database migrations" in prompt
+        assert "Preserve concrete decisions, constraints, files, commands, identifiers, and current state for this focus." in prompt
+        assert "Demote old / completed topics:" in prompt
+        assert "STALE context" in prompt
+        assert "must NOT resume" in prompt
+        assert "## Historical Task Snapshot" in prompt
+        assert "## Historical Remaining Work" in prompt
+        assert "## Completed Actions (historical)" not in prompt
+        assert (
+            "'## Historical Task Snapshot' / '## Historical In-Progress State' / "
+            "'## Historical Pending User Asks' / '## Historical Remaining Work'"
+        ) in prompt
+        # Blocker / handoff exception
+        assert "Exception: active blockers or handoff state should NOT be demoted" in prompt
+        assert "Keep blockers and pending handoffs outside historical headings" in prompt
+
+    def test_focus_topic_builds_structured_l2_brief(self):
+        from hermes_lcm.escalation import _build_l2_prompt
+        prompt = _build_l2_prompt(
+            "test content", 500,
+            focus_topic="release blockers",
+        )
+        assert "Focus brief:" in prompt
+        assert "Primary focus: release blockers" in prompt
+        assert "Prefer bullets that preserve decisions, blockers, files, commands, identifiers, and current state for this focus." in prompt
+        assert "Keep other active tasks only when they are current blockers or handoff state." in prompt
+        # Demote + blocker exception
+        assert "Demote old / completed topics:" in prompt
+        assert "## Completed Actions (historical)" not in prompt
+        assert (
+            "'## Historical Task Snapshot' / '## Historical In-Progress State' / "
+            "'## Historical Pending User Asks' / '## Historical Remaining Work'"
+        ) in prompt
+        assert "Exception: active blockers and pending handoff state should NOT be demoted" in prompt
+        assert "Keep them outside historical headings so the agent retains awareness" in prompt
+
+    def test_focus_topic_is_normalized_and_bounded_in_prompts(self):
+        from hermes_lcm.escalation import _build_l1_prompt
+        noisy_focus = "  migration\n\n" + ("very-long-topic " * 40)
+        prompt = _build_l1_prompt("test content", 500, depth=0, focus_topic=noisy_focus)
+        primary_focus_line = next(line for line in prompt.splitlines() if line.startswith("Primary focus:"))
+        assert "\n" not in primary_focus_line
+        assert "migration very-long-topic" in primary_focus_line
+        assert len(primary_focus_line) <= 180
+        assert primary_focus_line.endswith("…")
+
     def test_custom_instructions_injected_into_l1_prompt(self):
         from hermes_lcm.escalation import _build_l1_prompt
         prompt = _build_l1_prompt(
@@ -2961,20 +4184,1954 @@ class TestEscalation:
         assert "Additional instructions:" not in l2
 
 
+class TestAssemblyBudgetSelection:
+    def _engine(self, tmp_path: Path, monkeypatch, *, max_assembly_tokens: int = 120):
+        if "agent.context_engine" not in sys.modules:
+            agent_mod = ModuleType("agent")
+            agent_mod.__path__ = []
+            context_engine_mod = ModuleType("agent.context_engine")
+
+            class ContextEngine:
+                def __init__(self, **kwargs):
+                    self.compression_count = 0
+                    self.last_prompt_tokens = 0
+
+                def get_status(self):
+                    return {}
+
+            setattr(context_engine_mod, "ContextEngine", ContextEngine)
+            monkeypatch.setitem(sys.modules, "agent", agent_mod)
+            monkeypatch.setitem(sys.modules, "agent.context_engine", context_engine_mod)
+
+        # conftest may have left a partially imported module when agent.context_engine
+        # was unavailable during package registration. Force import against the fake
+        # only for that broken stub; keep a healthy module so monkeypatch targets
+        # remain identical across adjacent tests.
+        existing_engine_module = sys.modules.get("hermes_lcm.engine")
+        if existing_engine_module is not None and not hasattr(existing_engine_module, "LCMEngine"):
+            sys.modules.pop("hermes_lcm.engine", None)
+        from hermes_lcm.engine import LCMEngine
+
+        config = LCMConfig(
+            database_path=str(tmp_path / "assembly.db"),
+            max_assembly_tokens=max_assembly_tokens,
+        )
+        engine = LCMEngine(config=config, hermes_home=str(tmp_path / "hermes"))
+        engine._session_id = "assembly-session"
+        return engine
+
+    def test_assembly_skips_oversized_assistant_turn_to_preserve_user_prompt(self, tmp_path, monkeypatch):
+        engine = self._engine(tmp_path, monkeypatch, max_assembly_tokens=120)
+        huge_assistant = "oversized assistant tool chatter " * 400
+
+        assembled = engine._assemble_context(
+            {"role": "system", "content": "System anchor."},
+            [
+                {"role": "user", "content": "KEEP_USER_DECISION: continue with prompt-aware assembly."},
+                {"role": "assistant", "content": huge_assistant},
+                {"role": "assistant", "content": "Latest compact status."},
+            ],
+        )
+
+        contents = "\n".join(str(msg.get("content", "")) for msg in assembled)
+        assert "KEEP_USER_DECISION" in contents
+        assert "Latest compact status" in contents
+        assert "oversized assistant tool chatter" not in contents
+        # The preserved objective is replayed as scaffolding (identified by its
+        # content prefix, not its role), so it must never appear as a raw
+        # user-role turn that could be re-ingested as a durable row.
+        assert not any(
+            msg.get("role") == "user"
+            and "[Current user objective preserved from compacted history]"
+            not in str(msg.get("content", ""))
+            and "KEEP_USER_DECISION" in str(msg.get("content", ""))
+            for msg in assembled
+        )
+
+    def test_non_contiguous_raw_user_tail_replay_does_not_duplicate_durable_rows(self, tmp_path, monkeypatch):
+        engine = self._engine(tmp_path, monkeypatch, max_assembly_tokens=160)
+        messages = [
+            {"role": "system", "content": "sys"},
+            {"role": "user", "content": "repeat user intent"},
+            {"role": "assistant", "content": "huge assistant output " * 400},
+        ]
+        engine._ingest_messages(messages)
+        assert engine._store.get_session_count("assembly-session") == len(messages)
+
+        assembled = engine._assemble_context(messages[0], messages[1:])
+        contents = "\n".join(str(msg.get("content", "")) for msg in assembled)
+        assert "repeat user intent" in contents
+        assert "huge assistant output" not in contents
+        assert not any(
+            msg.get("role") == "user" and msg.get("content") == "repeat user intent"
+            for msg in assembled
+        )
+
+        from hermes_lcm.engine import LCMEngine
+
+        replay = LCMEngine(config=engine._config, hermes_home=str(tmp_path / "hermes"))
+        replay._session_id = "assembly-session"
+        replay._ingest_cursor_needs_reconcile = True
+        replay._ingest_messages(assembled + [{"role": "user", "content": "new user after restart"}])
+
+        rows = replay._store.get_session_messages("assembly-session")
+        assert len(rows) == len(messages) + 1
+        assert [row["content"] for row in rows].count("repeat user intent") == 1
+        assert rows[-1]["content"] == "new user after restart"
+
+    def test_non_contiguous_preserved_prompt_replay_does_not_duplicate_durable_rows(self, tmp_path, monkeypatch):
+        engine = self._engine(tmp_path, monkeypatch, max_assembly_tokens=450)
+        messages = [
+            {"role": "system", "content": "sys"},
+            {"role": "user", "content": "old compactable question"},
+            {"role": "assistant", "content": "old compactable answer"},
+            {"role": "user", "content": "KEEP_USER_DECISION: continue prompt-aware assembly"},
+            {"role": "assistant", "content": "oversized assistant tool chatter " * 400},
+            {"role": "assistant", "content": "Latest compact status."},
+        ]
+        engine._ingest_messages(messages)
+        assert engine._store.get_session_count("assembly-session") == len(messages)
+        engine._dag.add_node(SummaryNode(
+            session_id="assembly-session",
+            depth=0,
+            summary="Earlier compacted details.",
+            token_count=10,
+            source_token_count=100,
+            source_ids=[2, 3],
+            source_type="messages",
+            expand_hint="earlier details",
+        ))
+
+        assembled = engine._assemble_context(messages[0], messages[1:])
+        assert any(
+            "[Current user objective preserved from compacted history]" in str(msg.get("content", ""))
+            and "KEEP_USER_DECISION" in str(msg.get("content", ""))
+            for msg in assembled
+        )
+        # The preserved objective is replayed as scaffolding (identified by its
+        # content prefix, not its role), so it must never appear as a raw
+        # user-role turn that could be re-ingested as a durable row.
+        assert not any(
+            msg.get("role") == "user"
+            and "[Current user objective preserved from compacted history]"
+            not in str(msg.get("content", ""))
+            and "KEEP_USER_DECISION" in str(msg.get("content", ""))
+            for msg in assembled
+        )
+
+        from hermes_lcm.engine import LCMEngine
+
+        replay_no_delta = LCMEngine(config=engine._config, hermes_home=str(tmp_path / "hermes"))
+        replay_no_delta._session_id = "assembly-session"
+        replay_no_delta._ingest_cursor_needs_reconcile = True
+        replay_no_delta._ingest_messages(assembled)
+        assert replay_no_delta._store.get_session_count("assembly-session") == len(messages)
+
+        replay = LCMEngine(config=engine._config, hermes_home=str(tmp_path / "hermes"))
+        replay._session_id = "assembly-session"
+        replay._ingest_cursor_needs_reconcile = True
+        replay._ingest_messages(assembled + [{"role": "user", "content": "new user after restart"}])
+
+        assert replay._store.get_session_count("assembly-session") == len(messages) + 1
+
+    def test_preserved_objective_scaffold_does_not_skip_new_repeated_user_tail(self, tmp_path, monkeypatch):
+        engine = self._engine(tmp_path, monkeypatch, max_assembly_tokens=450)
+        persisted_messages = [
+            {"role": "system", "content": "sys"},
+            {"role": "user", "content": "stored setup"},
+            {"role": "assistant", "content": "stored answer"},
+            {"role": "user", "content": "repeat me"},
+        ]
+        engine._ingest_messages(persisted_messages)
+        assert engine._store.get_session_count("assembly-session") == len(persisted_messages)
+
+        from hermes_lcm.engine import LCMEngine
+
+        replay = LCMEngine(config=engine._config, hermes_home=str(tmp_path / "hermes"))
+        replay._session_id = "assembly-session"
+        replay._ingest_cursor_needs_reconcile = True
+        replay._ingest_messages([
+            {
+                "role": "assistant",
+                "content": "[Current user objective preserved from compacted history]\nstored setup",
+            },
+            {"role": "user", "content": "repeat me"},
+            {"role": "user", "content": "new followup"},
+        ])
+
+        rows = replay._store.get_session_messages("assembly-session")
+        assert len(rows) == len(persisted_messages) + 2
+        assert [row["content"] for row in rows].count("repeat me") == 2
+        assert rows[-1]["content"] == "new followup"
+
+    def test_assembly_skips_oversized_summary_and_keeps_later_fit_summary(self, tmp_path, monkeypatch):
+        engine = self._engine(tmp_path, monkeypatch, max_assembly_tokens=140)
+        engine._dag.add_node(SummaryNode(
+            session_id="assembly-session",
+            depth=2,
+            summary="HUGE_DURABLE_SUMMARY " * 400,
+            token_count=800,
+            source_token_count=2000,
+            source_ids=[1],
+            source_type="messages",
+            expand_hint="durable huge",
+        ))
+        engine._dag.add_node(SummaryNode(
+            session_id="assembly-session",
+            depth=0,
+            summary="SMALL_RECENT_SUMMARY: keep current handoff state.",
+            token_count=12,
+            source_token_count=80,
+            source_ids=[2],
+            source_type="messages",
+            expand_hint="recent small",
+        ))
+
+        assembled = engine._assemble_context(
+            {"role": "system", "content": "System anchor."},
+            [],
+        )
+
+        contents = "\n".join(str(msg.get("content", "")) for msg in assembled)
+        assert "SMALL_RECENT_SUMMARY" in contents
+        assert "HUGE_DURABLE_SUMMARY" not in contents
+
+
 class TestIngestExternalization:
-    def _engine(self, tmp_path: Path):
+    def _engine(self, tmp_path: Path, **config_overrides):
         from hermes_lcm.engine import LCMEngine
 
         output_dir = tmp_path / "externalized"
-        config = LCMConfig(
-            database_path=str(tmp_path / "lcm.db"),
-            large_output_externalization_enabled=True,
-            large_output_externalization_threshold_chars=200,
-            large_output_externalization_path=str(output_dir),
-        )
+        config_kwargs = {
+            "database_path": str(tmp_path / "lcm.db"),
+            "large_output_externalization_enabled": True,
+            "large_output_externalization_threshold_chars": 200,
+            "large_output_externalization_path": str(output_dir),
+        }
+        config_kwargs.update(config_overrides)
+        config = LCMConfig(**config_kwargs)
         engine = LCMEngine(config=config, hermes_home=str(tmp_path / "hermes"))
         engine._session_id = "ingest-session"
         return engine, output_dir
+
+    def test_ingest_recovers_hermes_persisted_output_marker_before_externalization(self, tmp_path, monkeypatch):
+        import tempfile
+        import hermes_lcm.tools as lcm_tools
+
+        monkeypatch.setattr(tempfile, "tempdir", str(tmp_path))
+        engine, output_dir = self._engine(tmp_path)
+        host_storage = tmp_path / "hermes-results"
+        host_storage.mkdir()
+        full_result = "FULL_RECOVERED_NEEDLE:\n" + ("abcdef" * 1000)
+        persisted_path = host_storage / "call_persisted.txt"
+        persisted_path.write_text(full_result, encoding="utf-8")
+        marker = (
+            "<persisted-output>\n"
+            f"This tool result was too large ({len(full_result):,} characters, 5.9 KB).\n"
+            f"Full output saved to: {persisted_path}\n"
+            "Use the read_file tool with offset and limit to access specific sections of this output.\n\n"
+            "Preview (first 30 chars):\n"
+            f"{full_result[:30]}\n...\n"
+            "</persisted-output>"
+        )
+
+        engine._ingest_messages([
+            {"role": "assistant", "content": "Calling", "tool_calls": [{"id": "call_persisted", "function": {"name": "dump", "arguments": "{}"}}]},
+            {"role": "tool", "tool_call_id": "call_persisted", "content": marker},
+        ])
+
+        stored = engine._store.get_session_messages("ingest-session")
+        assert len(stored) == 2
+        assert stored[1]["content"].startswith("[Externalized tool output:")
+        assert "FULL_RECOVERED_NEEDLE" not in stored[1]["content"]
+        assert "<persisted-output>" not in stored[1]["content"]
+
+        payload_files = list(output_dir.glob("*.json"))
+        assert len(payload_files) == 1
+        payload = json.loads(payload_files[0].read_text())
+        assert payload["kind"] == "tool_result"
+        assert payload["tool_call_id"] == "call_persisted"
+        assert payload["content"] == full_result
+
+        by_store_id = json.loads(lcm_tools.lcm_expand({"store_id": stored[1]["store_id"]}, engine=engine))
+        expanded = json.loads(lcm_tools.lcm_expand({"externalized_ref": by_store_id["externalized_ref"], "max_tokens": 20_000}, engine=engine))
+        assert expanded["content"] == full_result
+
+    def test_ingest_preserves_marker_when_recovered_file_preview_does_not_match(self, tmp_path, monkeypatch):
+        import tempfile
+
+        monkeypatch.setattr(tempfile, "tempdir", str(tmp_path))
+        engine, output_dir = self._engine(tmp_path)
+        host_storage = tmp_path / "hermes-results"
+        host_storage.mkdir()
+        original_result = "ORIGINAL_PREVIEW_NEEDLE:" + ("a" * 1000)
+        overwritten_result = "OVERWRITTEN_PREVIEW_BAD:" + ("b" * 1000)
+        assert len(overwritten_result) == len(original_result)
+        persisted_path = host_storage / "call_reused.txt"
+        persisted_path.write_text(overwritten_result, encoding="utf-8")
+        marker = (
+            "<persisted-output>\n"
+            f"This tool result was too large ({len(original_result):,} characters, 1.0 KB).\n"
+            f"Full output saved to: {persisted_path}\n"
+            "Use the read_file tool with offset and limit to access specific sections of this output.\n\n"
+            "Preview (first 30 chars):\n"
+            f"{original_result[:30]}\n...\n"
+            "</persisted-output>"
+        )
+
+        engine._ingest_messages([
+            {"role": "tool", "tool_call_id": "call_reused", "content": marker},
+        ])
+
+        stored = engine._store.get_session_messages("ingest-session")
+        assert stored[0]["content"] == marker
+        assert not output_dir.exists()
+
+    def test_ingest_preserves_marker_without_preview_proof(self, tmp_path, monkeypatch):
+        import tempfile
+
+        monkeypatch.setattr(tempfile, "tempdir", str(tmp_path))
+        engine, output_dir = self._engine(tmp_path)
+        host_storage = tmp_path / "hermes-results"
+        host_storage.mkdir()
+        full_result = "NO_PREVIEW_PROOF_NEEDLE:" + ("x" * 1000)
+        persisted_path = host_storage / "call_no_preview.txt"
+        persisted_path.write_text(full_result, encoding="utf-8")
+        marker = (
+            "<persisted-output>\n"
+            f"This tool result was too large ({len(full_result):,} characters, 1.0 KB).\n"
+            f"Full output saved to: {persisted_path}\n"
+            "Use the read_file tool with offset and limit to access specific sections of this output.\n"
+            "</persisted-output>"
+        )
+
+        engine._ingest_messages([
+            {"role": "tool", "tool_call_id": "call_no_preview", "content": marker},
+        ])
+
+        stored = engine._store.get_session_messages("ingest-session")
+        assert stored[0]["content"] == marker
+        assert not output_dir.exists()
+
+    def test_ingest_forces_durable_recovery_below_generic_externalization_threshold(self, tmp_path, monkeypatch):
+        import tempfile
+
+        monkeypatch.setattr(tempfile, "tempdir", str(tmp_path))
+        engine, output_dir = self._engine(
+            tmp_path,
+            large_output_externalization_threshold_chars=1_000_000,
+        )
+        host_storage = tmp_path / "hermes-results"
+        host_storage.mkdir()
+        full_result = "SMALL_RECOVERED_NEEDLE"
+        persisted_path = host_storage / "call_small.txt"
+        persisted_path.write_text(full_result, encoding="utf-8")
+        marker = (
+            "<persisted-output>\n"
+            f"This tool result was too large ({len(full_result):,} characters, 0.0 KB).\n"
+            f"Full output saved to: {persisted_path}\n"
+            "Use the read_file tool with offset and limit to access specific sections of this output.\n\n"
+            "Preview (first 20 chars):\n"
+            f"{full_result[:20]}\n"
+            "</persisted-output>"
+        )
+
+        engine._ingest_messages([
+            {"role": "tool", "tool_call_id": "call_small", "content": marker},
+        ])
+
+        stored = engine._store.get_session_messages("ingest-session")
+        assert stored[0]["content"].startswith("[Externalized tool output:")
+        payload_file = next(output_dir.glob("*.json"))
+        payload = json.loads(payload_file.read_text())
+        assert payload["content"] == full_result
+
+    def test_ingest_redacts_recovered_persisted_output_before_externalization(self, tmp_path, monkeypatch):
+        import tempfile
+        from hermes_lcm.engine import LCMEngine
+
+        monkeypatch.setattr(tempfile, "tempdir", str(tmp_path))
+        engine, output_dir = self._engine(
+            tmp_path,
+            large_output_externalization_threshold_chars=10,
+            sensitive_patterns_enabled=True,
+            sensitive_patterns=["api_key"],
+        )
+        host_storage = tmp_path / "hermes-results"
+        host_storage.mkdir()
+        full_result = "api_key = SECRETSECRET1234567890 suffix"
+        preview = full_result[:32]
+        assert "SECRETSECRET" in preview
+        persisted_path = host_storage / "call_secret.txt"
+        persisted_path.write_text(full_result, encoding="utf-8")
+        marker = (
+            "<persisted-output>\n"
+            f"This tool result was too large ({len(full_result):,} characters, 0.0 KB).\n"
+            f"Full output saved to: {persisted_path}\n"
+            "Use the read_file tool with offset and limit to access specific sections of this output.\n\n"
+            f"Preview (first {len(preview)} chars):\n"
+            f"{preview}\n"
+            "</persisted-output>"
+        )
+
+        messages = [
+            {"role": "assistant", "content": "Calling", "tool_calls": [{"id": "call_secret", "function": {"name": "dump", "arguments": "{}"}}]},
+            {"role": "tool", "tool_call_id": "call_secret", "content": marker},
+        ]
+
+        active_messages = engine._ingest_messages(messages)
+
+        stored = engine._store.get_session_messages("ingest-session")
+        assert "SECRETSECRET" not in stored[1]["content"]
+        assert "SECRETSECRET" not in active_messages[1]["content"]
+        payload_file = next(output_dir.glob("*.json"))
+        payload_text = payload_file.read_text()
+        payload = json.loads(payload_text)
+        assert "SECRETSECRET" not in payload_text
+        assert preview not in payload_text
+        assert "SECRETSECRET" not in payload["content"]
+        assert "[LCM sensitive redaction:" in payload["content"]
+        assert payload["persisted_output_source_path"] == str(persisted_path)
+        assert payload["persisted_output_expected_chars"] == len(full_result)
+        preview_sha256 = hashlib.sha256(preview.encode("utf-8")).hexdigest()
+        assert payload["persisted_output_preview_sha256"] == preview_sha256
+        assert "persisted_output_content_sha256" not in payload
+        assert payload.get("persisted_output_file_size") == len(full_result.encode("utf-8"))
+        assert isinstance(payload.get("persisted_output_file_mtime_ns"), int)
+        assert isinstance(payload.get("persisted_output_file_ctime_ns"), int)
+        from hermes_lcm.ingest_protection import _persisted_output_preview_prefix
+        redacted_preview_prefix = (_persisted_output_preview_prefix(active_messages[1]["content"]) or "").split(
+            "\n[LCM persisted-output marker identity:",
+            1,
+        )[0]
+        redacted_preview_sha256 = hashlib.sha256(redacted_preview_prefix.encode("utf-8")).hexdigest()
+        assert payload["persisted_output_redacted_preview_sha256"] == redacted_preview_sha256
+        assert "persisted_output_preview_prefix" not in payload
+        assert payload["persisted_output_markers"] == [
+            {
+                "source_path": str(persisted_path),
+                "expected_chars": len(full_result),
+                "preview_sha256": preview_sha256,
+                "redacted_preview_sha256": redacted_preview_sha256,
+                "file_size": payload["persisted_output_file_size"],
+                "file_mtime_ns": payload["persisted_output_file_mtime_ns"],
+                "file_ctime_ns": payload["persisted_output_file_ctime_ns"],
+            }
+        ]
+        assert "SECRETSECRET" not in payload_file.read_text()
+
+        from dataclasses import replace
+        replay_config = replace(
+            engine._config,
+            sensitive_patterns_enabled=False,
+            sensitive_patterns=[],
+        )
+        replay_with_redaction_disabled = LCMEngine(config=replay_config, hermes_home=str(tmp_path / "hermes"))
+        replay_with_redaction_disabled._session_id = "ingest-session"
+        replay_with_redaction_disabled._ingest_cursor_needs_reconcile = True
+        replay_with_redaction_disabled._ingest_messages(messages)
+        assert replay_with_redaction_disabled._store.get_session_count("ingest-session") == 2
+
+        persisted_path.unlink()
+        replay_from_active = LCMEngine(config=engine._config, hermes_home=str(tmp_path / "hermes"))
+        replay_from_active._session_id = "ingest-session"
+        replay_from_active._ingest_cursor_needs_reconcile = True
+        replay_from_active._ingest_messages(active_messages)
+        assert replay_from_active._store.get_session_count("ingest-session") == 4
+
+    def test_replay_matches_legacy_preview_prefix_payload_for_redacted_active_marker(self, tmp_path, monkeypatch):
+        import tempfile
+        from hermes_lcm.engine import LCMEngine
+
+        monkeypatch.setattr(tempfile, "tempdir", str(tmp_path))
+        engine, output_dir = self._engine(
+            tmp_path,
+            large_output_externalization_threshold_chars=10,
+            sensitive_patterns_enabled=True,
+            sensitive_patterns=["api_key"],
+        )
+        host_storage = tmp_path / "hermes-results"
+        host_storage.mkdir()
+        full_result = "api_key = LEGACYSECRET1234567890 suffix"
+        preview = full_result[:32]
+        persisted_path = host_storage / "call_legacy_secret.txt"
+        persisted_path.write_text(full_result, encoding="utf-8")
+        marker = (
+            "<persisted-output>\n"
+            f"This tool result was too large ({len(full_result):,} characters, 0.0 KB).\n"
+            f"Full output saved to: {persisted_path}\n"
+            "Use the read_file tool with offset and limit to access specific sections of this output.\n\n"
+            f"Preview (first {len(preview)} chars):\n"
+            f"{preview}\n"
+            "</persisted-output>"
+        )
+        messages = [{"role": "tool", "tool_call_id": "call_legacy_secret", "content": marker}]
+
+        active_messages = engine._ingest_messages(messages)
+        assert engine._store.get_session_count("ingest-session") == 1
+        assert "LEGACYSECRET" not in active_messages[0]["content"]
+
+        legacy_payload_file = next(output_dir.glob("*.json"))
+        legacy_payload = json.loads(legacy_payload_file.read_text())
+        legacy_payload["persisted_output_preview_prefix"] = preview
+        legacy_payload.pop("persisted_output_preview_sha256", None)
+        legacy_payload.pop("persisted_output_redacted_preview_sha256", None)
+        legacy_payload.pop("persisted_output_content_sha256", None)
+        for entry in legacy_payload.get("persisted_output_markers", []):
+            entry["preview_prefix"] = preview
+            entry.pop("preview_sha256", None)
+            entry.pop("redacted_preview_sha256", None)
+            entry.pop("content_sha256", None)
+        legacy_payload_file.write_text(json.dumps(legacy_payload), encoding="utf-8")
+
+        from dataclasses import replace
+        replay_config = replace(
+            engine._config,
+            sensitive_patterns_enabled=False,
+            sensitive_patterns=[],
+        )
+        replay_live_file = LCMEngine(config=replay_config, hermes_home=str(tmp_path / "hermes"))
+        replay_live_file._session_id = "ingest-session"
+        replay_live_file._ingest_cursor_needs_reconcile = True
+        replay_live_file._ingest_messages(messages)
+        assert replay_live_file._store.get_session_count("ingest-session") == 1
+
+        persisted_path.unlink()
+        replay = LCMEngine(config=engine._config, hermes_home=str(tmp_path / "hermes"))
+        replay._session_id = "ingest-session"
+        replay._ingest_cursor_needs_reconcile = True
+        replay._ingest_messages(active_messages)
+
+        assert replay._store.get_session_count("ingest-session") == 2
+
+    def test_ingest_reconciles_recovered_persisted_output_marker_after_restart(self, tmp_path, monkeypatch):
+        import tempfile
+        from hermes_lcm.engine import LCMEngine
+
+        monkeypatch.setattr(tempfile, "tempdir", str(tmp_path))
+        engine, _output_dir = self._engine(tmp_path)
+        host_storage = tmp_path / "hermes-results"
+        host_storage.mkdir()
+        full_result = "FULL_RESTART_NEEDLE:\n" + ("abcdef" * 1000)
+        persisted_path = host_storage / "call_restart.txt"
+        persisted_path.write_text(full_result, encoding="utf-8")
+        marker = (
+            "<persisted-output>\n"
+            f"This tool result was too large ({len(full_result):,} characters, 5.9 KB).\n"
+            f"Full output saved to: {persisted_path}\n"
+            "Use the read_file tool with offset and limit to access specific sections of this output.\n\n"
+            "Preview (first 30 chars):\n"
+            f"{full_result[:30]}\n...\n"
+            "</persisted-output>"
+        )
+        messages = [
+            {"role": "assistant", "content": "Calling", "tool_calls": [{"id": "call_restart", "function": {"name": "dump", "arguments": "{}"}}]},
+            {"role": "tool", "tool_call_id": "call_restart", "content": marker},
+        ]
+        engine._ingest_messages(messages)
+        assert engine._store.get_session_count("ingest-session") == 2
+
+        persisted_path.unlink()
+        replay = LCMEngine(config=engine._config, hermes_home=str(tmp_path / "hermes"))
+        replay._session_id = "ingest-session"
+        replay._ingest_cursor_needs_reconcile = True
+        replay._ingest_messages(messages)
+
+        # Once the host temp file is gone, a raw persisted-output marker no longer
+        # proves it is the same tool result; append instead of silently dropping a
+        # possible retry with identical path/preview/length.
+        assert replay._store.get_session_count("ingest-session") == 4
+
+    def test_replay_does_not_substitute_literal_persisted_tag_for_retried_tool_call(self, tmp_path, monkeypatch):
+        import tempfile
+        from hermes_lcm.engine import LCMEngine
+
+        monkeypatch.setattr(tempfile, "tempdir", str(tmp_path))
+        engine, _output_dir = self._engine(tmp_path)
+        host_storage = tmp_path / "hermes-results"
+        host_storage.mkdir()
+        full_result = "FULL_RETRY_NEEDLE:\n" + ("abcdef" * 1000)
+        persisted_path = host_storage / "call_retry.txt"
+        persisted_path.write_text(full_result, encoding="utf-8")
+        marker = (
+            "<persisted-output>\n"
+            f"This tool result was too large ({len(full_result):,} characters, 5.9 KB).\n"
+            f"Full output saved to: {persisted_path}\n"
+            "Use the read_file tool with offset and limit to access specific sections of this output.\n\n"
+            "Preview (first 30 chars):\n"
+            f"{full_result[:30]}\n...\n"
+            "</persisted-output>"
+        )
+        original_messages = [
+            {"role": "assistant", "content": "Calling", "tool_calls": [{"id": "call_retry", "function": {"name": "dump", "arguments": "{}"}}]},
+            {"role": "tool", "tool_call_id": "call_retry", "content": marker},
+        ]
+        engine._ingest_messages(original_messages)
+        assert engine._store.get_session_count("ingest-session") == 2
+
+        retry_content = "retry output with literal <persisted-output> text, not a Hermes marker"
+        retry_messages = [
+            {"role": "assistant", "content": "Calling", "tool_calls": [{"id": "call_retry", "function": {"name": "dump", "arguments": "{}"}}]},
+            {"role": "tool", "tool_call_id": "call_retry", "content": retry_content},
+        ]
+        replay = LCMEngine(config=engine._config, hermes_home=str(tmp_path / "hermes"))
+        replay._session_id = "ingest-session"
+        replay._ingest_cursor_needs_reconcile = True
+        replay._ingest_messages(retry_messages)
+
+        stored = replay._store.get_session_messages("ingest-session")
+        assert len(stored) == 4
+        assert stored[-1]["content"] == retry_content
+
+    def test_replay_prefers_current_persisted_marker_for_retried_tool_call(self, tmp_path, monkeypatch):
+        import tempfile
+        from hermes_lcm.engine import LCMEngine
+
+        monkeypatch.setattr(tempfile, "tempdir", str(tmp_path))
+        engine, output_dir = self._engine(tmp_path)
+        host_storage = tmp_path / "hermes-results"
+        host_storage.mkdir()
+        old_result = "OLD_RETRY_NEEDLE:\n" + ("old" * 1000)
+        old_path = host_storage / "call_retry_old.txt"
+        old_path.write_text(old_result, encoding="utf-8")
+        old_marker = (
+            "<persisted-output>\n"
+            f"This tool result was too large ({len(old_result):,} characters, 2.9 KB).\n"
+            f"Full output saved to: {old_path}\n"
+            "Use the read_file tool with offset and limit to access specific sections of this output.\n\n"
+            "Preview (first 30 chars):\n"
+            f"{old_result[:30]}\n...\n"
+            "</persisted-output>"
+        )
+        original_messages = [
+            {"role": "assistant", "content": "Calling", "tool_calls": [{"id": "call_retry", "function": {"name": "dump", "arguments": "{}"}}]},
+            {"role": "tool", "tool_call_id": "call_retry", "content": old_marker},
+        ]
+        engine._ingest_messages(original_messages)
+        assert engine._store.get_session_count("ingest-session") == 2
+
+        new_result = "NEW_RETRY_NEEDLE:\n" + ("new" * 1000)
+        new_path = host_storage / "call_retry_new.txt"
+        new_path.write_text(new_result, encoding="utf-8")
+        new_marker = (
+            "<persisted-output>\n"
+            f"This tool result was too large ({len(new_result):,} characters, 2.9 KB).\n"
+            f"Full output saved to: {new_path}\n"
+            "Use the read_file tool with offset and limit to access specific sections of this output.\n\n"
+            "Preview (first 30 chars):\n"
+            f"{new_result[:30]}\n...\n"
+            "</persisted-output>"
+        )
+        retry_messages = [
+            {"role": "assistant", "content": "Calling", "tool_calls": [{"id": "call_retry", "function": {"name": "dump", "arguments": "{}"}}]},
+            {"role": "tool", "tool_call_id": "call_retry", "content": new_marker},
+        ]
+        replay = LCMEngine(config=engine._config, hermes_home=str(tmp_path / "hermes"))
+        replay._session_id = "ingest-session"
+        replay._ingest_cursor_needs_reconcile = True
+        replay._ingest_messages(retry_messages)
+
+        stored = replay._store.get_session_messages("ingest-session")
+        assert len(stored) == 4
+        assert stored[-1]["content"].startswith("[Externalized tool output:")
+        payloads = [json.loads(path.read_text())["content"] for path in output_dir.glob("*.json")]
+        assert old_result in payloads
+        assert new_result in payloads
+
+        new_path.unlink()
+        replay_after_cleanup = LCMEngine(config=engine._config, hermes_home=str(tmp_path / "hermes"))
+        replay_after_cleanup._session_id = "ingest-session"
+        replay_after_cleanup._ingest_cursor_needs_reconcile = True
+        replay_after_cleanup._ingest_messages(original_messages + retry_messages)
+        assert replay_after_cleanup._store.get_session_count("ingest-session") == 8
+
+    def test_replay_reuses_same_content_persisted_output_payload_across_marker_paths(self, tmp_path, monkeypatch):
+        import tempfile
+        from hermes_lcm.engine import LCMEngine
+
+        monkeypatch.setattr(tempfile, "tempdir", str(tmp_path))
+        engine, output_dir = self._engine(tmp_path)
+        host_storage = tmp_path / "hermes-results"
+        host_storage.mkdir()
+        full_result = "SAME_CONTENT_RETRY_NEEDLE:\n" + ("same" * 1000)
+        preview = full_result[:30]
+        first_path = host_storage / "call_retry_first.txt"
+        first_path.write_text(full_result, encoding="utf-8")
+        first_marker = (
+            "<persisted-output>\n"
+            f"This tool result was too large ({len(full_result):,} characters, 3.9 KB).\n"
+            f"Full output saved to: {first_path}\n"
+            "Use the read_file tool with offset and limit to access specific sections of this output.\n\n"
+            "Preview (first 30 chars):\n"
+            f"{preview}\n...\n"
+            "</persisted-output>"
+        )
+        original_messages = [
+            {"role": "assistant", "content": "Calling", "tool_calls": [{"id": "call_retry", "function": {"name": "dump", "arguments": "{}"}}]},
+            {"role": "tool", "tool_call_id": "call_retry", "content": first_marker},
+        ]
+        engine._ingest_messages(original_messages)
+        assert engine._store.get_session_count("ingest-session") == 2
+
+        legacy_payload_file = next(output_dir.glob("*.json"))
+        legacy_payload = json.loads(legacy_payload_file.read_text())
+        legacy_payload["persisted_output_preview_prefix"] = preview
+        legacy_payload.pop("persisted_output_preview_sha256", None)
+        legacy_payload.pop("persisted_output_content_sha256", None)
+        for entry in legacy_payload.get("persisted_output_markers", []):
+            entry["preview_prefix"] = preview
+            entry.pop("preview_sha256", None)
+            entry.pop("content_sha256", None)
+        legacy_payload_file.write_text(json.dumps(legacy_payload), encoding="utf-8")
+
+        second_path = host_storage / "call_retry_second.txt"
+        second_path.write_text(full_result, encoding="utf-8")
+        second_marker = (
+            "<persisted-output>\n"
+            f"This tool result was too large ({len(full_result):,} characters, 3.9 KB).\n"
+            f"Full output saved to: {second_path}\n"
+            "Use the read_file tool with offset and limit to access specific sections of this output.\n\n"
+            "Preview (first 30 chars):\n"
+            f"{preview}\n...\n"
+            "</persisted-output>"
+        )
+        retry_messages = [
+            {"role": "assistant", "content": "Calling again", "tool_calls": [{"id": "call_retry", "function": {"name": "dump", "arguments": "{}"}}]},
+            {"role": "tool", "tool_call_id": "call_retry", "content": second_marker},
+        ]
+        replay = LCMEngine(config=engine._config, hermes_home=str(tmp_path / "hermes"))
+        replay._session_id = "ingest-session"
+        replay._ingest_cursor_needs_reconcile = True
+        replay._ingest_messages(original_messages + retry_messages)
+
+        assert replay._store.get_session_count("ingest-session") == 4
+        payload_files = list(output_dir.glob("*.json"))
+        assert len(payload_files) == 1
+        payload = json.loads(payload_files[0].read_text())
+        assert payload["content"] == full_result
+        marker_entries = payload.get("persisted_output_markers", [])
+        marker_paths = {entry["source_path"] for entry in marker_entries}
+        assert str(first_path) in marker_paths
+        assert str(second_path) in marker_paths
+        expected_preview_sha256 = hashlib.sha256(preview.encode("utf-8")).hexdigest()
+        assert all(entry.get("preview_sha256") == expected_preview_sha256 for entry in marker_entries)
+        assert all("content_sha256" not in entry for entry in marker_entries)
+        assert all("preview_prefix" not in entry for entry in marker_entries)
+        assert payload["persisted_output_preview_sha256"] == expected_preview_sha256
+        assert "persisted_output_content_sha256" not in payload
+        assert "persisted_output_preview_prefix" not in payload
+
+        replay_again = LCMEngine(config=engine._config, hermes_home=str(tmp_path / "hermes"))
+        replay_again._session_id = "ingest-session"
+        replay_again._ingest_cursor_needs_reconcile = True
+        replay_again._ingest_messages(original_messages + retry_messages)
+        assert replay_again._store.get_session_count("ingest-session") == 4
+
+        second_path.unlink()
+        replay_after_cleanup = LCMEngine(config=engine._config, hermes_home=str(tmp_path / "hermes"))
+        replay_after_cleanup._session_id = "ingest-session"
+        replay_after_cleanup._ingest_cursor_needs_reconcile = True
+        replay_after_cleanup._ingest_messages(original_messages + retry_messages)
+        assert replay_after_cleanup._store.get_session_count("ingest-session") == 8
+
+    def test_replay_does_not_reuse_durable_payload_for_stale_retry_marker_with_same_preview_but_different_path(self, tmp_path, monkeypatch):
+        import tempfile
+        from hermes_lcm.engine import LCMEngine
+
+        monkeypatch.setattr(tempfile, "tempdir", str(tmp_path))
+        engine, _output_dir = self._engine(tmp_path)
+        host_storage = tmp_path / "hermes-results"
+        host_storage.mkdir()
+        shared_prefix = "SAME_RETRY_PREFIX:" + ("p" * 64)
+        old_result = shared_prefix + ("a" * 1000)
+        old_path = host_storage / "call_retry_old.txt"
+        old_path.write_text(old_result, encoding="utf-8")
+        old_marker = (
+            "<persisted-output>\n"
+            f"This tool result was too large ({len(old_result):,} characters, 1.0 KB).\n"
+            f"Full output saved to: {old_path}\n"
+            "Use the read_file tool with offset and limit to access specific sections of this output.\n\n"
+            "Preview (first 30 chars):\n"
+            f"{old_result[:30]}\n...\n"
+            "</persisted-output>"
+        )
+        engine._ingest_messages([
+            {"role": "assistant", "content": "Calling", "tool_calls": [{"id": "call_retry", "function": {"name": "dump", "arguments": "{}"}}]},
+            {"role": "tool", "tool_call_id": "call_retry", "content": old_marker},
+        ])
+        assert engine._store.get_session_count("ingest-session") == 2
+
+        new_result = shared_prefix + ("b" * 1000)
+        assert len(new_result) == len(old_result)
+        missing_new_path = host_storage / "call_retry_new_missing.txt"
+        new_marker = (
+            "<persisted-output>\n"
+            f"This tool result was too large ({len(new_result):,} characters, 1.0 KB).\n"
+            f"Full output saved to: {missing_new_path}\n"
+            "Use the read_file tool with offset and limit to access specific sections of this output.\n\n"
+            "Preview (first 30 chars):\n"
+            f"{new_result[:30]}\n...\n"
+            "</persisted-output>"
+        )
+        retry_messages = [
+            {"role": "assistant", "content": "Calling", "tool_calls": [{"id": "call_retry", "function": {"name": "dump", "arguments": "{}"}}]},
+            {"role": "tool", "tool_call_id": "call_retry", "content": new_marker},
+        ]
+        replay = LCMEngine(config=engine._config, hermes_home=str(tmp_path / "hermes"))
+        replay._session_id = "ingest-session"
+        replay._ingest_cursor_needs_reconcile = True
+        replay._ingest_messages(retry_messages)
+
+        stored = replay._store.get_session_messages("ingest-session")
+        assert len(stored) == 4
+        assert stored[-1]["content"] == new_marker
+
+    def test_replay_prefers_live_persisted_file_over_stale_durable_payload_with_same_marker_proof(self, tmp_path, monkeypatch):
+        import os
+        import tempfile
+        import time
+        from hermes_lcm.engine import LCMEngine
+
+        monkeypatch.setattr(tempfile, "tempdir", str(tmp_path))
+        engine, output_dir = self._engine(tmp_path)
+        host_storage = tmp_path / "hermes-results"
+        host_storage.mkdir()
+        shared_prefix = "SAME_RETRY_PREFIX:" + ("p" * 64)
+        old_result = shared_prefix + ("a" * 1000)
+        new_result = shared_prefix + ("b" * 1000)
+        assert len(new_result) == len(old_result)
+        persisted_path = host_storage / "call_retry_reused.txt"
+        persisted_path.write_text(old_result, encoding="utf-8")
+        marker = (
+            "<persisted-output>\n"
+            f"This tool result was too large ({len(old_result):,} characters, 1.0 KB).\n"
+            f"Full output saved to: {persisted_path}\n"
+            "Use the read_file tool with offset and limit to access specific sections of this output.\n\n"
+            "Preview (first 30 chars):\n"
+            f"{old_result[:30]}\n...\n"
+            "</persisted-output>"
+        )
+        messages = [
+            {"role": "assistant", "content": "Calling", "tool_calls": [{"id": "call_retry", "function": {"name": "dump", "arguments": "{}"}}]},
+            {"role": "tool", "tool_call_id": "call_retry", "content": marker},
+        ]
+        engine._ingest_messages(messages)
+        assert engine._store.get_session_count("ingest-session") == 2
+        legacy_payload_file = next(output_dir.glob("*.json"))
+        legacy_payload = json.loads(legacy_payload_file.read_text())
+        legacy_payload.pop("persisted_output_content_sha256", None)
+        for entry in legacy_payload.get("persisted_output_markers", []):
+            entry.pop("content_sha256", None)
+        legacy_payload_file.write_text(json.dumps(legacy_payload), encoding="utf-8")
+
+        persisted_path.write_text(new_result, encoding="utf-8")
+        future_mtime = time.time() + 5
+        os.utime(persisted_path, (future_mtime, future_mtime))
+        replay = LCMEngine(config=engine._config, hermes_home=str(tmp_path / "hermes"))
+        replay._session_id = "ingest-session"
+        replay._ingest_cursor_needs_reconcile = True
+        replay._ingest_messages(messages)
+
+        stored = replay._store.get_session_messages("ingest-session")
+        assert len(stored) == 4
+        payloads = [json.loads(path.read_text())["content"] for path in output_dir.glob("*.json")]
+        assert old_result in payloads
+        assert new_result in payloads
+
+    def test_replay_distinguishes_stale_retry_that_only_differs_inside_lossy_redaction(self, tmp_path, monkeypatch):
+        import os
+        import tempfile
+        import time
+        from hermes_lcm.engine import LCMEngine
+
+        monkeypatch.setattr(tempfile, "tempdir", str(tmp_path))
+        engine, output_dir = self._engine(
+            tmp_path,
+            sensitive_patterns_enabled=True,
+            sensitive_patterns=["password_assignment"],
+        )
+        host_storage = tmp_path / "hermes-results"
+        host_storage.mkdir()
+        shared_prefix = "SAME_RETRY_PREFIX:" + ("p" * 64) + "\n"
+        old_result = shared_prefix + "password = OLDSECRET\nend"
+        new_result = shared_prefix + "password = NEWSECRET\nend"
+        assert len(new_result) == len(old_result)
+        persisted_path = host_storage / "call_retry_password.txt"
+        persisted_path.write_text(old_result, encoding="utf-8")
+        marker = (
+            "<persisted-output>\n"
+            f"This tool result was too large ({len(old_result):,} characters, 0.1 KB).\n"
+            f"Full output saved to: {persisted_path}\n"
+            "Use the read_file tool with offset and limit to access specific sections of this output.\n\n"
+            "Preview (first 30 chars):\n"
+            f"{old_result[:30]}\n...\n"
+            "</persisted-output>"
+        )
+        messages = [
+            {"role": "assistant", "content": "Calling", "tool_calls": [{"id": "call_retry", "function": {"name": "dump", "arguments": "{}"}}]},
+            {"role": "tool", "tool_call_id": "call_retry", "content": marker},
+        ]
+        engine._ingest_messages(messages)
+        assert engine._store.get_session_count("ingest-session") == 2
+
+        persisted_path.write_text(new_result, encoding="utf-8")
+        future_mtime = time.time() + 5
+        os.utime(persisted_path, (future_mtime, future_mtime))
+        replay = LCMEngine(config=engine._config, hermes_home=str(tmp_path / "hermes"))
+        replay._session_id = "ingest-session"
+        replay._ingest_cursor_needs_reconcile = True
+        replay._ingest_messages(messages)
+
+        assert replay._store.get_session_count("ingest-session") == 4
+        payload_text = next(output_dir.glob("*.json")).read_text()
+        assert "content_sha256" not in payload_text
+
+        replay_again = LCMEngine(config=engine._config, hermes_home=str(tmp_path / "hermes"))
+        replay_again._session_id = "ingest-session"
+        replay_again._ingest_cursor_needs_reconcile = True
+        replay_again._ingest_messages(messages)
+        assert replay_again._store.get_session_count("ingest-session") == 4
+
+        replay_third = LCMEngine(config=engine._config, hermes_home=str(tmp_path / "hermes"))
+        replay_third._session_id = "ingest-session"
+        replay_third._ingest_cursor_needs_reconcile = True
+        replay_third._ingest_messages(messages)
+        assert replay_third._store.get_session_count("ingest-session") == 4
+
+    def test_replay_distinguishes_same_path_retry_when_preview_only_differs_inside_lossy_redaction(self, tmp_path, monkeypatch):
+        import os
+        import tempfile
+        import time
+        from hermes_lcm.engine import LCMEngine
+
+        monkeypatch.setattr(tempfile, "tempdir", str(tmp_path))
+        engine, output_dir = self._engine(
+            tmp_path,
+            sensitive_patterns_enabled=True,
+            sensitive_patterns=["password_assignment"],
+        )
+        host_storage = tmp_path / "hermes-results"
+        host_storage.mkdir()
+        suffix = "\n" + ("z" * 1000)
+        old_result = "password = OLDSECRET" + suffix
+        new_result = "password = NEWSECRET" + suffix
+        assert len(new_result) == len(old_result)
+        persisted_path = host_storage / "call_retry_password_preview.txt"
+        persisted_path.write_text(old_result, encoding="utf-8")
+
+        def marker_for(content: str) -> str:
+            preview = content[:30]
+            return (
+                "<persisted-output>\n"
+                f"This tool result was too large ({len(content):,} characters, 1.0 KB).\n"
+                f"Full output saved to: {persisted_path}\n"
+                "Use the read_file tool with offset and limit to access specific sections of this output.\n\n"
+                "Preview (first 30 chars):\n"
+                f"{preview}\n...\n"
+                "</persisted-output>"
+            )
+
+        original_messages = [
+            {"role": "assistant", "content": "Calling", "tool_calls": [{"id": "call_retry", "function": {"name": "dump", "arguments": "{}"}}]},
+            {"role": "tool", "tool_call_id": "call_retry", "content": marker_for(old_result)},
+        ]
+        engine._ingest_messages(original_messages)
+        assert engine._store.get_session_count("ingest-session") == 2
+
+        persisted_path.write_text(new_result, encoding="utf-8")
+        future_mtime = time.time() + 5
+        os.utime(persisted_path, (future_mtime, future_mtime))
+        retry_messages = [
+            {"role": "assistant", "content": "Calling", "tool_calls": [{"id": "call_retry", "function": {"name": "dump", "arguments": "{}"}}]},
+            {"role": "tool", "tool_call_id": "call_retry", "content": marker_for(new_result)},
+        ]
+        replay = LCMEngine(config=engine._config, hermes_home=str(tmp_path / "hermes"))
+        replay._session_id = "ingest-session"
+        replay._ingest_cursor_needs_reconcile = True
+        active_retry_messages = replay._ingest_messages(retry_messages)
+
+        assert replay._store.get_session_count("ingest-session") == 4
+        payloads = [json.loads(path.read_text())["content"] for path in output_dir.glob("*.json")]
+        payload_texts = [path.read_text() for path in output_dir.glob("*.json")]
+        raw_preview_sha256 = hashlib.sha256(new_result[:30].encode("utf-8")).hexdigest()
+        assert payloads
+        assert all("OLDSECRET" not in payload for payload in payloads)
+        assert all("NEWSECRET" not in payload for payload in payloads)
+        assert all(raw_preview_sha256 not in payload_text for payload_text in payload_texts)
+        assert all("persisted-output marker identity" not in msg.get("content", "") for msg in active_retry_messages)
+
+    def test_recovery_does_not_strip_forged_inline_identity_from_raw_preview(self, tmp_path, monkeypatch):
+        import hashlib
+        import tempfile
+        from hermes_lcm.ingest_protection import recover_hermes_persisted_output_with_file_stat
+
+        monkeypatch.setattr(tempfile, "tempdir", str(tmp_path))
+        host_storage = tmp_path / "hermes-results"
+        host_storage.mkdir()
+        digest = hashlib.sha256(b"irrelevant").hexdigest()
+        old_result = (
+            "SHARED_PREFIX\n"
+            f"[LCM persisted-output marker identity: preview_sha256={digest}]\n"
+            "old payload tail"
+        )
+        new_result = "SHARED_PREFIX\nnew same-length payload tail"
+        new_result = new_result + ("x" * (len(old_result) - len(new_result)))
+        assert len(new_result) == len(old_result)
+        persisted_path = host_storage / "call_forged_preview_live.txt"
+        persisted_path.write_text(new_result, encoding="utf-8")
+        marker = (
+            "<persisted-output>\n"
+            f"This tool result was too large ({len(old_result):,} characters, 1.0 KB).\n"
+            f"Full output saved to: {persisted_path}\n"
+            "Use the read_file tool with offset and limit to access specific sections of this output.\n\n"
+            f"Preview (first {len(old_result)} chars):\n"
+            f"{old_result}\n...\n"
+            "</persisted-output>"
+        )
+
+        assert recover_hermes_persisted_output_with_file_stat(marker) is None
+
+    def test_replay_appends_missing_file_marker_with_generation_text_inside_raw_preview(self, tmp_path):
+        from hermes_lcm.engine import LCMEngine
+
+        engine, _output_dir = self._engine(tmp_path, large_output_externalization_threshold_chars=10)
+        missing_path = tmp_path / "hermes-results" / "missing_generation_text.txt"
+        marker = (
+            "<persisted-output>\n"
+            "This tool result was too large (100 characters, 0.1 KB).\n"
+            f"Full output saved to: {missing_path}\n"
+            "Use the read_file tool with offset and limit to access specific sections of this output.\n\n"
+            "Preview (first 80 chars):\n"
+            "SAME_RETRY_PREFIX\n"
+            "[LCM persisted-output file generation: user content, not trailer]\n"
+            "same marker tail\n...\n"
+            "</persisted-output>"
+        )
+        messages = [
+            {"role": "assistant", "content": "Calling", "tool_calls": [{"id": "call_raw", "function": {"name": "dump", "arguments": "{}"}}]},
+            {"role": "tool", "tool_call_id": "call_raw", "content": marker},
+        ]
+        engine._ingest_messages(messages)
+        assert engine._store.get_session_count("ingest-session") == 2
+
+        replay = LCMEngine(config=engine._config, hermes_home=str(tmp_path / "hermes"))
+        replay._session_id = "ingest-session"
+        replay._ingest_cursor_needs_reconcile = True
+        replay._ingest_messages(messages)
+
+        assert replay._store.get_session_count("ingest-session") == 4
+
+    def test_replay_appends_missing_file_retry_with_forged_identity_as_final_preview_line(self, tmp_path, monkeypatch):
+        import hashlib
+        import tempfile
+        from hermes_lcm.engine import LCMEngine
+
+        monkeypatch.setattr(tempfile, "tempdir", str(tmp_path))
+        engine, _output_dir = self._engine(tmp_path, large_output_externalization_threshold_chars=200)
+        host_storage = tmp_path / "hermes-results"
+        host_storage.mkdir()
+        old_result = "OLD_PREFIX:" + ("a" * 1000)
+        persisted_path = host_storage / "call_forged_final_identity.txt"
+        persisted_path.write_text(old_result, encoding="utf-8")
+        preview_len = 30
+        old_marker = (
+            "<persisted-output>\n"
+            f"This tool result was too large ({len(old_result):,} characters, 1.0 KB).\n"
+            f"Full output saved to: {persisted_path}\n"
+            "Use the read_file tool with offset and limit to access specific sections of this output.\n\n"
+            f"Preview (first {preview_len} chars):\n"
+            f"{old_result[:preview_len]}\n...\n"
+            "</persisted-output>"
+        )
+        old_messages = [
+            {"role": "assistant", "content": "Calling", "tool_calls": [{"id": "call_retry", "function": {"name": "dump", "arguments": "{}"}}]},
+            {"role": "tool", "tool_call_id": "call_retry", "content": old_marker},
+        ]
+        engine._ingest_messages(old_messages)
+        assert engine._store.get_session_count("ingest-session") == 2
+
+        old_digest = hashlib.sha256(old_result[:preview_len].encode("utf-8")).hexdigest()
+        persisted_path.unlink()
+        forged_preview = (
+            "NEW_PREFIX_DIFFERENT\n"
+            f"[LCM persisted-output marker identity: preview_sha256={old_digest}]"
+        )
+        forged_marker = (
+            "<persisted-output>\n"
+            f"This tool result was too large ({len(old_result):,} characters, 1.0 KB).\n"
+            f"Full output saved to: {persisted_path}\n"
+            "Use the read_file tool with offset and limit to access specific sections of this output.\n\n"
+            f"Preview (first {len(forged_preview)} chars):\n"
+            f"{forged_preview}\n"
+            "</persisted-output>"
+        )
+        retry_messages = [
+            {"role": "assistant", "content": "Calling", "tool_calls": [{"id": "call_retry", "function": {"name": "dump", "arguments": "{}"}}]},
+            {"role": "tool", "tool_call_id": "call_retry", "content": forged_marker},
+        ]
+
+        replay = LCMEngine(config=engine._config, hermes_home=str(tmp_path / "hermes"))
+        replay._session_id = "ingest-session"
+        replay._ingest_cursor_needs_reconcile = True
+        replay._ingest_messages(retry_messages)
+
+        assert replay._store.get_session_count("ingest-session") == 4
+
+    def test_replay_appends_missing_file_retry_with_forged_redaction_and_identity(self, tmp_path, monkeypatch):
+        import hashlib
+        import tempfile
+        from hermes_lcm.engine import LCMEngine
+
+        monkeypatch.setattr(tempfile, "tempdir", str(tmp_path))
+        engine, _output_dir = self._engine(tmp_path, large_output_externalization_threshold_chars=200)
+        host_storage = tmp_path / "hermes-results"
+        host_storage.mkdir()
+        old_result = "OLD_PREFIX:" + ("a" * 1000)
+        persisted_path = host_storage / "call_forged_redaction_identity.txt"
+        persisted_path.write_text(old_result, encoding="utf-8")
+        preview_len = 30
+        old_marker = (
+            "<persisted-output>\n"
+            f"This tool result was too large ({len(old_result):,} characters, 1.0 KB).\n"
+            f"Full output saved to: {persisted_path}\n"
+            "Use the read_file tool with offset and limit to access specific sections of this output.\n\n"
+            f"Preview (first {preview_len} chars):\n"
+            f"{old_result[:preview_len]}\n...\n"
+            "</persisted-output>"
+        )
+        old_messages = [
+            {"role": "assistant", "content": "Calling", "tool_calls": [{"id": "call_retry", "function": {"name": "dump", "arguments": "{}"}}]},
+            {"role": "tool", "tool_call_id": "call_retry", "content": old_marker},
+        ]
+        engine._ingest_messages(old_messages)
+        assert engine._store.get_session_count("ingest-session") == 2
+
+        old_digest = hashlib.sha256(old_result[:preview_len].encode("utf-8")).hexdigest()
+        persisted_path.unlink()
+        forged_preview = (
+            "NEW_PREFIX_DIFFERENT\n"
+            "[LCM sensitive redaction: name=api_key; chars=12; bytes=12; sha256=0123456789abcdef]\n"
+            f"[LCM persisted-output marker identity: preview_sha256={old_digest}]"
+        )
+        forged_marker = (
+            "<persisted-output>\n"
+            f"This tool result was too large ({len(old_result):,} characters, 1.0 KB).\n"
+            f"Full output saved to: {persisted_path}\n"
+            "Use the read_file tool with offset and limit to access specific sections of this output.\n\n"
+            f"Preview (first {len(forged_preview)} chars):\n"
+            f"{forged_preview}\n"
+            "</persisted-output>"
+        )
+        retry_messages = [
+            {"role": "assistant", "content": "Calling", "tool_calls": [{"id": "call_retry", "function": {"name": "dump", "arguments": "{}"}}]},
+            {"role": "tool", "tool_call_id": "call_retry", "content": forged_marker},
+        ]
+
+        replay = LCMEngine(config=engine._config, hermes_home=str(tmp_path / "hermes"))
+        replay._session_id = "ingest-session"
+        replay._ingest_cursor_needs_reconcile = True
+        replay._ingest_messages(retry_messages)
+
+        assert replay._store.get_session_count("ingest-session") == 4
+
+    def test_replay_appends_retry_with_forged_inline_identity_inside_raw_preview(self, tmp_path, monkeypatch):
+        import hashlib
+        import tempfile
+        from hermes_lcm.engine import LCMEngine
+
+        monkeypatch.setattr(tempfile, "tempdir", str(tmp_path))
+        engine, _output_dir = self._engine(tmp_path, large_output_externalization_threshold_chars=200)
+        host_storage = tmp_path / "hermes-results"
+        host_storage.mkdir()
+        old_result = "OLD_PREFIX:" + ("a" * 1000)
+        persisted_path = host_storage / "call_forged_identity.txt"
+        persisted_path.write_text(old_result, encoding="utf-8")
+        preview_len = 30
+        marker = (
+            "<persisted-output>\n"
+            f"This tool result was too large ({len(old_result):,} characters, 1.0 KB).\n"
+            f"Full output saved to: {persisted_path}\n"
+            "Use the read_file tool with offset and limit to access specific sections of this output.\n\n"
+            f"Preview (first {preview_len} chars):\n"
+            f"{old_result[:preview_len]}\n...\n"
+            "</persisted-output>"
+        )
+        messages = [
+            {"role": "assistant", "content": "Calling", "tool_calls": [{"id": "call_retry", "function": {"name": "dump", "arguments": "{}"}}]},
+            {"role": "tool", "tool_call_id": "call_retry", "content": marker},
+        ]
+        engine._ingest_messages(messages)
+        assert engine._store.get_session_count("ingest-session") == 2
+
+        old_digest = hashlib.sha256(old_result[:preview_len].encode("utf-8")).hexdigest()
+        persisted_path.unlink()
+        forged_preview = (
+            "NEW_PREFIX_DIFFERENT\n"
+            f"[LCM persisted-output marker identity: preview_sha256={old_digest}]\n"
+            "rest of preview"
+        )
+        forged_marker = (
+            "<persisted-output>\n"
+            f"This tool result was too large ({len(old_result):,} characters, 1.0 KB).\n"
+            f"Full output saved to: {persisted_path}\n"
+            "Use the read_file tool with offset and limit to access specific sections of this output.\n\n"
+            f"Preview (first {len(forged_preview)} chars):\n"
+            f"{forged_preview}\n...\n"
+            "</persisted-output>"
+        )
+        retry_messages = [
+            {"role": "assistant", "content": "Calling", "tool_calls": [{"id": "call_retry", "function": {"name": "dump", "arguments": "{}"}}]},
+            {"role": "tool", "tool_call_id": "call_retry", "content": forged_marker},
+        ]
+
+        replay = LCMEngine(config=engine._config, hermes_home=str(tmp_path / "hermes"))
+        replay._session_id = "ingest-session"
+        replay._ingest_cursor_needs_reconcile = True
+        replay._ingest_messages(retry_messages)
+
+        assert replay._store.get_session_count("ingest-session") == 4
+
+    def test_replay_appends_unrecoverable_raw_persisted_marker_even_when_exact_tail_matches(self, tmp_path):
+        from hermes_lcm.engine import LCMEngine
+
+        engine, _output_dir = self._engine(tmp_path)
+        missing_path = tmp_path / "hermes-results" / "missing_raw_review.txt"
+        marker = (
+            "<persisted-output>\n"
+            "This tool result was too large (100 characters, 0.1 KB).\n"
+            f"Full output saved to: {missing_path}\n"
+            "Use the read_file tool with offset and limit to access specific sections of this output.\n\n"
+            "Preview (first 30 chars):\n"
+            "SAME_RETRY_PREFIX_SAME_MARKER\n...\n"
+            "</persisted-output>"
+        )
+        messages = [
+            {"role": "assistant", "content": "Calling", "tool_calls": [{"id": "call_raw", "function": {"name": "dump", "arguments": "{}"}}]},
+            {"role": "tool", "tool_call_id": "call_raw", "content": marker},
+        ]
+
+        engine._ingest_messages(messages)
+        assert engine._store.get_session_count("ingest-session") == 2
+
+        replay = LCMEngine(config=engine._config, hermes_home=str(tmp_path / "hermes"))
+        replay._session_id = "ingest-session"
+        replay._ingest_cursor_needs_reconcile = True
+        replay._ingest_messages(messages)
+
+        assert replay._store.get_session_count("ingest-session") == 4
+
+    def test_replay_appends_mixed_persisted_suffix_when_any_marker_lacks_file_proof(self, tmp_path, monkeypatch):
+        import tempfile
+        from hermes_lcm.engine import LCMEngine
+
+        monkeypatch.setattr(tempfile, "tempdir", str(tmp_path))
+        engine, _output_dir = self._engine(tmp_path, large_output_externalization_threshold_chars=10)
+        host_storage = tmp_path / "hermes-results"
+        host_storage.mkdir()
+        live_content = "LIVE_PROOF_PREFIX:" + ("a" * 1000)
+        missing_content = "MISSING_RAW_PREFIX:" + ("b" * 1000)
+        live_path = host_storage / "live.txt"
+        missing_path = host_storage / "missing.txt"
+        live_path.write_text(live_content, encoding="utf-8")
+
+        def marker(path: Path, content: str) -> str:
+            return (
+                "<persisted-output>\n"
+                f"This tool result was too large ({len(content):,} characters, 1.0 KB).\n"
+                f"Full output saved to: {path}\n"
+                "Use the read_file tool with offset and limit to access specific sections of this output.\n\n"
+                "Preview (first 30 chars):\n"
+                f"{content[:30]}\n...\n"
+                "</persisted-output>"
+            )
+
+        messages = [
+            {"role": "tool", "tool_call_id": "call_live", "content": marker(live_path, live_content)},
+            {"role": "tool", "tool_call_id": "call_missing", "content": marker(missing_path, missing_content)},
+        ]
+
+        engine._ingest_messages(messages)
+        assert engine._store.get_session_count("ingest-session") == 2
+
+        replay = LCMEngine(config=engine._config, hermes_home=str(tmp_path / "hermes"))
+        replay._session_id = "ingest-session"
+        replay._ingest_cursor_needs_reconcile = True
+        replay._ingest_messages(messages)
+
+        assert replay._store.get_session_count("ingest-session") == 4
+
+    def test_replay_appends_stale_lossy_persisted_retry_when_redaction_config_disabled(self, tmp_path, monkeypatch):
+        import os
+        import tempfile
+        import time
+        from hermes_lcm.config import LCMConfig
+        from hermes_lcm.engine import LCMEngine
+
+        monkeypatch.setattr(tempfile, "tempdir", str(tmp_path))
+        engine, output_dir = self._engine(
+            tmp_path,
+            sensitive_patterns_enabled=True,
+            sensitive_patterns=["password_assignment"],
+        )
+        host_storage = tmp_path / "hermes-results"
+        host_storage.mkdir()
+        shared_prefix = "SAME_RETRY_PREFIX:" + ("p" * 64) + "\n"
+        old_result = shared_prefix + "password = OLDSECRET\nend"
+        new_result = shared_prefix + "password = NEWSECRET\nend"
+        assert len(new_result) == len(old_result)
+        persisted_path = host_storage / "call_config_drift_password.txt"
+        persisted_path.write_text(old_result, encoding="utf-8")
+        marker = (
+            "<persisted-output>\n"
+            f"This tool result was too large ({len(old_result):,} characters, 0.1 KB).\n"
+            f"Full output saved to: {persisted_path}\n"
+            "Use the read_file tool with offset and limit to access specific sections of this output.\n\n"
+            "Preview (first 30 chars):\n"
+            f"{old_result[:30]}\n...\n"
+            "</persisted-output>"
+        )
+        messages = [
+            {"role": "assistant", "content": "Calling", "tool_calls": [{"id": "call_retry", "function": {"name": "dump", "arguments": "{}"}}]},
+            {"role": "tool", "tool_call_id": "call_retry", "content": marker},
+        ]
+
+        engine._ingest_messages(messages)
+        assert engine._store.get_session_count("ingest-session") == 2
+
+        persisted_path.write_text(new_result, encoding="utf-8")
+        future_mtime = time.time() + 5
+        os.utime(persisted_path, (future_mtime, future_mtime))
+        cfg = engine._config
+        drift_config = LCMConfig(
+            database_path=cfg.database_path,
+            large_output_externalization_enabled=cfg.large_output_externalization_enabled,
+            large_output_externalization_threshold_chars=cfg.large_output_externalization_threshold_chars,
+            large_output_externalization_path=cfg.large_output_externalization_path,
+            sensitive_patterns_enabled=False,
+            sensitive_patterns=[],
+        )
+        replay = LCMEngine(config=drift_config, hermes_home=str(tmp_path / "hermes"))
+        replay._session_id = "ingest-session"
+        replay._ingest_cursor_needs_reconcile = True
+        replay._ingest_messages(messages)
+
+        assert replay._store.get_session_count("ingest-session") == 4
+        payloads = [json.loads(path.read_text())["content"] for path in output_dir.glob("*.json")]
+        assert any("OLDSECRET" not in payload and "NEWSECRET" not in payload for payload in payloads)
+        assert any(payload == new_result for payload in payloads)
+
+    def test_replay_appends_same_path_same_preview_retry_when_live_file_missing(self, tmp_path, monkeypatch):
+        import tempfile
+        from hermes_lcm.engine import LCMEngine
+
+        monkeypatch.setattr(tempfile, "tempdir", str(tmp_path))
+        engine, output_dir = self._engine(tmp_path)
+        host_storage = tmp_path / "hermes-results"
+        host_storage.mkdir()
+        shared_prefix = "SAME_RETRY_PREFIX:" + ("p" * 64)
+        old_result = shared_prefix + ("a" * 1000)
+        new_result = shared_prefix + ("b" * 1000)
+        assert len(new_result) == len(old_result)
+        persisted_path = host_storage / "call_retry_missing_live.txt"
+
+        def marker_for(content: str) -> str:
+            return (
+                "<persisted-output>\n"
+                f"This tool result was too large ({len(content):,} characters, 1.0 KB).\n"
+                f"Full output saved to: {persisted_path}\n"
+                "Use the read_file tool with offset and limit to access specific sections of this output.\n\n"
+                "Preview (first 30 chars):\n"
+                f"{content[:30]}\n...\n"
+                "</persisted-output>"
+            )
+
+        persisted_path.write_text(old_result, encoding="utf-8")
+        old_messages = [
+            {"role": "assistant", "content": "Calling", "tool_calls": [{"id": "call_retry", "function": {"name": "dump", "arguments": "{}"}}]},
+            {"role": "tool", "tool_call_id": "call_retry", "content": marker_for(old_result)},
+        ]
+        engine._ingest_messages(old_messages)
+        assert engine._store.get_session_count("ingest-session") == 2
+
+        persisted_path.unlink()
+        retry_messages = [
+            {"role": "assistant", "content": "Calling", "tool_calls": [{"id": "call_retry", "function": {"name": "dump", "arguments": "{}"}}]},
+            {"role": "tool", "tool_call_id": "call_retry", "content": marker_for(new_result)},
+        ]
+        replay = LCMEngine(config=engine._config, hermes_home=str(tmp_path / "hermes"))
+        replay._session_id = "ingest-session"
+        replay._ingest_cursor_needs_reconcile = True
+        replay._ingest_messages(retry_messages)
+
+        assert replay._store.get_session_count("ingest-session") == 4
+        assert output_dir.exists()
+
+    def test_legacy_lossy_preview_prefix_sanitization_does_not_create_raw_preview_digest(self):
+        from hermes_lcm.externalize import _sanitize_persisted_output_marker_metadata
+
+        existing_raw_preview_sha256 = hashlib.sha256(b"password = OLDSECRET\nend").hexdigest()
+        payload = {
+            "kind": "tool_result",
+            "tool_call_id": "call_retry",
+            "role": "tool",
+            "session_id": "ingest-session",
+            "content": "password = [LCM sensitive redaction: name=password_assignment; chars=9; bytes=9]\nend",
+            "persisted_output_source_path": "/tmp/hermes-results/call.txt",
+            "persisted_output_expected_chars": 128,
+            "persisted_output_preview_sha256": existing_raw_preview_sha256,
+            "persisted_output_preview_prefix": "password = OLDSECRET\nend",
+            "persisted_output_markers": [
+                {
+                    "source_path": "/tmp/hermes-results/call.txt",
+                    "expected_chars": 128,
+                    "preview_sha256": existing_raw_preview_sha256,
+                    "preview_prefix": "password = OLDSECRET\nend",
+                }
+            ],
+        }
+
+        assert _sanitize_persisted_output_marker_metadata(payload) is True
+        payload_text = json.dumps(payload, sort_keys=True)
+        assert "preview_prefix" not in payload_text
+        assert "OLDSECRET" not in payload_text
+        assert "preview_sha256" not in payload_text
+        assert "persisted_output_preview_sha256" not in payload
+
+    def test_replay_distinguishes_same_path_retry_with_backdated_mtime(self, tmp_path, monkeypatch):
+        import os
+        import tempfile
+        from hermes_lcm.engine import LCMEngine
+
+        monkeypatch.setattr(tempfile, "tempdir", str(tmp_path))
+        engine, output_dir = self._engine(tmp_path)
+        host_storage = tmp_path / "hermes-results"
+        host_storage.mkdir()
+        shared_prefix = "SAME_RETRY_PREFIX:" + ("p" * 64)
+        old_result = shared_prefix + ("a" * 1000)
+        new_result = shared_prefix + ("b" * 1000)
+        assert len(new_result) == len(old_result)
+        persisted_path = host_storage / "call_retry_backdated.txt"
+        persisted_path.write_text(old_result, encoding="utf-8")
+        old_stat = persisted_path.stat()
+        marker = (
+            "<persisted-output>\n"
+            f"This tool result was too large ({len(old_result):,} characters, 1.0 KB).\n"
+            f"Full output saved to: {persisted_path}\n"
+            "Use the read_file tool with offset and limit to access specific sections of this output.\n\n"
+            "Preview (first 30 chars):\n"
+            f"{old_result[:30]}\n...\n"
+            "</persisted-output>"
+        )
+        messages = [
+            {"role": "assistant", "content": "Calling", "tool_calls": [{"id": "call_retry", "function": {"name": "dump", "arguments": "{}"}}]},
+            {"role": "tool", "tool_call_id": "call_retry", "content": marker},
+        ]
+        engine._ingest_messages(messages)
+        assert engine._store.get_session_count("ingest-session") == 2
+
+        persisted_path.write_text(new_result, encoding="utf-8")
+        os.utime(persisted_path, ns=(old_stat.st_atime_ns, old_stat.st_mtime_ns))
+        replay = LCMEngine(config=engine._config, hermes_home=str(tmp_path / "hermes"))
+        replay._session_id = "ingest-session"
+        replay._ingest_cursor_needs_reconcile = True
+        replay._ingest_messages(messages)
+
+        assert replay._store.get_session_count("ingest-session") == 4
+        payloads = [json.loads(path.read_text())["content"] for path in output_dir.glob("*.json")]
+        assert old_result in payloads
+        assert new_result in payloads
+
+    def test_ingest_preserves_recoverable_marker_when_externalization_disabled(self, tmp_path, monkeypatch):
+        import tempfile
+        from hermes_lcm.engine import LCMEngine
+
+        monkeypatch.setattr(tempfile, "tempdir", str(tmp_path))
+        engine, output_dir = self._engine(
+            tmp_path,
+            large_output_externalization_enabled=False,
+        )
+        host_storage = tmp_path / "hermes-results"
+        host_storage.mkdir()
+        full_result = "FULL_DISABLED_NEEDLE:" + ("abc" * 1000)
+        persisted_path = host_storage / "call_disabled.txt"
+        persisted_path.write_text(full_result, encoding="utf-8")
+        marker = (
+            "<persisted-output>\n"
+            f"This tool result was too large ({len(full_result):,} characters, 2.9 KB).\n"
+            f"Full output saved to: {persisted_path}\n"
+            "Use the read_file tool with offset and limit to access specific sections of this output.\n\n"
+            "Preview (first 20 chars):\n"
+            f"{full_result[:20]}\n...\n"
+            "</persisted-output>"
+        )
+        messages = [{"role": "tool", "tool_call_id": "call_disabled", "content": marker}]
+
+        engine._ingest_messages(messages)
+        stored = engine._store.get_session_messages("ingest-session")
+        assert stored[0]["content"].startswith(marker.removesuffix("</persisted-output>"))
+        assert "[LCM persisted-output file generation:" in stored[0]["content"]
+        assert stored[0]["content"].endswith("</persisted-output>")
+        assert not output_dir.exists()
+
+        replay_with_file = LCMEngine(config=engine._config, hermes_home=str(tmp_path / "hermes"))
+        replay_with_file._session_id = "ingest-session"
+        replay_with_file._ingest_cursor_needs_reconcile = True
+        replay_with_file._ingest_messages(messages)
+
+        assert replay_with_file._store.get_session_count("ingest-session") == 2
+
+        from dataclasses import replace
+        enabled_config = replace(engine._config, large_output_externalization_enabled=True)
+        replay_enabled_with_file = LCMEngine(config=enabled_config, hermes_home=str(tmp_path / "hermes"))
+        replay_enabled_with_file._session_id = "ingest-session"
+        replay_enabled_with_file._ingest_cursor_needs_reconcile = True
+        replay_enabled_with_file._ingest_messages(messages)
+
+        assert replay_enabled_with_file._store.get_session_count("ingest-session") == 3
+
+        persisted_path.unlink()
+        replay = LCMEngine(config=engine._config, hermes_home=str(tmp_path / "hermes"))
+        replay._session_id = "ingest-session"
+        replay._ingest_cursor_needs_reconcile = True
+        replay._ingest_messages(messages)
+
+        assert replay._store.get_session_count("ingest-session") == 4
+
+    def test_replay_reconciles_redacted_inline_persisted_marker_when_externalization_disabled(self, tmp_path, monkeypatch):
+        import tempfile
+        from hermes_lcm.engine import LCMEngine
+
+        monkeypatch.setattr(tempfile, "tempdir", str(tmp_path))
+        engine, output_dir = self._engine(
+            tmp_path,
+            large_output_externalization_enabled=False,
+            sensitive_patterns_enabled=True,
+            sensitive_patterns=["api_key"],
+        )
+        host_storage = tmp_path / "hermes-results"
+        host_storage.mkdir()
+        full_result = "api_key = INLINESECRET1234567890 suffix"
+        preview = full_result[:32]
+        persisted_path = host_storage / "call_disabled_secret.txt"
+        persisted_path.write_text(full_result, encoding="utf-8")
+        marker = (
+            "<persisted-output>\n"
+            f"This tool result was too large ({len(full_result):,} characters, 0.0 KB).\n"
+            f"Full output saved to: {persisted_path}\n"
+            "Use the read_file tool with offset and limit to access specific sections of this output.\n\n"
+            f"Preview (first {len(preview)} chars):\n"
+            f"{preview}\n"
+            "</persisted-output>"
+        )
+        messages = [{"role": "tool", "tool_call_id": "call_disabled_secret", "content": marker}]
+
+        engine._ingest_messages(messages)
+        stored = engine._store.get_session_messages("ingest-session")
+        assert "INLINESECRET" not in stored[0]["content"]
+        assert "[LCM sensitive redaction:" in stored[0]["content"]
+        assert not output_dir.exists()
+
+        replay_with_file = LCMEngine(config=engine._config, hermes_home=str(tmp_path / "hermes"))
+        replay_with_file._session_id = "ingest-session"
+        replay_with_file._ingest_cursor_needs_reconcile = True
+        replay_with_file._ingest_messages(messages)
+        assert replay_with_file._store.get_session_count("ingest-session") == 2
+
+        persisted_path.unlink()
+        replay = LCMEngine(config=engine._config, hermes_home=str(tmp_path / "hermes"))
+        replay._session_id = "ingest-session"
+        replay._ingest_cursor_needs_reconcile = True
+        replay._ingest_messages(messages)
+
+        assert replay._store.get_session_count("ingest-session") == 3
+
+    def test_replay_appends_externalization_disabled_retry_that_only_differs_inside_lossy_redaction(self, tmp_path, monkeypatch):
+        import os
+        import tempfile
+        import time
+        from hermes_lcm.engine import LCMEngine
+
+        monkeypatch.setattr(tempfile, "tempdir", str(tmp_path))
+        engine, output_dir = self._engine(
+            tmp_path,
+            large_output_externalization_enabled=False,
+            sensitive_patterns_enabled=True,
+            sensitive_patterns=["password_assignment"],
+        )
+        host_storage = tmp_path / "hermes-results"
+        host_storage.mkdir()
+        suffix = "\n" + ("z" * 1000)
+        old_result = "password = OLDSECRET" + suffix
+        new_result = "password = NEWSECRET" + suffix
+        assert len(new_result) == len(old_result)
+        persisted_path = host_storage / "call_disabled_password_retry.txt"
+
+        def marker_for(content: str) -> str:
+            preview = content[:30]
+            return (
+                "<persisted-output>\n"
+                f"This tool result was too large ({len(content):,} characters, 1.0 KB).\n"
+                f"Full output saved to: {persisted_path}\n"
+                "Use the read_file tool with offset and limit to access specific sections of this output.\n\n"
+                "Preview (first 30 chars):\n"
+                f"{preview}\n...\n"
+                "</persisted-output>"
+            )
+
+        persisted_path.write_text(old_result, encoding="utf-8")
+        original_messages = [
+            {"role": "assistant", "content": "Calling", "tool_calls": [{"id": "call_retry", "function": {"name": "dump", "arguments": "{}"}}]},
+            {"role": "tool", "tool_call_id": "call_retry", "content": marker_for(old_result)},
+        ]
+        engine._ingest_messages(original_messages)
+        assert engine._store.get_session_count("ingest-session") == 2
+
+        replay_same = LCMEngine(config=engine._config, hermes_home=str(tmp_path / "hermes"))
+        replay_same._session_id = "ingest-session"
+        replay_same._ingest_cursor_needs_reconcile = True
+        replay_same._ingest_messages(original_messages)
+        assert replay_same._store.get_session_count("ingest-session") == 4
+
+        persisted_path.write_text(new_result, encoding="utf-8")
+        future_mtime = time.time() + 5
+        os.utime(persisted_path, (future_mtime, future_mtime))
+        retry_messages = [
+            {"role": "assistant", "content": "Calling", "tool_calls": [{"id": "call_retry", "function": {"name": "dump", "arguments": "{}"}}]},
+            {"role": "tool", "tool_call_id": "call_retry", "content": marker_for(new_result)},
+        ]
+        replay_retry = LCMEngine(config=engine._config, hermes_home=str(tmp_path / "hermes"))
+        replay_retry._session_id = "ingest-session"
+        replay_retry._ingest_cursor_needs_reconcile = True
+        replay_retry._ingest_messages(retry_messages)
+        assert replay_retry._store.get_session_count("ingest-session") == 6
+        assert not output_dir.exists()
+
+    def test_ingest_recovers_persisted_output_with_crlf_newlines(self, tmp_path, monkeypatch):
+        import tempfile
+
+        monkeypatch.setattr(tempfile, "tempdir", str(tmp_path))
+        engine, output_dir = self._engine(
+            tmp_path,
+            large_output_externalization_threshold_chars=1,
+        )
+        host_storage = tmp_path / "hermes-results"
+        host_storage.mkdir()
+        full_result = "a\r\nb\r\n"
+        persisted_path = host_storage / "call_crlf.txt"
+        persisted_path.write_bytes(full_result.encode("utf-8"))
+        marker = (
+            "<persisted-output>\n"
+            f"This tool result was too large ({len(full_result):,} characters, 0.0 KB).\n"
+            f"Full output saved to: {persisted_path}\n"
+            "Use the read_file tool with offset and limit to access specific sections of this output.\n\n"
+            "Preview (first 3 chars):\n"
+            "a\r\n\n"
+            "</persisted-output>"
+        )
+
+        engine._ingest_messages([
+            {"role": "tool", "tool_call_id": "call_crlf", "content": marker},
+        ])
+
+        stored = engine._store.get_session_messages("ingest-session")
+        assert stored[0]["content"].startswith("[Externalized tool output:")
+        payload_file = next(output_dir.glob("*.json"))
+        payload = json.loads(payload_file.read_text())
+        assert payload["content"] == full_result
+
+    def test_ingest_preserves_persisted_output_marker_from_fifo_inline_without_blocking(self, tmp_path, monkeypatch):
+        import os
+        import tempfile
+
+        if not hasattr(os, "mkfifo"):
+            pytest.skip("FIFO creation unavailable on this platform")
+        monkeypatch.setattr(tempfile, "tempdir", str(tmp_path))
+        engine, output_dir = self._engine(tmp_path)
+        host_storage = tmp_path / "hermes-results"
+        host_storage.mkdir()
+        fifo_path = host_storage / "call_fifo.txt"
+        try:
+            os.mkfifo(fifo_path)
+        except OSError as exc:
+            pytest.skip(f"FIFO creation unavailable: {exc}")
+        marker = (
+            "<persisted-output>\n"
+            "This tool result was too large (42 characters, 0.0 KB).\n"
+            f"Full output saved to: {fifo_path}\n"
+            "Use the read_file tool with offset and limit to access specific sections of this output.\n\n"
+            "Preview (first 12 chars):\n"
+            "FIFO_PREVIEW\n"
+            "</persisted-output>"
+        )
+
+        engine._ingest_messages([
+            {"role": "tool", "tool_call_id": "call_fifo", "content": marker},
+        ])
+
+        stored = engine._store.get_session_messages("ingest-session")
+        assert stored[0]["content"] == marker
+        assert not output_dir.exists()
+
+    def test_ingest_externalizes_large_tool_output_containing_literal_persisted_tag(self, tmp_path):
+        engine, output_dir = self._engine(
+            tmp_path,
+            large_output_externalization_threshold_chars=10,
+        )
+        content = "log prefix <persisted-output> not a Hermes marker " + ("x" * 200)
+
+        engine._ingest_messages([
+            {"role": "tool", "tool_call_id": "call_literal_tag", "content": content},
+        ])
+
+        stored = engine._store.get_session_messages("ingest-session")
+        assert stored[0]["content"].startswith("[Externalized tool output:")
+        payload_file = next(output_dir.glob("*.json"))
+        payload = json.loads(payload_file.read_text())
+        assert payload["content"] == content
+
+    def test_ingest_externalizes_whole_output_when_persisted_marker_is_embedded(self, tmp_path, monkeypatch):
+        import tempfile
+
+        monkeypatch.setattr(tempfile, "tempdir", str(tmp_path))
+        engine, output_dir = self._engine(
+            tmp_path,
+            large_output_externalization_threshold_chars=10,
+        )
+        host_storage = tmp_path / "hermes-results"
+        host_storage.mkdir()
+        full_result = "EMBEDDED_MARKER_BACKING_FILE"
+        persisted_path = host_storage / "embedded_marker.txt"
+        persisted_path.write_text(full_result, encoding="utf-8")
+        marker = (
+            "<persisted-output>\n"
+            f"This tool result was too large ({len(full_result):,} characters, 0.0 KB).\n"
+            f"Full output saved to: {persisted_path}\n"
+            "Use the read_file tool with offset and limit to access specific sections of this output.\n\n"
+            "Preview (first 10 chars):\n"
+            f"{full_result[:10]}\n"
+            "</persisted-output>"
+        )
+        content = "log prefix before marker\n" + marker + "\nlog suffix after marker"
+
+        engine._ingest_messages([
+            {"role": "tool", "tool_call_id": "call_embedded_marker", "content": content},
+        ])
+
+        stored = engine._store.get_session_messages("ingest-session")
+        assert stored[0]["content"].startswith("[Externalized tool output:")
+        payload_file = next(output_dir.glob("*.json"))
+        payload = json.loads(payload_file.read_text())
+        assert payload["content"] == content
+        assert payload["content"] != full_result
+
+    def test_ingest_preserves_persisted_output_marker_with_unsafe_path_inline(self, tmp_path):
+        engine, output_dir = self._engine(tmp_path)
+        marker = (
+            "<persisted-output>\n"
+            "This tool result was too large (6 characters, 0.0 KB).\n"
+            "Full output saved to: /etc/passwd\n"
+            "Use the read_file tool with offset and limit to access specific sections of this output.\n\n"
+            "Preview (first 6 chars):\n"
+            "root:x\n"
+            "</persisted-output>"
+        )
+
+        engine._ingest_messages([
+            {"role": "tool", "tool_call_id": "call_unsafe", "content": marker},
+        ])
+
+        stored = engine._store.get_session_messages("ingest-session")
+        assert stored[0]["content"] == marker
+        assert not output_dir.exists()
+
+    def test_ingest_preserves_persisted_output_marker_from_nested_temp_dir_inline(self, tmp_path, monkeypatch):
+        import tempfile
+
+        monkeypatch.setattr(tempfile, "tempdir", str(tmp_path))
+        engine, output_dir = self._engine(tmp_path)
+        nested_storage = tmp_path / "attacker" / "hermes-results"
+        nested_storage.mkdir(parents=True)
+        nested_file = nested_storage / "call_nested.txt"
+        nested_file.write_text("secret", encoding="utf-8")
+        marker = (
+            "<persisted-output>\n"
+            "This tool result was too large (6 characters, 0.0 KB).\n"
+            f"Full output saved to: {nested_file}\n"
+            "Use the read_file tool with offset and limit to access specific sections of this output.\n\n"
+            "Preview (first 6 chars):\n"
+            "secret\n"
+            "</persisted-output>"
+        )
+
+        engine._ingest_messages([
+            {"role": "tool", "tool_call_id": "call_nested", "content": marker},
+        ])
+
+        stored = engine._store.get_session_messages("ingest-session")
+        assert stored[0]["content"] == marker
+        assert not output_dir.exists()
+
+    def test_ingest_recovers_persisted_output_marker_through_symlinked_temp_root(self, tmp_path, monkeypatch):
+        import tempfile
+
+        real_temp_root = tmp_path / "real-temp"
+        real_temp_root.mkdir()
+        symlink_temp_root = tmp_path / "temp-link"
+        try:
+            symlink_temp_root.symlink_to(real_temp_root, target_is_directory=True)
+        except OSError as exc:
+            pytest.skip(f"symlink creation unavailable: {exc}")
+        monkeypatch.setattr(tempfile, "tempdir", str(symlink_temp_root))
+        engine, output_dir = self._engine(tmp_path)
+        host_storage = symlink_temp_root / "hermes-results"
+        host_storage.mkdir()
+        full_result = "FULL_SYMLINKED_TEMP_ROOT_NEEDLE:" + ("abc" * 1000)
+        persisted_path = host_storage / "call_symlinked_temp_root.txt"
+        persisted_path.write_text(full_result, encoding="utf-8")
+        marker = (
+            "<persisted-output>\n"
+            f"This tool result was too large ({len(full_result):,} characters, 2.9 KB).\n"
+            f"Full output saved to: {persisted_path}\n"
+            "Use the read_file tool with offset and limit to access specific sections of this output.\n\n"
+            "Preview (first 30 chars):\n"
+            f"{full_result[:30]}\n...\n"
+            "</persisted-output>"
+        )
+
+        engine._ingest_messages([
+            {"role": "tool", "tool_call_id": "call_symlinked_temp_root", "content": marker},
+        ])
+
+        stored = engine._store.get_session_messages("ingest-session")
+        assert stored[0]["content"].startswith("[Externalized tool output:")
+        payload_file = next(output_dir.glob("*.json"))
+        payload = json.loads(payload_file.read_text())
+        assert payload["content"] == full_result
+
+    def test_ingest_preserves_persisted_output_marker_from_symlinked_results_dir_inline(self, tmp_path, monkeypatch):
+        import tempfile
+
+        monkeypatch.setattr(tempfile, "tempdir", str(tmp_path))
+        engine, output_dir = self._engine(tmp_path)
+        outside_storage = tmp_path / "outside-results"
+        outside_storage.mkdir()
+        symlink_storage = tmp_path / "hermes-results"
+        try:
+            symlink_storage.symlink_to(outside_storage, target_is_directory=True)
+        except OSError as exc:
+            pytest.skip(f"symlink creation unavailable: {exc}")
+        symlinked_file = symlink_storage / "call_symlink.txt"
+        symlinked_file.write_text("secret", encoding="utf-8")
+        marker = (
+            "<persisted-output>\n"
+            "This tool result was too large (6 characters, 0.0 KB).\n"
+            f"Full output saved to: {symlinked_file}\n"
+            "Use the read_file tool with offset and limit to access specific sections of this output.\n\n"
+            "Preview (first 6 chars):\n"
+            "secret\n"
+            "</persisted-output>"
+        )
+
+        engine._ingest_messages([
+            {"role": "tool", "tool_call_id": "call_symlink", "content": marker},
+        ])
+
+        stored = engine._store.get_session_messages("ingest-session")
+        assert stored[0]["content"] == marker
+        assert not output_dir.exists()
+
+    def test_ingest_does_not_recover_persisted_output_marker_outside_tool_role(self, tmp_path, monkeypatch):
+        import tempfile
+
+        monkeypatch.setattr(tempfile, "tempdir", str(tmp_path))
+        engine, output_dir = self._engine(tmp_path)
+        host_storage = tmp_path / "hermes-results"
+        host_storage.mkdir()
+        persisted_path = host_storage / "assistant.txt"
+        persisted_path.write_text("assistant recovered text", encoding="utf-8")
+        marker = (
+            "<persisted-output>\n"
+            "This tool result was too large (24 characters, 0.0 KB).\n"
+            f"Full output saved to: {persisted_path}\n"
+            "Use the read_file tool with offset and limit to access specific sections of this output.\n\n"
+            "Preview (first 8 chars):\n"
+            "assistant\n"
+            "</persisted-output>"
+        )
+
+        engine._ingest_messages([
+            {"role": "assistant", "content": marker},
+        ])
+
+        stored = engine._store.get_session_messages("ingest-session")
+        assert stored[0]["content"].startswith("[Externalized payload:")
+        payload_file = next(output_dir.glob("*.json"))
+        payload = json.loads(payload_file.read_text())
+        assert payload["kind"] == "raw_payload"
+        assert payload["content"] == marker
+        assert "assistant recovered text" not in stored[0]["content"]
+
+    def test_ingest_preserves_unrecoverable_truncation_marker_inline(self, tmp_path):
+        engine, output_dir = self._engine(tmp_path)
+        preview_only = (
+            "PREVIEW_ONLY_NEEDLE:" + ("x" * 500) +
+            "\n\n[Truncated: tool response was 9,999 chars. Full output could not be saved to sandbox.]"
+        )
+
+        engine._ingest_messages([
+            {"role": "tool", "tool_call_id": "call_truncated", "content": preview_only},
+        ])
+
+        stored = engine._store.get_session_messages("ingest-session")
+        assert stored[0]["content"] == preview_only
+        assert "[Truncated: tool response was 9,999 chars" in stored[0]["content"]
+        assert not output_dir.exists()
+
+    def test_ingest_sanitizes_inline_payloads_inside_unrecoverable_truncation_marker(self, tmp_path):
+        engine, output_dir = self._engine(tmp_path)
+        data_uri = "data:image/png;base64," + ("A" * 1000)
+        preview_only = (
+            "Preview with inline payload: "
+            + data_uri
+            + "\n\n[Truncated: tool response was 9,999 chars. Full output could not be saved to sandbox.]"
+        )
+
+        engine._ingest_messages([
+            {"role": "tool", "tool_call_id": "call_payload_preview", "content": preview_only},
+        ])
+
+        stored = engine._store.get_session_messages("ingest-session")
+        assert "[Truncated: tool response was 9,999 chars" in stored[0]["content"]
+        assert "[Externalized LCM ingest payload:" in stored[0]["content"]
+        assert data_uri not in stored[0]["content"]
+        payload_file = next(output_dir.glob("*.json"))
+        payload = json.loads(payload_file.read_text())
+        assert payload["content"] == data_uri
+
+    def test_ingest_preserves_existing_externalized_payload_ref_without_reexternalizing(self, tmp_path):
+        import hermes_lcm.tools as lcm_tools
+
+        engine, output_dir = self._engine(tmp_path)
+        payload = "EXISTING_REF_NEEDLE:" + ("z" * 5000)
+        messages = [
+            {"role": "tool", "tool_call_id": "call_original", "content": payload},
+        ]
+        engine._ingest_messages(messages)
+        first_payload = next(output_dir.glob("*.json"))
+        existing_ref = (
+            f"[Externalized tool output: tool_call_id=call_original; "
+            f"chars={len(payload)}; bytes={len(payload.encode('utf-8'))}; ref={first_payload.name}]"
+        )
+
+        messages.append({"role": "tool", "tool_call_id": "call_replay", "content": existing_ref})
+        engine._ingest_messages(messages)
+
+        stored = engine._store.get_session_messages("ingest-session")
+        assert len(stored) == 2
+        assert stored[1]["content"] == existing_ref
+        assert sorted(path.name for path in output_dir.glob("*.json")) == [first_payload.name]
+        expanded = json.loads(lcm_tools.lcm_expand({"externalized_ref": first_payload.name, "max_tokens": 20_000}, engine=engine))
+        assert expanded["content"] == payload
 
     def test_ingest_externalizes_large_tool_result_before_sqlite_and_preserves_tool_pair_replay(self, tmp_path):
         import hermes_lcm.tools as lcm_tools
@@ -3139,6 +6296,87 @@ class TestIngestExternalization:
         assert payload["kind"] == "raw_payload"
         assert payload["role"] == "user"
         assert payload["content"] == content
+
+    def test_compress_returns_externalized_stub_for_oversized_active_tail(self, tmp_path):
+        import hermes_lcm.tools as lcm_tools
+        from hermes_lcm.engine import LCMEngine
+
+        engine, output_dir = self._engine(tmp_path)
+        content = "ACTIVE_RAW_NEEDLE:" + ("r" * 5000)
+        messages = [{"role": "user", "content": content}]
+
+        active_context = engine.compress(messages)
+
+        assert len(active_context) == 1
+        active_content = active_context[0]["content"]
+        assert active_content.startswith("[Externalized payload: kind=raw_payload;")
+        assert "ACTIVE_RAW_NEEDLE" not in active_content
+        assert len(active_content) < 512
+        assert messages[0]["content"] == content
+
+        stored = engine._store.get_session_messages("ingest-session")
+        assert stored[0]["content"] == active_content
+        assert engine._get_store_ids_for_messages(active_context) == [stored[0]["store_id"]]
+        assert engine._store.search("ACTIVE_RAW_NEEDLE", session_id="ingest-session") == []
+        payload_path = next(output_dir.glob("*.json"))
+        expanded = json.loads(
+            lcm_tools.lcm_expand(
+                {"externalized_ref": payload_path.name, "max_tokens": 20_000},
+                engine=engine,
+            )
+        )
+        assert expanded["kind"] == "raw_payload"
+        assert expanded["content"] == content
+
+        replay = LCMEngine(config=engine._config, hermes_home=str(tmp_path / "hermes"))
+        replay._session_id = "ingest-session"
+        replay._ingest_cursor_needs_reconcile = True
+        replay._ingest_messages(active_context)
+        assert replay._store.get_session_count("ingest-session") == 1
+
+        replay_with_delta = LCMEngine(config=engine._config, hermes_home=str(tmp_path / "hermes"))
+        replay_with_delta._session_id = "ingest-session"
+        replay_with_delta._ingest_cursor_needs_reconcile = True
+        replay_with_delta._ingest_messages(active_context + [{"role": "user", "content": "followup"}])
+        rows = replay_with_delta._store.get_session_messages("ingest-session")
+        assert len(rows) == 2
+        assert rows[-1]["content"] == "followup"
+
+    def test_preflight_requests_cleanup_for_oversized_raw_payload_stub(self, tmp_path):
+        engine, _output_dir = self._engine(tmp_path)
+        content = "PREFLIGHT_RAW_NEEDLE:" + ("r" * 5000)
+        messages = [{"role": "user", "content": content}]
+
+        assert engine.should_compress_preflight(messages) is True
+
+        active_context = engine.compress(messages)
+        assert active_context[0]["content"].startswith("[Externalized payload: kind=raw_payload;")
+        assert "PREFLIGHT_RAW_NEEDLE" not in active_context[0]["content"]
+        assert engine._last_compression_status == "sanitized"
+        assert engine._last_compression_noop_reason == ""
+
+    def test_non_tool_externalized_placeholder_sanitizes_role_metadata_for_ref_parsing(self, tmp_path):
+        import hermes_lcm.tools as lcm_tools
+
+        engine, output_dir = self._engine(tmp_path)
+        content = "INJECTED_ROLE_RAW_NEEDLE:" + ("z" * 5000)
+        injected_role = "user; ref=bogus]"
+
+        engine._ingest_messages([{"role": injected_role, "content": content}])
+
+        stored = engine._store.get_session_messages("ingest-session")
+        placeholder = stored[0]["content"]
+        assert placeholder.startswith("[Externalized payload: kind=raw_payload;")
+        assert "; ref=bogus]" not in placeholder
+        assert "INJECTED_ROLE_RAW_NEEDLE" not in placeholder
+
+        payload_file = next(output_dir.glob("*.json"))
+        payload = json.loads(payload_file.read_text())
+        assert payload["role"] == injected_role
+        by_store_id = json.loads(lcm_tools.lcm_expand({"store_id": stored[0]["store_id"], "max_tokens": 20_000}, engine=engine))
+        assert by_store_id["externalized_ref"] == payload_file.name
+        expanded = json.loads(lcm_tools.lcm_expand({"externalized_ref": by_store_id["externalized_ref"], "max_tokens": 20_000}, engine=engine))
+        assert expanded["content"] == content
 
     def test_engine_bootstrap_does_not_externalize_until_ingest_path_runs(self, tmp_path):
         from hermes_lcm.engine import LCMEngine
@@ -3699,3 +6937,447 @@ class TestExtraction:
             assert "s2" in content
         finally:
             ext_module._call_extraction_llm = original
+
+
+class TestLCMEngineCloning:
+    def test_clone_for_agent_isolates_session_binding_while_sharing_store(self, tmp_path):
+        from hermes_lcm.engine import LCMEngine
+
+        config = LCMConfig(database_path=str(tmp_path / "lcm-clone.db"))
+        prototype = LCMEngine(config=config, hermes_home=str(tmp_path / "hermes"))
+        first_agent = prototype.clone_for_agent()
+        second_agent = prototype.clone_for_agent()
+        assert first_agent is not prototype
+        assert second_agent is not prototype
+        assert first_agent is not second_agent
+
+        first_agent.on_session_start(
+            "agent-a-session",
+            platform="alpha",
+            conversation_id="agent:main:alpha:dm:1",
+        )
+        second_agent.on_session_start(
+            "agent-b-session",
+            platform="beta",
+            conversation_id="agent:main:beta:dm:2",
+        )
+
+        first_agent.on_session_end(
+            "agent-a-session",
+            [
+                {"role": "user", "content": "alpha question"},
+                {"role": "assistant", "content": "alpha answer"},
+            ],
+        )
+
+        rows = sqlite3.connect(config.database_path).execute(
+            "SELECT session_id, source, role, content FROM messages ORDER BY store_id"
+        ).fetchall()
+        assert rows == [
+            ("agent-a-session", "alpha", "user", "alpha question"),
+            ("agent-a-session", "alpha", "assistant", "alpha answer"),
+        ]
+
+        lifecycle = LifecycleStateStore(config.database_path)
+        try:
+            first_state = lifecycle.get_by_conversation("agent:main:alpha:dm:1")
+            second_state = lifecycle.get_by_conversation("agent:main:beta:dm:2")
+            assert first_state is not None
+            assert first_state.current_session_id is None
+            assert first_state.last_finalized_session_id == "agent-a-session"
+            assert second_state is not None
+            assert second_state.current_session_id == "agent-b-session"
+            assert second_state.last_finalized_session_id is None
+        finally:
+            lifecycle.close()
+            for engine in (prototype, first_agent, second_agent):
+                engine.shutdown()
+
+    def test_clone_for_agent_does_not_copy_bypass_lineage_into_normal_session(self, tmp_path):
+        from hermes_lcm.engine import LCMEngine
+
+        config = LCMConfig(
+            database_path=str(tmp_path / "lcm-clone-bypass-lineage.db"),
+            stateless_session_patterns=["stateless"],
+        )
+        prototype = LCMEngine(config=config, hermes_home=str(tmp_path / "hermes"))
+        clone = None
+        shared_prefix = [{"role": "user", "content": "shared opener"}]
+        try:
+            prototype.on_session_start(
+                "shared-session",
+                platform="stateless",
+                conversation_id="bypass-conversation",
+                context_length=200000,
+            )
+            prototype.ingest(shared_prefix)
+
+            clone = prototype.clone_for_agent()
+            clone.on_session_start(
+                "shared-session",
+                platform="cli",
+                conversation_id="normal-conversation",
+                context_length=200000,
+            )
+            clone.on_session_end(
+                "shared-session",
+                shared_prefix + [{"role": "assistant", "content": "normal final"}],
+            )
+
+            rows = clone._store.get_session_messages("shared-session")
+            assert [(row["conversation_id"], row["role"], row["content"]) for row in rows] == [
+                ("normal-conversation", "user", "shared opener"),
+                ("normal-conversation", "assistant", "normal final"),
+            ]
+        finally:
+            prototype.shutdown()
+            if clone is not None:
+                clone.shutdown()
+
+    def test_deepcopy_uses_clone_for_agent_without_copying_sqlite_handles(self, tmp_path):
+        from hermes_lcm.engine import LCMEngine
+
+        config = LCMConfig(database_path=str(tmp_path / "lcm-deepcopy.db"))
+        prototype = LCMEngine(config=config, hermes_home=str(tmp_path / "hermes"))
+        clone = None
+        try:
+            clone = copy.deepcopy(prototype)
+
+            assert clone is not prototype
+            assert isinstance(clone, LCMEngine)
+            assert clone._store is not prototype._store
+            assert clone._dag is not prototype._dag
+            assert clone._lifecycle is not prototype._lifecycle
+            assert clone._config.database_path == prototype._config.database_path
+            assert clone._hermes_home == prototype._hermes_home
+        finally:
+            prototype.shutdown()
+            if clone is not None:
+                clone.shutdown()
+
+    def test_deepcopy_matches_hermes_host_copy_contract_without_fallback(self, tmp_path):
+        from hermes_lcm.engine import LCMEngine
+
+        def host_selects_context_engine(candidate):
+            try:
+                return copy.deepcopy(candidate)
+            except Exception:
+                return "built-in-compressor-fallback"
+
+        config = LCMConfig(database_path=str(tmp_path / "lcm-host-copy.db"))
+        prototype = LCMEngine(config=config, hermes_home=str(tmp_path / "hermes"))
+        clone = None
+        try:
+            prototype.update_model(
+                model="gpt-5.5",
+                context_length=400_000,
+                provider="openai-codex",
+                base_url="https://example.invalid/v1",
+                api_key="test-secret",
+                api_mode="responses",
+            )
+            prototype.on_session_start(
+                "parent-session",
+                platform="telegram",
+                conversation_id="agent:main:telegram:dm:1",
+            )
+
+            clone = host_selects_context_engine(prototype)
+
+            assert clone != "built-in-compressor-fallback"
+            assert isinstance(clone, LCMEngine)
+            assert clone.name == "lcm"
+            assert clone is not prototype
+            assert clone._store is not prototype._store
+            assert clone._dag is not prototype._dag
+            assert clone._lifecycle is not prototype._lifecycle
+            assert clone._session_id == ""
+            assert clone._conversation_id == ""
+            assert clone.model == prototype.model
+            assert clone.provider == prototype.provider
+            assert clone.base_url == prototype.base_url
+            assert clone.api_key == prototype.api_key
+            assert clone.api_mode == prototype.api_mode
+            assert clone.raw_context_length == prototype.raw_context_length
+            assert clone.context_length == prototype.context_length
+            assert clone.effective_context_length_cap == prototype.effective_context_length_cap
+            assert clone.effective_context_length_reason == prototype.effective_context_length_reason
+            assert clone._context_length_source == prototype._context_length_source
+            assert clone._context_threshold_source == prototype._context_threshold_source
+            assert clone._context_threshold_autoraised == prototype._context_threshold_autoraised
+            assert clone.threshold_percent == prototype.threshold_percent
+            assert clone.threshold_tokens == prototype.threshold_tokens
+        finally:
+            prototype.shutdown()
+            shutdown = getattr(clone, "shutdown", None)
+            if callable(shutdown):
+                shutdown()
+
+    def test_deepcopy_before_session_start_copies_budget_without_pending_authority(self, tmp_path):
+        from hermes_lcm.engine import LCMEngine
+
+        config = LCMConfig(database_path=str(tmp_path / "lcm-pre-session-copy.db"))
+        prototype = LCMEngine(config=config, hermes_home=str(tmp_path / "hermes"))
+        clone = None
+        try:
+            prototype.update_model(
+                model="gpt-5.5",
+                context_length=400_000,
+                provider="openai-codex",
+                base_url="https://example.invalid/v1",
+                api_key="test-secret",
+                api_mode="responses",
+            )
+
+            clone = copy.deepcopy(prototype)
+
+            assert clone._session_id == ""
+            assert clone._conversation_id == ""
+            assert clone._update_model_pending_session_start is False
+            assert clone.model == "gpt-5.5"
+            assert clone.provider == "openai-codex"
+            assert clone.api_key == "test-secret"
+            assert clone.raw_context_length == 400_000
+            assert clone.context_length == 272_000
+            assert clone.effective_context_length_cap == 272_000
+            assert clone.effective_context_length_reason == "codex_oauth_context_cap"
+            assert clone.context_threshold == 0.85
+            assert clone.threshold_tokens == int(272_000 * 0.85)
+
+            clone.on_session_start(
+                "child-session",
+                platform="telegram",
+                conversation_id="agent:main:telegram:dm:2",
+                model="other-model",
+                provider="custom",
+                base_url="https://other.example.invalid/v1",
+                api_key="other-secret",
+                api_mode="chat",
+                context_length=128_000,
+            )
+
+            assert clone._session_id == "child-session"
+            assert clone._conversation_id == "agent:main:telegram:dm:2"
+            assert clone._update_model_pending_session_start is False
+            assert clone.model == "other-model"
+            assert clone.provider == "custom"
+            assert clone.base_url == "https://other.example.invalid/v1"
+            assert clone.api_key == "other-secret"
+            assert clone.api_mode == "chat"
+            assert clone.raw_context_length == 128_000
+            assert clone.context_length == 128_000
+            assert clone.effective_context_length_cap is None
+            assert clone.effective_context_length_reason == ""
+            assert clone._context_length_source == "session_start"
+            assert clone.threshold_tokens == int(128_000 * clone.context_threshold)
+        finally:
+            prototype.shutdown()
+            shutdown = getattr(clone, "shutdown", None)
+            if callable(shutdown):
+                shutdown()
+
+    def test_deepcopy_recomputes_copied_window_when_session_route_changes(self, tmp_path):
+        from hermes_lcm.engine import LCMEngine
+
+        config = LCMConfig(database_path=str(tmp_path / "lcm-route-recompute-copy.db"))
+        prototype = LCMEngine(config=config, hermes_home=str(tmp_path / "hermes"))
+        clone = None
+        try:
+            prototype.update_model(
+                model="large-custom-model",
+                context_length=1_000_000,
+                provider="custom",
+                base_url="https://example.invalid/v1",
+                api_key="test-secret",
+                api_mode="chat",
+            )
+
+            clone = copy.deepcopy(prototype)
+            assert clone._update_model_pending_session_start is False
+            assert clone.raw_context_length == 1_000_000
+            assert clone.context_length == 1_000_000
+            assert clone.effective_context_length_cap is None
+
+            clone.on_session_start(
+                "codex-session",
+                platform="telegram",
+                conversation_id="agent:main:telegram:dm:4",
+                model="gpt-5.5",
+                provider="openai-codex",
+                base_url="https://codex.example.invalid/v1",
+                api_key="codex-secret",
+                api_mode="responses",
+            )
+
+            assert clone._session_id == "codex-session"
+            assert clone._conversation_id == "agent:main:telegram:dm:4"
+            assert clone.model == "gpt-5.5"
+            assert clone.provider == "openai-codex"
+            assert clone.raw_context_length == 1_000_000
+            assert clone.context_length == 272_000
+            assert clone.effective_context_length_cap == 272_000
+            assert clone.effective_context_length_reason == "codex_oauth_context_cap"
+            assert clone.context_threshold == 0.85
+            assert clone.threshold_tokens == int(272_000 * 0.85)
+        finally:
+            prototype.shutdown()
+            shutdown = getattr(clone, "shutdown", None)
+            if callable(shutdown):
+                shutdown()
+
+    def test_deepcopy_recomputes_copied_cap_away_when_session_route_changes(self, tmp_path):
+        from hermes_lcm.engine import LCMEngine
+
+        config = LCMConfig(database_path=str(tmp_path / "lcm-route-uncap-copy.db"))
+        prototype = LCMEngine(config=config, hermes_home=str(tmp_path / "hermes"))
+        clone = None
+        try:
+            prototype.update_model(
+                model="gpt-5.5",
+                context_length=400_000,
+                provider="openai-codex",
+                base_url="https://codex.example.invalid/v1",
+                api_key="codex-secret",
+                api_mode="responses",
+            )
+
+            clone = copy.deepcopy(prototype)
+            assert clone._update_model_pending_session_start is False
+            assert clone.raw_context_length == 400_000
+            assert clone.context_length == 272_000
+            assert clone.effective_context_length_cap == 272_000
+            assert clone.context_threshold == 0.85
+
+            clone.on_session_start(
+                "custom-session",
+                platform="telegram",
+                conversation_id="agent:main:telegram:dm:5",
+                model="large-custom-model",
+                provider="custom",
+                base_url="https://custom.example.invalid/v1",
+                api_key="custom-secret",
+                api_mode="chat",
+            )
+
+            assert clone._session_id == "custom-session"
+            assert clone._conversation_id == "agent:main:telegram:dm:5"
+            assert clone.model == "large-custom-model"
+            assert clone.provider == "custom"
+            assert clone.raw_context_length == 400_000
+            assert clone.context_length == 400_000
+            assert clone.effective_context_length_cap is None
+            assert clone.effective_context_length_reason == ""
+            assert clone.context_threshold == clone._config.context_threshold
+            assert clone.threshold_tokens == int(400_000 * clone._config.context_threshold)
+        finally:
+            prototype.shutdown()
+            shutdown = getattr(clone, "shutdown", None)
+            if callable(shutdown):
+                shutdown()
+
+    def test_deepcopy_preserves_zero_context_metadata_without_pending_authority(self, tmp_path):
+        from hermes_lcm.engine import LCMEngine
+
+        config = LCMConfig(database_path=str(tmp_path / "lcm-zero-context-copy.db"))
+        prototype = LCMEngine(config=config, hermes_home=str(tmp_path / "hermes"))
+        clone = None
+        try:
+            prototype.update_model(
+                model="unknown-model",
+                context_length=0,
+                provider="custom",
+                base_url="https://example.invalid/v1",
+                api_key="test-secret",
+                api_mode="chat",
+            )
+
+            clone = copy.deepcopy(prototype)
+
+            assert clone._update_model_pending_session_start is False
+            assert clone._context_length_source == "update_model"
+            assert clone.raw_context_length == 0
+            assert clone.context_length == 0
+            assert clone.threshold_tokens == 0
+
+            clone.on_session_start(
+                "zero-window-session",
+                platform="telegram",
+                conversation_id="agent:main:telegram:dm:3",
+                model="resolved-model",
+                provider="custom",
+                base_url="https://resolved.example.invalid/v1",
+                api_key="resolved-secret",
+                api_mode="chat",
+                context_length=400_000,
+            )
+
+            assert clone._session_id == "zero-window-session"
+            assert clone._conversation_id == "agent:main:telegram:dm:3"
+            assert clone._update_model_pending_session_start is False
+            assert clone.model == "resolved-model"
+            assert clone.base_url == "https://resolved.example.invalid/v1"
+            assert clone.api_key == "resolved-secret"
+            assert clone.raw_context_length == 400_000
+            assert clone.context_length == 400_000
+            assert clone._context_length_source == "session_start"
+            assert clone.threshold_tokens == int(400_000 * clone.context_threshold)
+        finally:
+            prototype.shutdown()
+            shutdown = getattr(clone, "shutdown", None)
+            if callable(shutdown):
+                shutdown()
+
+
+def test_like_fallback_relevance_prefers_multi_term_score_over_single_exact(tmp_path):
+    import hermes_lcm.store as store_module
+
+    original = store_module.compute_search_candidate_cap
+    store_module.compute_search_candidate_cap = lambda _limit: 10
+    store = MessageStore(str(tmp_path / "store.db"))
+    try:
+        for i in range(20):
+            store.append("sess1", {"role": "user", "content": "alpha"})
+        multi_id = store.append("sess1", {"role": "user", "content": "alpha beta"})
+
+        results = store.search("alpha-beta", session_id="sess1", limit=5, sort="relevance")
+
+        assert results
+        assert results[0]["store_id"] == multi_id
+    finally:
+        store_module.compute_search_candidate_cap = original
+        store.close()
+
+
+def test_like_fallback_relevance_preserves_exact_match_before_candidate_cap(tmp_path):
+    from hermes_lcm.store import MessageStore
+    import hermes_lcm.store as store_module
+
+    original = store_module.compute_search_candidate_cap
+    store_module.compute_search_candidate_cap = lambda limit: 2
+    try:
+        store = MessageStore(tmp_path / "lcm.db")
+        try:
+            for idx in range(4):
+                store.append("s", {"role": "assistant", "content": f"needle filler filler filler {idx}"})
+            store.append("s", {"role": "assistant", "content": "needle"})
+            results = store.search("needle", session_id="s", limit=1, sort="relevance")
+            assert results[0]["content"] == "needle"
+        finally:
+            store.close()
+    finally:
+        store_module.compute_search_candidate_cap = original
+
+def test_count_tokens_skips_lru_for_large_strings(monkeypatch):
+    import hermes_lcm.tokens as tokens
+
+    assert tokens._MAX_CACHEABLE_TOKEN_TEXT_CHARS == 32_768
+
+    tokens._count_tokens_cached.cache_clear()
+    monkeypatch.setattr(tokens, "_get_encoder", lambda: None)
+    large = "x" * 32_769
+
+    first = tokens.count_tokens(large)
+    second = tokens.count_tokens(large)
+
+    assert first == second
+    assert tokens._count_tokens_cached.cache_info().currsize == 0

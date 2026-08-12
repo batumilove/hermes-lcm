@@ -4,7 +4,6 @@ Patches the plugin modules so they can be imported both as a package
 (relative imports during plugin loading) and directly during testing.
 """
 import sys
-import types
 import importlib
 from pathlib import Path
 
@@ -43,6 +42,7 @@ if pkg_name not in sys.modules:
             sub_mod = importlib.util.module_from_spec(sub_spec)
             sub_mod.__package__ = pkg_name
             sys.modules[sub_name] = sub_mod
+            setattr(mod, py_file.stem, sub_mod)
             try:
                 sub_spec.loader.exec_module(sub_mod)
             except Exception:
