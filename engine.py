@@ -3111,6 +3111,7 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
                 _SESSION_END_BUSY_TIMEOUT_MS,
                 write_lock=getattr(self._store, "_write_lock", None),
                 write_lock_timeout_ms=_SESSION_END_PROCESS_WRITE_TIMEOUT_MS,
+                write_lock_operation="session_end_ingest_finalize",
             ):
                 try:
                     # Best-effort final flush. Keep this path bounded because

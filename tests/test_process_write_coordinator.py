@@ -138,6 +138,20 @@ def test_temporary_busy_timeout_accepts_separate_coordinator_bound(
     assert attempted_timeouts == [0.2]
 
 
+def test_temporary_busy_timeout_attributes_semantic_operation(tmp_path):
+    coordinator = sqlite_util.process_sqlite_write_lock(tmp_path / "lcm.db")
+
+    with sqlite_util._temporary_sqlite_busy_timeout(
+        [],
+        50,
+        write_lock=coordinator,
+        write_lock_operation="session_end_ingest_finalize",
+    ):
+        assert coordinator.owner_snapshot()["operation"] == "session_end_ingest_finalize"
+
+    assert coordinator.owner_snapshot() == {}
+
+
 def test_process_write_lock_wait_is_bounded(tmp_path, monkeypatch):
     coordinator = sqlite_util.process_sqlite_write_lock(tmp_path / "lcm.db")
     holder_entered = threading.Event()

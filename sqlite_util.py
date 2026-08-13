@@ -252,6 +252,7 @@ def _temporary_sqlite_busy_timeout(
     *,
     write_lock: Any = None,
     write_lock_timeout_ms: int | None = None,
+    write_lock_operation: str | None = None,
 ) -> Iterator[None]:
     """Temporarily bound lock waits while excluding same-process writers."""
     bounded_timeout = max(0, int(timeout_ms))
@@ -263,7 +264,9 @@ def _temporary_sqlite_busy_timeout(
     lock_context = nullcontext()
     if write_lock is not None:
         lock_context = _acquire_process_write_lock(
-            write_lock, timeout_seconds=bounded_write_lock_timeout / 1000.0
+            write_lock,
+            timeout_seconds=bounded_write_lock_timeout / 1000.0,
+            operation=write_lock_operation,
         )
     with lock_context:
         originals: list[tuple[sqlite3.Connection, int]] = []
@@ -282,10 +285,15 @@ def _temporary_sqlite_busy_timeout(
 
 @contextmanager
 def _acquire_process_write_lock(
-    write_lock: Any, *, timeout_seconds: float
+    write_lock: Any, *, timeout_seconds: float, operation: str | None = None
 ) -> Iterator[None]:
     """Acquire a coordinator using the caller's existing bounded wait budget."""
-    if not write_lock.acquire(timeout=max(0.0, float(timeout_seconds))):
+    acquire_kwargs: dict[str, Any] = {
+        "timeout": max(0.0, float(timeout_seconds))
+    }
+    if operation is not None:
+        acquire_kwargs["operation"] = operation
+    if not write_lock.acquire(**acquire_kwargs):
         raise sqlite3.OperationalError(
             "database is locked: timed out waiting for process-wide SQLite writer"
             + _optional_timeout_detail(write_lock)

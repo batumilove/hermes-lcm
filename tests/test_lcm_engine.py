@@ -12292,6 +12292,35 @@ class TestSessionRollover:
         assert "LCM session-end ingest/finalize skipped due to SQLite lock" not in caplog.text
         assert len(engine._store.get_session_messages("test-session")) == 1
 
+    def test_on_session_end_attributes_its_process_writer_hold(self, engine, monkeypatch):
+        engine.on_session_start("test-session", platform="discord")
+        ingest_entered = threading.Event()
+        release_ingest = threading.Event()
+
+        def hold_inside_ingest(messages):
+            del messages
+            ingest_entered.set()
+            assert release_ingest.wait(timeout=2.0)
+
+        monkeypatch.setattr(engine, "_ingest_messages", hold_inside_ingest)
+        worker = threading.Thread(
+            target=engine.on_session_end,
+            args=("test-session", [{"role": "user", "content": "hello"}]),
+            name="session-end-attribution-probe",
+        )
+        worker.start()
+        try:
+            assert ingest_entered.wait(timeout=1.0)
+            assert engine._store._write_lock.owner_snapshot()["operation"] == (
+                "session_end_ingest_finalize"
+            )
+        finally:
+            release_ingest.set()
+            worker.join(timeout=2.0)
+
+        assert not worker.is_alive()
+        assert engine._store._write_lock.owner_snapshot() == {}
+
     def test_on_session_end_reraises_non_lock_errors(self, engine, monkeypatch):
         engine.on_session_start("test-session", platform="discord")
 
