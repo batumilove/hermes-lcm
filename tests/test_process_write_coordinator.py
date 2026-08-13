@@ -117,6 +117,27 @@ def test_temporary_busy_timeout_uses_requested_bound_for_coordinator(
     assert attempted_timeouts == [0.05]
 
 
+def test_temporary_busy_timeout_accepts_separate_coordinator_bound(
+    tmp_path, monkeypatch
+):
+    coordinator = sqlite_util.process_sqlite_write_lock(tmp_path / "lcm.db")
+    attempted_timeouts = []
+
+    def reject_acquire(*, timeout):
+        attempted_timeouts.append(timeout)
+        return False
+
+    monkeypatch.setattr(coordinator, "acquire", reject_acquire)
+
+    with pytest.raises(sqlite3.OperationalError, match="process-wide SQLite writer"):
+        with sqlite_util._temporary_sqlite_busy_timeout(
+            [], 50, write_lock=coordinator, write_lock_timeout_ms=200
+        ):
+            pass
+
+    assert attempted_timeouts == [0.2]
+
+
 def test_process_write_lock_wait_is_bounded(tmp_path, monkeypatch):
     coordinator = sqlite_util.process_sqlite_write_lock(tmp_path / "lcm.db")
     holder_entered = threading.Event()

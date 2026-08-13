@@ -133,6 +133,7 @@ from . import tools as lcm_tools
 logger = logging.getLogger(__name__)
 
 _SESSION_END_BUSY_TIMEOUT_MS = 50
+_SESSION_END_PROCESS_WRITE_TIMEOUT_MS = 200
 _CODEX_GPT55_COMPACTION_THRESHOLD = 0.85
 
 # Auto-focus topic derivation: infer a compact focus hint from the most recent
@@ -3109,6 +3110,7 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
                 ],
                 _SESSION_END_BUSY_TIMEOUT_MS,
                 write_lock=getattr(self._store, "_write_lock", None),
+                write_lock_timeout_ms=_SESSION_END_PROCESS_WRITE_TIMEOUT_MS,
             ):
                 try:
                     # Best-effort final flush. Keep this path bounded because
