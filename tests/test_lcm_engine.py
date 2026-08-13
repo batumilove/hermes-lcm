@@ -12369,6 +12369,296 @@ class TestSessionRollover:
         assert state is not None
         assert state.last_finalized_session_id == "test-session"
 
+    def test_duplicate_session_end_callbacks_eventually_persist_exactly_once(
+        self,
+        engine,
+    ):
+        engine.on_session_start("test-session", platform="discord")
+        holder_entered = threading.Event()
+        release_holder = threading.Event()
+        final_messages = [{"role": "user", "content": "duplicate-safe final message"}]
+
+        def hold_writer():
+            with engine._store._write_lock.attributed("duplicate_callback_writer"):
+                holder_entered.set()
+                assert release_holder.wait(timeout=2.0)
+
+        holder = threading.Thread(target=hold_writer, name="duplicate-callback-writer")
+        holder.start()
+        assert holder_entered.wait(timeout=1.0)
+
+        engine.on_session_end("test-session", final_messages)
+        engine.on_session_end("test-session", final_messages)
+        release_holder.set()
+        holder.join(timeout=1.0)
+        assert not holder.is_alive()
+
+        deadline = time.monotonic() + 2.0
+        while time.monotonic() < deadline:
+            persisted = engine._store.get_session_messages("test-session")
+            state = engine._lifecycle.get_by_conversation(engine._conversation_id)
+            if (
+                [message.get("content") for message in persisted]
+                == ["duplicate-safe final message"]
+                and state is not None
+                and state.last_finalized_session_id == "test-session"
+            ):
+                break
+            time.sleep(0.01)
+
+        persisted = engine._store.get_session_messages("test-session")
+        state = engine._lifecycle.get_by_conversation(engine._conversation_id)
+        assert [message.get("content") for message in persisted] == [
+            "duplicate-safe final message"
+        ]
+        assert state is not None
+        assert state.last_finalized_session_id == "test-session"
+
+    def test_extending_duplicate_session_end_callbacks_persist_latest_payload_once(
+        self,
+        engine,
+    ):
+        engine.on_session_start("test-session", platform="discord")
+        holder_entered = threading.Event()
+        release_holder = threading.Event()
+        first = [{"role": "user", "content": "one"}]
+        latest = first + [{"role": "assistant", "content": "two"}]
+
+        def hold_writer():
+            with engine._store._write_lock.attributed("extending_duplicate_writer"):
+                holder_entered.set()
+                assert release_holder.wait(timeout=2.0)
+
+        holder = threading.Thread(target=hold_writer, name="extending-duplicate-writer")
+        holder.start()
+        assert holder_entered.wait(timeout=1.0)
+        engine.on_session_end("test-session", first)
+        engine.on_session_end("test-session", latest)
+        release_holder.set()
+        holder.join(timeout=1.0)
+        assert not holder.is_alive()
+
+        deadline = time.monotonic() + 2.0
+        while time.monotonic() < deadline:
+            persisted = engine._store.get_session_messages("test-session")
+            state = engine._lifecycle.get_by_conversation(engine._conversation_id)
+            if (
+                [message.get("content") for message in persisted] == ["one", "two"]
+                and state is not None
+                and state.last_finalized_session_id == "test-session"
+            ):
+                break
+            time.sleep(0.01)
+
+        persisted = engine._store.get_session_messages("test-session")
+        assert [message.get("content") for message in persisted] == ["one", "two"]
+
+    def test_shutdown_boundedly_drains_session_end_after_writer_release(
+        self,
+        tmp_path,
+    ):
+        config = LCMConfig(database_path=str(tmp_path / "shutdown-drain.db"))
+        ending = LCMEngine(config=config)
+        ending.on_session_start("shutdown-session", platform="discord")
+        holder_entered = threading.Event()
+        release_holder = threading.Event()
+
+        def hold_writer():
+            with ending._store._write_lock.attributed("shutdown_drain_writer"):
+                holder_entered.set()
+                assert release_holder.wait(timeout=2.0)
+
+        holder = threading.Thread(target=hold_writer, name="shutdown-drain-writer")
+        holder.start()
+        assert holder_entered.wait(timeout=1.0)
+        ending.on_session_end(
+            "shutdown-session",
+            [{"role": "user", "content": "shutdown-drained final message"}],
+        )
+        release_holder.set()
+        holder.join(timeout=1.0)
+        assert not holder.is_alive()
+
+        started = time.monotonic()
+        ending.shutdown()
+        assert time.monotonic() - started < 1.0
+
+        restarted = LCMEngine(config=config)
+        try:
+            restarted.on_session_start("shutdown-session", platform="discord")
+            persisted = restarted._store.get_session_messages("shutdown-session")
+            state = restarted._lifecycle.get_by_conversation(restarted._conversation_id)
+            assert [message.get("content") for message in persisted] == [
+                "shutdown-drained final message"
+            ]
+            assert state is not None
+            assert state.last_finalized_session_id == "shutdown-session"
+        finally:
+            restarted.shutdown()
+
+    def test_pending_session_end_recovers_exactly_once_after_engine_restart(
+        self,
+        tmp_path,
+    ):
+        config = LCMConfig(database_path=str(tmp_path / "restart-recovery.db"))
+        ending = LCMEngine(config=config)
+        ending.on_session_start("restart-session", platform="discord")
+        holder_entered = threading.Event()
+        release_holder = threading.Event()
+
+        def hold_writer():
+            with ending._store._write_lock.attributed("restart_recovery_writer"):
+                holder_entered.set()
+                release_holder.wait()
+
+        holder = threading.Thread(target=hold_writer, name="restart-recovery-writer")
+        holder.start()
+        assert holder_entered.wait(timeout=1.0)
+        ending.on_session_end(
+            "restart-session",
+            [{"role": "user", "content": "restart-recovered final message"}],
+        )
+
+        shutdown_done = threading.Event()
+        shutdown_errors = []
+
+        def shut_down_ending_engine():
+            try:
+                ending.shutdown()
+            except BaseException as exc:
+                shutdown_errors.append(exc)
+            finally:
+                shutdown_done.set()
+
+        shutdown_thread = threading.Thread(
+            target=shut_down_ending_engine,
+            name="restart-recovery-shutdown",
+        )
+        shutdown_thread.start()
+        shutdown_was_bounded = shutdown_done.wait(timeout=1.0)
+
+        # Always release and join both test-owned threads before asserting the
+        # protected bound, so RED cannot leak work into later tests.
+        release_holder.set()
+        holder.join(timeout=1.0)
+        shutdown_thread.join(timeout=1.0)
+        assert not holder.is_alive()
+        assert not shutdown_thread.is_alive()
+        assert shutdown_errors == []
+        assert shutdown_was_bounded
+
+        restarted = LCMEngine(config=config)
+        try:
+            restarted.on_session_start("restart-session", platform="discord")
+            deadline = time.monotonic() + 2.0
+            while time.monotonic() < deadline:
+                persisted = restarted._store.get_session_messages("restart-session")
+                state = restarted._lifecycle.get_by_conversation(
+                    restarted._conversation_id
+                )
+                if (
+                    [message.get("content") for message in persisted]
+                    == ["restart-recovered final message"]
+                    and state is not None
+                    and state.last_finalized_session_id == "restart-session"
+                ):
+                    break
+                time.sleep(0.01)
+
+            persisted = restarted._store.get_session_messages("restart-session")
+            state = restarted._lifecycle.get_by_conversation(
+                restarted._conversation_id
+            )
+            assert [message.get("content") for message in persisted] == [
+                "restart-recovered final message"
+            ]
+            assert state is not None
+            assert state.last_finalized_session_id == "restart-session"
+        finally:
+            restarted.shutdown()
+
+    def test_deferred_session_end_retries_transient_lifecycle_failure_without_duplicate_ingest(
+        self,
+        engine,
+        monkeypatch,
+    ):
+        engine.on_session_start("test-session", platform="discord")
+        original_finalize = engine._lifecycle.finalize_session
+        attempts = 0
+
+        def fail_once(*args, **kwargs):
+            nonlocal attempts
+            attempts += 1
+            if attempts == 1:
+                raise RuntimeError("transient lifecycle failure")
+            return original_finalize(*args, **kwargs)
+
+        monkeypatch.setattr(engine._lifecycle, "finalize_session", fail_once)
+        intent = engine._persist_session_end_intent(
+            "test-session",
+            [{"role": "user", "content": "persist exactly once"}],
+        )
+        engine._schedule_session_end_drain()
+
+        deadline = time.monotonic() + 2.0
+        while time.monotonic() < deadline and intent.exists():
+            time.sleep(0.01)
+
+        persisted = engine._store.get_session_messages("test-session")
+        state = engine._lifecycle.get_by_conversation(engine._conversation_id)
+        assert not intent.exists()
+        assert attempts >= 2
+        assert [message.get("content") for message in persisted] == [
+            "persist exactly once"
+        ]
+        assert state is not None
+        assert state.last_finalized_session_id == "test-session"
+
+    def test_deferred_session_end_retries_when_writer_outlives_first_drain_attempt(
+        self,
+        engine,
+    ):
+        engine.on_session_start("test-session", platform="discord")
+        holder_entered = threading.Event()
+        release_holder = threading.Event()
+
+        def hold_writer():
+            with engine._store._write_lock.attributed("long_retry_writer"):
+                holder_entered.set()
+                assert release_holder.wait(timeout=4.0)
+
+        holder = threading.Thread(target=hold_writer, name="long-retry-writer")
+        holder.start()
+        assert holder_entered.wait(timeout=1.0)
+        engine.on_session_end(
+            "test-session",
+            [{"role": "user", "content": "retry after coordinator timeout"}],
+        )
+        time.sleep(2.2)
+        release_holder.set()
+        holder.join(timeout=1.0)
+        assert not holder.is_alive()
+
+        deadline = time.monotonic() + 2.0
+        while time.monotonic() < deadline:
+            persisted = engine._store.get_session_messages("test-session")
+            state = engine._lifecycle.get_by_conversation(engine._conversation_id)
+            if (
+                persisted
+                and state is not None
+                and state.last_finalized_session_id == "test-session"
+            ):
+                break
+            time.sleep(0.01)
+
+        persisted = engine._store.get_session_messages("test-session")
+        state = engine._lifecycle.get_by_conversation(engine._conversation_id)
+        assert [message.get("content") for message in persisted] == [
+            "retry after coordinator timeout"
+        ]
+        assert state is not None
+        assert state.last_finalized_session_id == "test-session"
+
     def test_on_session_end_reraises_non_lock_errors(self, engine, monkeypatch):
         engine.on_session_start("test-session", platform="discord")
 
