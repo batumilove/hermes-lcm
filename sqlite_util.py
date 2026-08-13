@@ -251,13 +251,19 @@ def _temporary_sqlite_busy_timeout(
     timeout_ms: int,
     *,
     write_lock: Any = None,
+    write_lock_timeout_ms: int | None = None,
 ) -> Iterator[None]:
     """Temporarily bound lock waits while excluding same-process writers."""
     bounded_timeout = max(0, int(timeout_ms))
+    bounded_write_lock_timeout = (
+        bounded_timeout
+        if write_lock_timeout_ms is None
+        else max(0, int(write_lock_timeout_ms))
+    )
     lock_context = nullcontext()
     if write_lock is not None:
         lock_context = _acquire_process_write_lock(
-            write_lock, timeout_seconds=bounded_timeout / 1000.0
+            write_lock, timeout_seconds=bounded_write_lock_timeout / 1000.0
         )
     with lock_context:
         originals: list[tuple[sqlite3.Connection, int]] = []

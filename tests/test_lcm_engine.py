@@ -12266,6 +12266,27 @@ class TestSessionRollover:
         assert engine._lifecycle._conn.execute("PRAGMA busy_timeout").fetchone()[0] == 750
         assert "LCM session-end raw-message ingest skipped due to SQLite lock" in caplog.text
 
+    def test_on_session_end_waits_for_short_same_process_writer_overlap(self, engine, caplog):
+        engine.on_session_start("test-session", platform="discord")
+        holder_entered = threading.Event()
+
+        def hold_writer_briefly():
+            with engine._store._write_lock.attributed("concurrent_idle_shutdown"):
+                holder_entered.set()
+                time.sleep(0.08)
+
+        holder = threading.Thread(target=hold_writer_briefly, name="short-lcm-writer")
+        holder.start()
+        assert holder_entered.wait(timeout=1.0)
+
+        with caplog.at_level(logging.WARNING):
+            engine.on_session_end("test-session", [{"role": "user", "content": "hello"}])
+        holder.join(timeout=1.0)
+
+        assert not holder.is_alive()
+        assert "LCM session-end ingest/finalize skipped due to SQLite lock" not in caplog.text
+        assert len(engine._store.get_session_messages("test-session")) == 1
+
     def test_on_session_end_reraises_non_lock_errors(self, engine, monkeypatch):
         engine.on_session_start("test-session", platform="discord")
 
