@@ -12321,6 +12321,54 @@ class TestSessionRollover:
         assert not worker.is_alive()
         assert engine._store._write_lock.owner_snapshot() == {}
 
+    def test_on_session_end_eventually_persists_after_long_same_process_writer_overlap(
+        self,
+        engine,
+    ):
+        engine.on_session_start("test-session", platform="discord")
+        holder_entered = threading.Event()
+        release_holder = threading.Event()
+        final_messages = [{"role": "user", "content": "durable final message"}]
+
+        def hold_writer():
+            with engine._store._write_lock.attributed("timed_out_compression_writer"):
+                holder_entered.set()
+                assert release_holder.wait(timeout=2.0)
+
+        holder = threading.Thread(target=hold_writer, name="long-lcm-writer")
+        holder.start()
+        assert holder_entered.wait(timeout=1.0)
+
+        started = time.monotonic()
+        engine.on_session_end("test-session", final_messages)
+        elapsed = time.monotonic() - started
+
+        assert elapsed < 0.75
+        assert engine._store.get_session_messages("test-session") == []
+
+        release_holder.set()
+        holder.join(timeout=1.0)
+        assert not holder.is_alive()
+
+        deadline = time.monotonic() + 2.0
+        while time.monotonic() < deadline:
+            persisted = engine._store.get_session_messages("test-session")
+            state = engine._lifecycle.get_by_conversation(engine._conversation_id)
+            if (
+                len(persisted) == 1
+                and persisted[0].get("content") == "durable final message"
+                and state is not None
+                and state.last_finalized_session_id == "test-session"
+            ):
+                break
+            time.sleep(0.01)
+
+        persisted = engine._store.get_session_messages("test-session")
+        state = engine._lifecycle.get_by_conversation(engine._conversation_id)
+        assert [message.get("content") for message in persisted] == ["durable final message"]
+        assert state is not None
+        assert state.last_finalized_session_id == "test-session"
+
     def test_on_session_end_reraises_non_lock_errors(self, engine, monkeypatch):
         engine.on_session_start("test-session", platform="discord")
 
