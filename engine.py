@@ -108,6 +108,7 @@ from .session_end_pending import (
     iter_session_end_intents,
     load_session_end_intent,
     persist_session_end_intent,
+    quarantine_session_end_intent,
     remove_session_end_intent,
 )
 from .message_analysis import (
@@ -431,6 +432,7 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
         self._session_end_drain_thread: threading.Thread | None = None
         self._session_end_drain_done = threading.Event()
         self._session_end_drain_done.set()
+        self._session_end_drain_rescan = threading.Event()
         self._session_end_pending_failures = 0
         # Lifecycle metrics — registered *after* __init__ succeeds so a
         # construction failure cannot inflate live counts.
@@ -2895,10 +2897,16 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
 
     def _drain_pending_session_ends(self, owner: _SharedStorageOwner) -> None:
         try:
+            self._session_end_drain_rescan.clear()
             while True:
                 pending = tuple(iter_session_end_intents(self._store.db_path))
                 if not pending:
-                    return
+                    with self._session_end_drain_lock:
+                        if self._session_end_drain_rescan.is_set():
+                            self._session_end_drain_rescan.clear()
+                            continue
+                        self._session_end_drain_thread = None
+                        return
                 made_progress = False
                 try:
                     with _acquire_process_write_lock(
@@ -2909,6 +2917,16 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
                         for path in pending:
                             try:
                                 self._drain_one_session_end_intent(path)
+                                made_progress = True
+                            except (ValueError, UnicodeError) as exc:
+                                quarantined = quarantine_session_end_intent(path)
+                                self._session_end_pending_failures += 1
+                                logger.error(
+                                    "LCM quarantined invalid deferred session-end intent %s as %s: %s",
+                                    path,
+                                    quarantined,
+                                    exc,
+                                )
                                 made_progress = True
                             except Exception:
                                 self._session_end_pending_failures += 1
@@ -2928,6 +2946,7 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
 
     def _schedule_session_end_drain(self) -> None:
         with self._session_end_drain_lock:
+            self._session_end_drain_rescan.set()
             thread = self._session_end_drain_thread
             if thread is not None and thread.is_alive():
                 return

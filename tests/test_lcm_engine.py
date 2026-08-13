@@ -12572,6 +12572,73 @@ class TestSessionRollover:
         finally:
             restarted.shutdown()
 
+    def test_corrupt_pending_session_end_is_quarantined_without_retry_loop(
+        self,
+        engine,
+        monkeypatch,
+    ):
+        from hermes_lcm.session_end_pending import pending_session_end_dir
+
+        directory = pending_session_end_dir(engine._store.db_path)
+        directory.mkdir(parents=True, exist_ok=True)
+        corrupt = directory / "corrupt.json"
+        corrupt.write_text("{not-json", encoding="utf-8")
+        calls = 0
+        original = engine._drain_one_session_end_intent
+
+        def counted(path):
+            nonlocal calls
+            calls += 1
+            return original(path)
+
+        monkeypatch.setattr(engine, "_drain_one_session_end_intent", counted)
+        engine._schedule_session_end_drain()
+        assert engine._session_end_drain_done.wait(timeout=1.0)
+        assert calls == 1
+        assert not corrupt.exists()
+        assert list(directory.glob("*.invalid"))
+
+    def test_session_end_drain_does_not_lose_wakeup_at_empty_exit(
+        self,
+        engine,
+        monkeypatch,
+    ):
+        from hermes_lcm.session_end_pending import iter_session_end_intents
+
+        original_iter = iter_session_end_intents
+        empty_scan_entered = threading.Event()
+        release_empty_scan = threading.Event()
+        scans = 0
+
+        def gated_iter(db_path):
+            nonlocal scans
+            result = tuple(original_iter(db_path))
+            scans += 1
+            if scans == 1 and not result:
+                empty_scan_entered.set()
+                assert release_empty_scan.wait(timeout=2.0)
+            return result
+
+        monkeypatch.setattr("hermes_lcm.engine.iter_session_end_intents", gated_iter)
+        engine._schedule_session_end_drain()
+        assert empty_scan_entered.wait(timeout=1.0)
+        engine._persist_session_end_intent(
+            "test-session",
+            [{"role": "user", "content": "published at worker exit"}],
+        )
+        engine._schedule_session_end_drain()
+        release_empty_scan.set()
+
+        deadline = time.monotonic() + 2.0
+        while time.monotonic() < deadline:
+            if engine._store.get_session_messages("test-session"):
+                break
+            time.sleep(0.01)
+        assert [
+            message.get("content")
+            for message in engine._store.get_session_messages("test-session")
+        ] == ["published at worker exit"]
+
     def test_deferred_session_end_retries_transient_lifecycle_failure_without_duplicate_ingest(
         self,
         engine,
