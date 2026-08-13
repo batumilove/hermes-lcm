@@ -140,3 +140,15 @@ def iter_session_end_intents(db_path: str | Path) -> Iterable[Path]:
 def remove_session_end_intent(path: Path) -> None:
     path.unlink(missing_ok=True)
     _fsync_directory(path.parent)
+
+
+def quarantine_session_end_intent(path: Path) -> Path:
+    """Atomically exclude a permanently invalid intent from normal discovery."""
+    destination = path.with_suffix(path.suffix + ".invalid")
+    counter = 0
+    while destination.exists():
+        counter += 1
+        destination = path.with_suffix(path.suffix + f".{counter}.invalid")
+    os.replace(path, destination)
+    _fsync_directory(path.parent)
+    return destination
