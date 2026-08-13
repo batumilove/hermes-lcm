@@ -29,6 +29,7 @@ __all__ = [
     "complete_lifecycle_state_store_close",
     "fail_lifecycle_state_store_close",
     "record_storage_bind",
+    "record_deferred_session_finalization",
     "configure",
     "configure_from_host_policy",
     "snapshot",
@@ -211,6 +212,20 @@ def record_storage_bind() -> None:
         _TOTALS["storage_binds_total"] += 1
 
 
+def record_deferred_session_finalization(outcome: str) -> None:
+    if not _enabled():
+        return
+    key = {
+        "deferred": "session_finalizations_deferred_total",
+        "completed": "session_finalizations_deferred_completed_total",
+        "exhausted": "session_finalizations_deferred_exhausted_total",
+    }.get(outcome)
+    if key is None:
+        raise ValueError(f"unknown deferred finalization outcome: {outcome}")
+    with _LOCK:
+        _TOTALS[key] += 1
+
+
 def _registered_unique_engine_count() -> int:
     """Count unique currently bound engines without exposing registry keys."""
     if not _enabled():
@@ -271,6 +286,9 @@ def snapshot() -> dict[str, dict[str, int]]:
             "lifecycle_state_store_close_idempotent_total",
             "lifecycle_state_store_close_failures_total",
             "storage_binds_total",
+            "session_finalizations_deferred_total",
+            "session_finalizations_deferred_completed_total",
+            "session_finalizations_deferred_exhausted_total",
         ):
             values[key] = int(_TOTALS[key]) if is_enabled else 0
 

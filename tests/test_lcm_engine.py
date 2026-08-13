@@ -12203,7 +12203,7 @@ class TestSessionRollover:
         with caplog.at_level(logging.WARNING):
             engine.on_session_end("test-session", [{"role": "user", "content": "hello"}])
 
-        assert "LCM session-end raw-message ingest skipped due to SQLite lock" in caplog.text
+        assert "LCM session-end ingest/finalize deferred due to SQLite lock" in caplog.text
 
     def test_on_session_end_fails_open_when_ingest_is_interrupted(self, engine, monkeypatch, caplog):
         engine.on_session_start("test-session", platform="discord")
@@ -12229,7 +12229,7 @@ class TestSessionRollover:
         with caplog.at_level(logging.WARNING):
             engine.on_session_end("test-session", [{"role": "user", "content": "hello"}])
 
-        assert "LCM session-end lifecycle finalization skipped due to SQLite lock" in caplog.text
+        assert "LCM session-end ingest/finalize deferred due to SQLite lock" in caplog.text
 
     def test_on_session_end_fails_open_when_finalize_is_interrupted(self, engine, monkeypatch, caplog):
         engine.on_session_start("test-session", platform="discord")
@@ -12264,7 +12264,7 @@ class TestSessionRollover:
         assert elapsed < 0.3
         assert engine._store._conn.execute("PRAGMA busy_timeout").fetchone()[0] == 750
         assert engine._lifecycle._conn.execute("PRAGMA busy_timeout").fetchone()[0] == 750
-        assert "LCM session-end raw-message ingest skipped due to SQLite lock" in caplog.text
+        assert "LCM session-end ingest/finalize deferred due to SQLite lock" in caplog.text
 
     def test_on_session_end_waits_for_short_same_process_writer_overlap(self, engine, caplog):
         engine.on_session_start("test-session", platform="discord")
@@ -12284,7 +12284,7 @@ class TestSessionRollover:
         holder.join(timeout=1.0)
 
         assert not holder.is_alive()
-        assert "LCM session-end ingest/finalize skipped due to SQLite lock" not in caplog.text
+        assert "LCM session-end ingest/finalize deferred due to SQLite lock" not in caplog.text
         assert len(engine._store.get_session_messages("test-session")) == 1
 
     def test_on_session_end_attributes_its_process_writer_hold(self, engine, monkeypatch):

@@ -25,6 +25,7 @@ from .codex_routing import (
 from .config import LCMConfig
 from .dag import SummaryDAG, SummaryNode
 from .diagnostics import _enforce_state_db_containment
+from .deferred_session_finalization import DeferredSessionFinalizationCoordinator
 from .engine_registry import (
     _ACTIVE_ENGINE_REGISTRY_LOCK,
     _ACTIVE_ENGINES_BY_CONVERSATION_ID,
@@ -157,6 +158,11 @@ class _SharedStorageOwner:
         self._lock = threading.Lock()
         self._references = 1
         self._closed = False
+        self._finalization_coordinator = DeferredSessionFinalizationCoordinator(
+            self,
+            writer_timeout_ms=_SESSION_END_PROCESS_WRITE_TIMEOUT_MS,
+            busy_timeout_ms=_SESSION_END_BUSY_TIMEOUT_MS,
+        )
 
     def acquire(self) -> "_SharedStorageOwner":
         with self._lock:
@@ -173,6 +179,10 @@ class _SharedStorageOwner:
             if self._references != 0:
                 return
             self._closed = True
+        if not self._finalization_coordinator.shutdown():
+            raise RuntimeError(
+                "LCM deferred session-end worker remained active; storage retained open"
+            )
         first_error: Exception | None = None
         for helper in (self.store, self.dag, self.lifecycle):
             try:
@@ -3102,6 +3112,7 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
                 current_session_bypasses=current_session_bypasses,
             )
             return
+        raw_ingest_completed = False
         try:
             with _temporary_sqlite_busy_timeout(
                 [
@@ -3114,6 +3125,13 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
                 write_lock_operation="session_end_ingest_finalize",
             ):
                 try:
+                    # Probe SQLite write availability before running ingest
+                    # protection/tokenization.  When an external writer holds
+                    # the database, those CPU-heavy preparations cannot commit
+                    # and would otherwise consume most of the bounded callback
+                    # budget before the eventual lock error.
+                    self._store._conn.execute("BEGIN IMMEDIATE")
+                    self._store._conn.execute("ROLLBACK")
                     # Best-effort final flush. Keep this path bounded because
                     # host gateways call session-end hooks from lifecycle paths
                     # that must not wait through SQLite's normal busy timeout.
@@ -3126,13 +3144,9 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
                     return
                 except Exception as exc:
                     if _is_sqlite_locked_error(exc):
-                        logger.warning(
-                            "LCM session-end raw-message ingest skipped due to SQLite lock after short wait; "
-                            "final messages may be absent from the plugin-local store: %s",
-                            exc,
-                        )
-                        return
+                        raise
                     raise
+                raw_ingest_completed = True
 
                 try:
                     self._lifecycle.finalize_session(
@@ -3148,20 +3162,46 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
                     return
                 except Exception as exc:
                     if _is_sqlite_locked_error(exc):
-                        logger.warning(
-                            "LCM session-end lifecycle finalization skipped due to SQLite lock after short wait; "
-                            "raw messages were ingested but lifecycle state may be finalized later: %s",
-                            exc,
-                        )
-                        return
+                        raise
                     raise
         except KeyboardInterrupt:
             logger.warning("LCM session-end ingest/finalize interrupted before bounded flush completed")
             return
         except Exception as exc:
             if _is_sqlite_locked_error(exc):
+                conversation_id = str(self._conversation_id or "")
+                if raw_ingest_completed:
+                    suffix = []
+                else:
+                    # The synchronous ingest batch is atomic.  Avoid a second
+                    # SQLite read here: under an external writer it would
+                    # inherit the caller connection's normal busy timeout and
+                    # defeat the bounded session-end callback.  The deferred
+                    # worker reconciles any already-stored prefix before append.
+                    suffix = messages
+                kept = [
+                    message
+                    for message in suffix
+                    if not self._matches_ignore_message_patterns(message)
+                ]
+                protected_messages = protect_messages_for_ingest(
+                    kept,
+                    session_id=session_id,
+                    config=self._config,
+                    hermes_home=self._hermes_home,
+                )
+                accepted = self._storage_owner._finalization_coordinator.enqueue(
+                    session_id=session_id,
+                    conversation_id=conversation_id,
+                    source=str(self._session_platform or ""),
+                    protected_messages=protected_messages,
+                    frontier_store_id=int(self._last_compacted_store_id or 0),
+                    ingest_pending=bool(protected_messages),
+                )
                 logger.warning(
-                    "LCM session-end ingest/finalize skipped due to SQLite lock before bounded flush: %s",
+                    "LCM session-end ingest/finalize deferred due to SQLite lock before "
+                    "bounded flush (accepted=%s): %s",
+                    accepted,
                     exc,
                 )
                 return
