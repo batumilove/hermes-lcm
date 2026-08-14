@@ -135,6 +135,49 @@ def test_deferred_recovery_replays_only_uningested_cursor_suffix(tmp_path):
         engine.shutdown()
 
 
+def test_filtered_deferred_suffix_records_receipt_before_lifecycle_failure(
+    tmp_path,
+    monkeypatch,
+):
+    config = LCMConfig(
+        database_path=str(tmp_path / "filtered-receipt.db"),
+        ignore_message_patterns=["^DROP_DEFERRED_SUFFIX$"],
+    )
+    engine = LCMEngine(config=config)
+    engine.on_session_start("filtered-session", platform="telegram")
+    session_id = engine._session_id
+    conversation_id = engine._conversation_id
+    original_finalize = engine._lifecycle.finalize_session
+    path = engine._persist_session_end_intent(
+        session_id,
+        [{"role": "user", "content": "DROP_DEFERRED_SUFFIX"}],
+        ingest_cursor=0,
+    )
+    digest = load_session_end_intent(path)["intent_sha256"]
+    try:
+        def fail_finalize(*args, **kwargs):
+            raise RuntimeError("lifecycle unavailable after filtered settlement")
+
+        monkeypatch.setattr(engine._lifecycle, "finalize_session", fail_finalize)
+        with pytest.raises(RuntimeError, match="lifecycle unavailable"):
+            engine._drain_one_session_end_intent(path)
+
+        assert engine._store.get_session_messages(session_id) == []
+        assert engine._store.has_session_end_ingest_receipt(digest)
+        assert path.exists()
+
+        monkeypatch.setattr(engine._lifecycle, "finalize_session", original_finalize)
+        engine._drain_one_session_end_intent(path)
+
+        assert engine._store.get_session_messages(session_id) == []
+        state = engine._lifecycle.get_by_conversation(conversation_id)
+        assert state is not None
+        assert state.last_finalized_session_id == session_id
+        assert not path.exists()
+    finally:
+        engine.shutdown()
+
+
 def test_synchronous_raw_commit_records_receipt_before_lifecycle_failure(
     tmp_path,
     monkeypatch,
