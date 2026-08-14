@@ -2867,7 +2867,12 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
         return persist_session_end_intent(self._store.db_path, intent)
 
     def _drain_one_session_end_intent(self, path: Path) -> None:
-        intent = load_session_end_intent(path)
+        try:
+            intent = load_session_end_intent(path)
+        except FileNotFoundError:
+            # Another drain worker may have consumed the same path from a stale
+            # directory snapshot.  The durable intent is already settled.
+            return
         session_id = str(intent["session_id"])
         conversation_id = str(intent["conversation_id"])
         messages = list(intent["messages"])
