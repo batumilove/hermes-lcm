@@ -81,6 +81,28 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 
+def _read_only_sqlite_snapshot_rows(
+    db_path: str | Path,
+    statements: tuple[str, ...],
+) -> list[sqlite3.Row | tuple | None]:
+    """Evaluate fixed diagnostic statements on one committed read snapshot."""
+    path = Path(db_path).expanduser().resolve()
+    connection = sqlite3.connect(
+        f"{path.as_uri()}?mode=ro",
+        uri=True,
+        timeout=5.0,
+    )
+    try:
+        connection.execute("PRAGMA query_only=ON")
+        connection.execute("BEGIN")
+        return [connection.execute(statement).fetchone() for statement in statements]
+    finally:
+        try:
+            connection.rollback()
+        finally:
+            connection.close()
+
+
 def _combined_result_sort_key(result: dict[str, Any], sort: str) -> tuple:
     sort_timestamp = float(result.get("_sort_ts") or 0.0)
     rank = result.get("_sort_rank")
@@ -4743,7 +4765,10 @@ def lcm_doctor(args: Dict[str, Any], **kwargs) -> str:
 
     # 1. Database integrity
     try:
-        result = engine._store.connection.execute("PRAGMA integrity_check").fetchone()
+        (result,) = _read_only_sqlite_snapshot_rows(
+            engine._store.db_path,
+            ("PRAGMA integrity_check",),
+        )
         ok = result and result[0] == "ok"
         checks.append({
             "check": "database_integrity",
@@ -4859,8 +4884,10 @@ def lcm_doctor(args: Dict[str, Any], **kwargs) -> str:
 
     # 2. SQLite storage posture and payload diagnostics
     try:
-        journal_mode_row = engine._store.connection.execute("PRAGMA journal_mode").fetchone()
-        quick_check_row = engine._store.connection.execute("PRAGMA quick_check").fetchone()
+        journal_mode_row, quick_check_row = _read_only_sqlite_snapshot_rows(
+            engine._store.db_path,
+            ("PRAGMA journal_mode", "PRAGMA quick_check"),
+        )
         db_path = Path(engine._store.db_path)
         wal_path = Path(str(db_path) + "-wal")
         checks.append({

@@ -2633,6 +2633,7 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
         messages: List[Dict[str, Any]],
         *,
         conversation_id: str | None = None,
+        raise_on_error: bool = False,
     ) -> Optional[int]:
         try:
             stored_messages = self._store.get_range(
@@ -2640,8 +2641,10 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
                 limit=max(1, len(messages)),
                 conversation_id=conversation_id,
             )
-        except Exception:
+        except Exception as exc:
             logger.debug("LCM session-end prefix check failed", exc_info=True)
+            if raise_on_error:
+                raise RuntimeError("LCM session-end prefix check failed") from exc
             return None
         if not stored_messages:
             return 0
@@ -2658,8 +2661,12 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
                     stored_msg,
                     session_id=session_id,
                 )
-            except Exception:
+            except Exception as exc:
                 logger.debug("LCM session-end prefix compare normalization failed", exc_info=True)
+                if raise_on_error:
+                    raise RuntimeError(
+                        "LCM session-end prefix compare normalization failed"
+                    ) from exc
                 return None
             if message_identity != stored_identity:
                 return None
@@ -2948,9 +2955,10 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
             session_id,
             messages,
             conversation_id=conversation_id,
+            raise_on_error=True,
         )
         if prefix_count is None:
-            raise RuntimeError(
+            raise ValueError(
                 f"pending session-end prefix mismatch for session {session_id!r}"
             )
         suffix = messages[prefix_count:]
