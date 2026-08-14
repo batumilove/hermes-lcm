@@ -12409,6 +12409,28 @@ class TestSessionRollover:
         assert state is not None
         assert state.last_finalized_session_id == "test-session"
 
+    def test_deferred_session_end_intent_consumption_is_idempotent(
+        self,
+        engine,
+    ):
+        engine.on_session_start("test-session", platform="discord")
+        intent = engine._persist_session_end_intent(
+            "test-session",
+            [{"role": "user", "content": "consume once across stale snapshots"}],
+        )
+
+        engine._drain_one_session_end_intent(intent)
+        engine._drain_one_session_end_intent(intent)
+
+        persisted = engine._store.get_session_messages("test-session")
+        state = engine._lifecycle.get_by_conversation(engine._conversation_id)
+        assert [message.get("content") for message in persisted] == [
+            "consume once across stale snapshots"
+        ]
+        assert state is not None
+        assert state.last_finalized_session_id == "test-session"
+        assert not intent.exists()
+
     def test_extending_duplicate_session_end_callbacks_persist_latest_payload_once(
         self,
         engine,
