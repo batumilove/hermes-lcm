@@ -143,6 +143,8 @@ logger = logging.getLogger(__name__)
 
 _SESSION_END_BUSY_TIMEOUT_MS = 50
 _SESSION_END_PROCESS_WRITE_TIMEOUT_MS = 200
+_SESSION_END_DEFERRED_RETRY_BUDGET_SECONDS = 30.0
+_SESSION_END_DEFERRED_RETRY_INTERVAL_SECONDS = 0.05
 _CODEX_GPT55_COMPACTION_THRESHOLD = 0.85
 
 # Auto-focus topic derivation: infer a compact focus hint from the most recent
@@ -2821,6 +2823,8 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
         *,
         source: str,
         conversation_id: str,
+        session_end_intent_sha256: str | None = None,
+        session_end_message_fingerprints: list[str] | None = None,
     ) -> list[int]:
         if not session_id or not suffix:
             return []
@@ -2850,12 +2854,16 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
             [count_message_tokens(msg) for msg in protected_messages],
             source=source,
             conversation_id=conversation_id,
+            session_end_intent_sha256=session_end_intent_sha256,
+            session_end_message_fingerprints=session_end_message_fingerprints,
         )
 
     def _persist_session_end_intent(
         self,
         session_id: str,
         messages: List[Dict[str, Any]],
+        *,
+        ingest_cursor: int | None = None,
     ) -> Path:
         intent = build_session_end_intent(
             session_id=session_id,
@@ -2863,6 +2871,13 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
             source=self._session_platform,
             frontier_store_id=self._last_compacted_store_id,
             messages=copy.deepcopy(messages),
+            ingest_cursor=min(
+                max(
+                    self._ingest_cursor if ingest_cursor is None else ingest_cursor,
+                    0,
+                ),
+                len(messages),
+            ),
         )
         return persist_session_end_intent(self._store.db_path, intent)
 
@@ -2871,6 +2886,53 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
         session_id = str(intent["session_id"])
         conversation_id = str(intent["conversation_id"])
         messages = list(intent["messages"])
+        if int(intent.get("version") or 0) >= 2:
+            intent_sha256 = str(intent["intent_sha256"])
+            message_fingerprints = list(intent["message_fingerprints"])
+            if not self._store.has_session_end_ingest_receipt(intent_sha256):
+                ingest_cursor = max(
+                    int(intent["ingest_cursor"]),
+                    self._store.session_end_ingested_prefix_count(
+                        session_id=session_id,
+                        conversation_id=conversation_id,
+                        message_fingerprints=message_fingerprints,
+                    ),
+                )
+                if (
+                    session_id == self._session_id
+                    and conversation_id == self._conversation_id
+                ):
+                    ingest_cursor = max(ingest_cursor, self._ingest_cursor)
+                ingest_cursor = min(ingest_cursor, len(messages))
+                suffix = messages[ingest_cursor:]
+                if suffix:
+                    self._append_off_current_session_end_suffix(
+                        session_id,
+                        suffix,
+                        source=str(intent.get("source") or ""),
+                        conversation_id=conversation_id,
+                        session_end_intent_sha256=intent_sha256,
+                        session_end_message_fingerprints=message_fingerprints,
+                    )
+                else:
+                    self._store.record_session_end_ingest_receipt(
+                        intent_sha256,
+                        session_id=session_id,
+                        conversation_id=conversation_id,
+                        message_fingerprints=message_fingerprints,
+                    )
+            if (
+                session_id == self._session_id
+                and conversation_id == self._conversation_id
+            ):
+                self._ingest_cursor = max(self._ingest_cursor, len(messages))
+            self._lifecycle.finalize_session(
+                conversation_id,
+                session_id,
+                frontier_store_id=int(intent.get("frontier_store_id") or 0),
+            )
+            remove_session_end_intent(path)
+            return
         prefix_count = self._session_end_store_prefix_count(
             session_id,
             messages,
@@ -2896,6 +2958,8 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
         remove_session_end_intent(path)
 
     def _drain_pending_session_ends(self, owner: _SharedStorageOwner) -> None:
+        started_at = time.monotonic()
+        failed_paths: set[Path] = set()
         try:
             self._session_end_drain_rescan.clear()
             while True:
@@ -2929,17 +2993,31 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
                                 )
                                 made_progress = True
                             except Exception:
-                                self._session_end_pending_failures += 1
-                                logger.warning(
-                                    "LCM deferred session-end intent remains unresolved and will retry: %s",
+                                if path not in failed_paths:
+                                    failed_paths.add(path)
+                                    self._session_end_pending_failures += 1
+                                logger.debug(
+                                    "LCM deferred session-end intent remains unresolved in current retry budget: %s",
                                     path,
                                     exc_info=True,
                                 )
                 except Exception as exc:
                     if not _is_sqlite_locked_error(exc):
                         raise
+                elapsed = time.monotonic() - started_at
+                if elapsed >= _SESSION_END_DEFERRED_RETRY_BUDGET_SECONDS:
+                    retained = tuple(iter_session_end_intents(self._store.db_path))
+                    with self._session_end_drain_lock:
+                        self._session_end_drain_thread = None
+                    logger.warning(
+                        "LCM deferred session-end drain exhausted bounded retry budget; "
+                        "retaining %d unresolved intent(s) after %.3fs",
+                        len(retained),
+                        elapsed,
+                    )
+                    return
                 if not made_progress:
-                    time.sleep(0.05)
+                    time.sleep(_SESSION_END_DEFERRED_RETRY_INTERVAL_SECONDS)
         finally:
             owner.release()
             self._session_end_drain_done.set()
@@ -3249,7 +3327,14 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
                     # Best-effort final flush. Keep this path bounded because
                     # host gateways call session-end hooks from lifecycle paths
                     # that must not wait through SQLite's normal busy timeout.
-                    self._ingest_messages(messages)
+                    pending_intent = load_session_end_intent(pending_intent_path)
+                    self._ingest_messages(
+                        messages,
+                        session_end_intent_sha256=str(pending_intent["intent_sha256"]),
+                        session_end_message_fingerprints=list(
+                            pending_intent["message_fingerprints"]
+                        ),
+                    )
                 except KeyboardInterrupt:
                     logger.warning(
                         "LCM session-end raw-message ingest interrupted; "
@@ -4191,7 +4276,13 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
             redacted_replay_messages.append(redacted_message)
         return redacted_replay_messages
 
-    def _ingest_messages(self, messages: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    def _ingest_messages(
+        self,
+        messages: List[Dict[str, Any]],
+        *,
+        session_end_intent_sha256: str | None = None,
+        session_end_message_fingerprints: list[str] | None = None,
+    ) -> List[Dict[str, Any]]:
         """Persist new messages to the store.
 
         Uses a cursor to track which portion of the current messages list
@@ -4214,6 +4305,13 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
                 "ignored" if self._session_ignored else "stateless",
                 self._session_id,
             )
+            if session_end_intent_sha256:
+                self._store.record_session_end_ingest_receipt(
+                    session_end_intent_sha256,
+                    session_id=self._session_id,
+                    conversation_id=self._conversation_id,
+                    message_fingerprints=session_end_message_fingerprints or [],
+                )
             return self._redact_active_replay_messages(messages)
 
         n = len(messages)
@@ -4303,6 +4401,13 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
         original_new_messages = messages[cursor:] if cursor < n else []
 
         if not new_messages:
+            if session_end_intent_sha256:
+                self._store.record_session_end_ingest_receipt(
+                    session_end_intent_sha256,
+                    session_id=self._session_id,
+                    conversation_id=self._conversation_id,
+                    message_fingerprints=session_end_message_fingerprints or [],
+                )
             cached_replay = self._cached_active_replay_messages(messages)
             self._compression_boundary_ingest_pending = False
             self._compression_boundary_active_placeholder_digest_budget = {}
@@ -4534,6 +4639,13 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
             messages_to_store_with_index = kept
 
         if not messages_to_store_with_index:
+            if session_end_intent_sha256:
+                self._store.record_session_end_ingest_receipt(
+                    session_end_intent_sha256,
+                    session_id=self._session_id,
+                    conversation_id=self._conversation_id,
+                    message_fingerprints=session_end_message_fingerprints or [],
+                )
             self._ingest_cursor = n
             self._compression_boundary_ingest_pending = False
             self._compression_boundary_active_placeholder_digest_budget = {}
@@ -4584,6 +4696,8 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
             estimates,
             source=self._session_platform,
             conversation_id=self._conversation_id,
+            session_end_intent_sha256=session_end_intent_sha256,
+            session_end_message_fingerprints=session_end_message_fingerprints,
         )
         # Rollup staleness is driven by summary-node PUBLICATION
         # (_invalidate_rollups_for_published_node at every add_node site), not by
