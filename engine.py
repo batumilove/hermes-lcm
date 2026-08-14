@@ -2841,6 +2841,17 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
                 continue
             kept.append(msg)
         if not kept:
+            if session_end_intent_sha256 is not None:
+                if session_end_message_fingerprints is None:
+                    raise ValueError(
+                        "session-end receipt fingerprints are required with intent identity"
+                    )
+                self._store.record_session_end_ingest_receipt(
+                    session_end_intent_sha256,
+                    session_id=session_id,
+                    conversation_id=conversation_id,
+                    message_fingerprints=session_end_message_fingerprints,
+                )
             return []
         protected_messages = protect_messages_for_ingest(
             kept,

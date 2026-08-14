@@ -237,6 +237,10 @@ _V5_CORE_TABLE_COLUMNS: dict[str, frozenset[str]] = {
         "last_finalized_at", "debt_updated_at", "last_maintenance_attempt_at",
         "last_rollover_at", "last_reset_at", "updated_at",
     }),
+    "lcm_session_end_ingest_receipts": frozenset({
+        "intent_sha256", "session_id", "conversation_id",
+        "message_fingerprints", "recorded_at",
+    }),
 }
 
 # Core FTS5 virtual tables: presence is enough — their column layout is owned by
