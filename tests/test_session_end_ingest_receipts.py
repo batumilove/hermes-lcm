@@ -3,11 +3,13 @@ import json
 
 import pytest
 
+import hermes_lcm.engine as lcm_engine
 from hermes_lcm.config import LCMConfig
 from hermes_lcm.engine import LCMEngine
 from hermes_lcm.session_end_pending import (
     build_session_end_intent,
     load_session_end_intent,
+    pending_session_end_dir,
     persist_session_end_intent,
 )
 
@@ -67,6 +69,108 @@ def test_loader_preserves_legacy_v1_digest_contract(tmp_path):
 
     assert loaded == payload
     assert "ingest_cursor" not in loaded
+
+
+def test_legacy_prefix_mismatch_is_quarantined_without_replay(tmp_path, monkeypatch):
+    engine = _engine(tmp_path, "legacy-prefix-mismatch")
+    session_id = engine._session_id
+    conversation_id = engine._conversation_id
+    engine._store.append_batch(
+        session_id,
+        [{"role": "user", "content": "already persisted different turn"}],
+        source="telegram",
+        conversation_id=conversation_id,
+    )
+    identity = {
+        "version": 1,
+        "session_id": session_id,
+        "conversation_id": conversation_id,
+        "source": "telegram",
+        "frontier_store_id": 0,
+        "messages": [{"role": "user", "content": "legacy unresolved turn"}],
+    }
+    digest = hashlib.sha256(
+        json.dumps(
+            identity,
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+            default=str,
+        ).encode("utf-8")
+    ).hexdigest()
+    payload = {**identity, "intent_sha256": digest, "created_at": 1.0}
+    directory = pending_session_end_dir(engine._store.db_path)
+    directory.mkdir(parents=True, exist_ok=True)
+    path = directory / "legacy-prefix-mismatch.json"
+    path.write_text(json.dumps(payload, sort_keys=True), encoding="utf-8")
+    original_bytes = path.read_bytes()
+    monkeypatch.setattr(lcm_engine, "_SESSION_END_DEFERRED_RETRY_BUDGET_SECONDS", 0.05)
+    monkeypatch.setattr(lcm_engine, "_SESSION_END_DEFERRED_RETRY_INTERVAL_SECONDS", 0.005)
+
+    try:
+        engine._schedule_session_end_drain()
+        assert engine._session_end_drain_done.wait(timeout=2)
+
+        assert not path.exists()
+        quarantined = list(directory.glob("legacy-prefix-mismatch.json*.invalid"))
+        assert len(quarantined) == 1
+        assert quarantined[0].read_bytes() == original_bytes
+        assert [
+            message.get("content")
+            for message in engine._store.get_session_messages(session_id)
+        ] == ["already persisted different turn"]
+        assert engine._session_end_pending_failures == 1
+    finally:
+        engine.shutdown()
+
+
+def test_legacy_prefix_read_failure_remains_pending(tmp_path, monkeypatch):
+    engine = _engine(tmp_path, "legacy-prefix-read-failure")
+    session_id = engine._session_id
+    conversation_id = engine._conversation_id
+    identity = {
+        "version": 1,
+        "session_id": session_id,
+        "conversation_id": conversation_id,
+        "source": "telegram",
+        "frontier_store_id": 0,
+        "messages": [{"role": "user", "content": "legacy unresolved turn"}],
+    }
+    digest = hashlib.sha256(
+        json.dumps(
+            identity,
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+            default=str,
+        ).encode("utf-8")
+    ).hexdigest()
+    payload = {**identity, "intent_sha256": digest, "created_at": 1.0}
+    directory = pending_session_end_dir(engine._store.db_path)
+    directory.mkdir(parents=True, exist_ok=True)
+    path = directory / "legacy-prefix-read-failure.json"
+    path.write_text(json.dumps(payload, sort_keys=True), encoding="utf-8")
+    original_bytes = path.read_bytes()
+    original_get_range = engine._store.get_range
+
+    def fail_prefix_read(*args, **kwargs):
+        del args, kwargs
+        raise RuntimeError("temporary prefix read failure")
+
+    monkeypatch.setattr(engine._store, "get_range", fail_prefix_read)
+    monkeypatch.setattr(lcm_engine, "_SESSION_END_DEFERRED_RETRY_BUDGET_SECONDS", 0.05)
+    monkeypatch.setattr(lcm_engine, "_SESSION_END_DEFERRED_RETRY_INTERVAL_SECONDS", 0.005)
+
+    try:
+        engine._schedule_session_end_drain()
+        assert engine._session_end_drain_done.wait(timeout=2)
+
+        assert path.read_bytes() == original_bytes
+        assert list(directory.glob("legacy-prefix-read-failure.json*.invalid")) == []
+        assert engine._session_end_pending_failures == 1
+    finally:
+        monkeypatch.setattr(engine._store, "get_range", original_get_range)
+        engine.shutdown()
 
 
 def test_v2_intent_rejects_cursor_outside_immutable_snapshot():

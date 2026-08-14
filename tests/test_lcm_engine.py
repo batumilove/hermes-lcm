@@ -25967,6 +25967,39 @@ class TestEngineTools:
         assert "config_validation" in check_names
         assert all(c["status"] == "pass" for c in result["checks"])
 
+    def test_handle_doctor_integrity_checks_avoid_shared_store_connection(self, engine):
+        original_connection = engine._store._conn
+
+        class GuardedConnection:
+            def __init__(self, wrapped):
+                self._wrapped = wrapped
+
+            def execute(self, sql, *args, **kwargs):
+                normalized = " ".join(str(sql).lower().split())
+                if normalized.startswith("pragma integrity_check") or normalized.startswith(
+                    "pragma quick_check"
+                ):
+                    raise AssertionError("doctor used the shared store connection")
+                return self._wrapped.execute(sql, *args, **kwargs)
+
+            def __getattr__(self, name):
+                return getattr(self._wrapped, name)
+
+        engine._store._conn = GuardedConnection(original_connection)
+        try:
+            result = json.loads(engine.handle_tool_call("lcm_doctor", {}))
+        finally:
+            engine._store._conn = original_connection
+
+        checks = {check["check"]: check for check in result["checks"]}
+        assert checks["database_integrity"] == {
+            "check": "database_integrity",
+            "status": "pass",
+            "detail": "ok",
+        }
+        assert checks["sqlite_storage"]["status"] == "pass"
+        assert checks["sqlite_storage"]["detail"]["quick_check"] == "ok"
+
     def test_handle_doctor_reports_fts_integrity_failures_separately(self, engine, monkeypatch):
         def fake_fts_integrity(_conn, spec):
             if spec.table_name == "nodes_fts":
