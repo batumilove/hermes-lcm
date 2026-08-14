@@ -16,7 +16,8 @@ from pathlib import Path
 from typing import Any, Dict, Iterable
 
 _PENDING_DIR_SUFFIX = "-session-end-pending"
-_INTENT_VERSION = 1
+_INTENT_VERSION = 2
+_SUPPORTED_INTENT_VERSIONS = (1, 2)
 
 
 def _fsync_directory(path: Path) -> None:
@@ -45,6 +46,13 @@ def _canonical_payload(payload: Dict[str, Any]) -> bytes:
     ).encode("utf-8")
 
 
+def session_end_message_fingerprints(messages: list[Dict[str, Any]]) -> list[str]:
+    return [
+        hashlib.sha256(_canonical_payload(message)).hexdigest()
+        for message in messages
+    ]
+
+
 def build_session_end_intent(
     *,
     session_id: str,
@@ -52,7 +60,11 @@ def build_session_end_intent(
     source: str,
     frontier_store_id: int,
     messages: list[Dict[str, Any]],
+    ingest_cursor: int = 0,
 ) -> Dict[str, Any]:
+    cursor = int(ingest_cursor or 0)
+    if cursor < 0 or cursor > len(messages):
+        raise ValueError("pending session-end ingest cursor is out of range")
     identity = {
         "version": _INTENT_VERSION,
         "session_id": str(session_id),
@@ -60,6 +72,8 @@ def build_session_end_intent(
         "source": str(source or ""),
         "frontier_store_id": int(frontier_store_id or 0),
         "messages": messages,
+        "ingest_cursor": cursor,
+        "message_fingerprints": session_end_message_fingerprints(messages),
     }
     digest = hashlib.sha256(_canonical_payload(identity)).hexdigest()
     return {**identity, "intent_sha256": digest, "created_at": time.time()}
@@ -108,25 +122,35 @@ def persist_session_end_intent(db_path: str | Path, intent: Dict[str, Any]) -> P
 
 def load_session_end_intent(path: Path) -> Dict[str, Any]:
     payload = json.loads(path.read_text(encoding="utf-8"))
-    if int(payload.get("version") or 0) != _INTENT_VERSION:
+    version = int(payload.get("version") or 0)
+    if version not in _SUPPORTED_INTENT_VERSIONS:
         raise ValueError("unsupported pending session-end intent version")
     supplied = str(payload.get("intent_sha256") or "")
-    identity = {
-        key: payload.get(key)
-        for key in (
-            "version",
-            "session_id",
-            "conversation_id",
-            "source",
-            "frontier_store_id",
-            "messages",
-        )
-    }
+    identity_keys = [
+        "version",
+        "session_id",
+        "conversation_id",
+        "source",
+        "frontier_store_id",
+        "messages",
+    ]
+    if version >= 2:
+        identity_keys.extend(("ingest_cursor", "message_fingerprints"))
+    identity = {key: payload.get(key) for key in identity_keys}
     expected = hashlib.sha256(_canonical_payload(identity)).hexdigest()
     if not supplied or supplied != expected:
         raise ValueError("pending session-end intent digest mismatch")
     if not isinstance(payload.get("messages"), list):
         raise ValueError("pending session-end intent messages must be a list")
+    if version >= 2:
+        cursor = payload.get("ingest_cursor")
+        if not isinstance(cursor, int) or isinstance(cursor, bool):
+            raise ValueError("pending session-end ingest cursor must be an integer")
+        if cursor < 0 or cursor > len(payload["messages"]):
+            raise ValueError("pending session-end ingest cursor is out of range")
+        fingerprints = payload.get("message_fingerprints")
+        if fingerprints != session_end_message_fingerprints(payload["messages"]):
+            raise ValueError("pending session-end message fingerprints mismatch")
     return payload
 
 

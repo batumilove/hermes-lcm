@@ -12195,7 +12195,7 @@ class TestSessionRollover:
     def test_on_session_end_fails_open_when_ingest_store_is_locked(self, engine, monkeypatch, caplog):
         engine.on_session_start("test-session", platform="discord")
 
-        def locked_ingest(messages):
+        def locked_ingest(messages, **_kwargs):
             raise sqlite3.OperationalError("database is locked")
 
         monkeypatch.setattr(engine, "_ingest_messages", locked_ingest)
@@ -12208,7 +12208,7 @@ class TestSessionRollover:
     def test_on_session_end_fails_open_when_ingest_is_interrupted(self, engine, monkeypatch, caplog):
         engine.on_session_start("test-session", platform="discord")
 
-        def interrupted_ingest(messages):
+        def interrupted_ingest(messages, **_kwargs):
             raise KeyboardInterrupt()
 
         monkeypatch.setattr(engine, "_ingest_messages", interrupted_ingest)
@@ -12292,7 +12292,7 @@ class TestSessionRollover:
         ingest_entered = threading.Event()
         release_ingest = threading.Event()
 
-        def hold_inside_ingest(messages):
+        def hold_inside_ingest(messages, **_kwargs):
             del messages
             ingest_entered.set()
             assert release_ingest.wait(timeout=2.0)
@@ -12724,7 +12724,7 @@ class TestSessionRollover:
     def test_on_session_end_reraises_non_lock_errors(self, engine, monkeypatch):
         engine.on_session_start("test-session", platform="discord")
 
-        def broken_ingest(messages):
+        def broken_ingest(messages, **_kwargs):
             raise RuntimeError("not a lock")
 
         monkeypatch.setattr(engine, "_ingest_messages", broken_ingest)
