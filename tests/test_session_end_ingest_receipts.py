@@ -243,11 +243,18 @@ def test_filtered_deferred_suffix_records_receipt_before_lifecycle_failure(
     tmp_path,
     monkeypatch,
 ):
-    config = LCMConfig(
-        database_path=str(tmp_path / "filtered-receipt.db"),
-        ignore_message_patterns=["^DROP_DEFERRED_SUFFIX$"],
-    )
+    config = LCMConfig(database_path=str(tmp_path / "filtered-receipt.db"))
     engine = LCMEngine(config=config)
+
+    class _ExactIgnorePattern:
+        pattern = "^DROP_DEFERRED_SUFFIX$"
+
+        @staticmethod
+        def search(text, timeout=None):
+            return object() if text == "DROP_DEFERRED_SUFFIX" else None
+
+    # This receipt-ordering test must not depend on the optional regex package.
+    engine._compiled_ignore_message_patterns = [_ExactIgnorePattern()]
     engine.on_session_start("filtered-session", platform="telegram")
     session_id = engine._session_id
     conversation_id = engine._conversation_id
