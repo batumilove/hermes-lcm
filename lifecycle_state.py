@@ -31,7 +31,7 @@ def _synchronized(method):
     """
     @functools.wraps(method)
     def wrapper(self, *args, **kwargs):
-        with self._lock:
+        with self._lock.attributed(method.__name__):
             return method(self, *args, **kwargs)
     return wrapper
 
@@ -709,12 +709,59 @@ class LifecycleStateStore:
         self._conn.commit()
         return self.get_by_conversation(conversation_id)
 
-    @_synchronized
+    def _snapshot_sessions_with_data(self) -> set[str]:
+        """Collect broad message/node membership without holding the writer coordinator."""
+        uri = self.db_path.resolve().as_uri() + "?mode=ro"
+        conn = sqlite3.connect(uri, uri=True)
+        try:
+            tables = {
+                str(row[0])
+                for row in conn.execute(
+                    "SELECT name FROM sqlite_master WHERE type='table'"
+                ).fetchall()
+            }
+            sessions_with_data: set[str] = set()
+            if "messages" in tables:
+                sessions_with_data.update(
+                    str(row[0])
+                    for row in conn.execute(
+                        "SELECT DISTINCT session_id FROM messages"
+                    ).fetchall()
+                    if row[0]
+                )
+            if "summary_nodes" in tables:
+                sessions_with_data.update(
+                    str(row[0])
+                    for row in conn.execute(
+                        "SELECT DISTINCT session_id FROM summary_nodes"
+                    ).fetchall()
+                    if row[0]
+                )
+            return sessions_with_data
+        finally:
+            conn.close()
+
     def prune_empty_sessions(
         self,
         *,
         protected_session_ids: set[str] | list[str] | tuple[str, ...] | None = None,
         max_age_hours: float | None = None,
+    ) -> int:
+        """Delete lifecycle rows for sessions with no stored data."""
+        sessions_with_data = self._snapshot_sessions_with_data()
+        with self._lock.attributed("prune_empty_sessions"):
+            return self._prune_empty_sessions_locked(
+                protected_session_ids=protected_session_ids,
+                max_age_hours=max_age_hours,
+                sessions_with_data=sessions_with_data,
+            )
+
+    def _prune_empty_sessions_locked(
+        self,
+        *,
+        protected_session_ids: set[str] | list[str] | tuple[str, ...] | None,
+        max_age_hours: float | None,
+        sessions_with_data: set[str],
     ) -> int:
         """Delete lifecycle rows for sessions with no stored data.
 
@@ -740,7 +787,6 @@ class LifecycleStateStore:
 
         conn.execute("BEGIN IMMEDIATE")
         try:
-            sessions_with_data: set[str] = set()
             tables = {
                 row[0] for row in conn.execute(
                     "SELECT name FROM sqlite_master WHERE type='table'"
@@ -761,17 +807,6 @@ class LifecycleStateStore:
                 ).fetchone():
                     return True
                 return False
-
-            if "messages" in tables:
-                for row in conn.execute(
-                    "SELECT DISTINCT session_id FROM messages"
-                ).fetchall():
-                    sessions_with_data.add(str(row[0]))
-            if "summary_nodes" in tables:
-                for row in conn.execute(
-                    "SELECT DISTINCT session_id FROM summary_nodes"
-                ).fetchall():
-                    sessions_with_data.add(str(row[0]))
 
             now = time.time()
             max_age_seconds = (
