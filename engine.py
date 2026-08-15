@@ -168,6 +168,12 @@ class _SharedStorageOwner:
         self._lock = threading.Lock()
         self._references = 1
         self._closed = False
+        self._session_end_drain_lock = threading.Lock()
+        self._session_end_drain_thread: threading.Thread | None = None
+        self._session_end_drain_done = threading.Event()
+        self._session_end_drain_done.set()
+        self._session_end_drain_rescan = threading.Event()
+        self._session_end_pending_failures = 0
 
     def acquire(self) -> "_SharedStorageOwner":
         with self._lock:
@@ -212,6 +218,26 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
          lcm_expand) to search and drill into compacted history
       5. Active context = system prompt + DAG summaries + fresh tail
     """
+
+    @property
+    def _session_end_drain_lock(self) -> threading.Lock:
+        return self._storage_owner._session_end_drain_lock
+
+    @property
+    def _session_end_drain_thread(self) -> threading.Thread | None:
+        return self._storage_owner._session_end_drain_thread
+
+    @property
+    def _session_end_drain_done(self) -> threading.Event:
+        return self._storage_owner._session_end_drain_done
+
+    @property
+    def _session_end_drain_rescan(self) -> threading.Event:
+        return self._storage_owner._session_end_drain_rescan
+
+    @property
+    def _session_end_pending_failures(self) -> int:
+        return self._storage_owner._session_end_pending_failures
 
     def __init__(self, config: LCMConfig | None = None,
                  hermes_home: str = "", *,
@@ -430,12 +456,6 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
         self._host_fallback_compressor: Any = None
         self._host_fallback_session_id = ""
         self._host_fallback_import_warning_logged = False
-        self._session_end_drain_lock = threading.Lock()
-        self._session_end_drain_thread: threading.Thread | None = None
-        self._session_end_drain_done = threading.Event()
-        self._session_end_drain_done.set()
-        self._session_end_drain_rescan = threading.Event()
-        self._session_end_pending_failures = 0
         # Lifecycle metrics — registered *after* __init__ succeeds so a
         # construction failure cannot inflate live counts.
         from .lifecycle_metrics import register_engine_created
@@ -2980,20 +3000,19 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
         started_at = time.monotonic()
         failed_paths: set[Path] = set()
         try:
-            self._session_end_drain_rescan.clear()
+            owner._session_end_drain_rescan.clear()
             while True:
-                pending = tuple(iter_session_end_intents(self._store.db_path))
+                pending = tuple(iter_session_end_intents(owner.store.db_path))
                 if not pending:
-                    with self._session_end_drain_lock:
-                        if self._session_end_drain_rescan.is_set():
-                            self._session_end_drain_rescan.clear()
+                    with owner._session_end_drain_lock:
+                        if owner._session_end_drain_rescan.is_set():
+                            owner._session_end_drain_rescan.clear()
                             continue
-                        self._session_end_drain_thread = None
                         return
                 made_progress = False
                 try:
                     with _acquire_process_write_lock(
-                        self._store._write_lock,
+                        owner.store._write_lock,
                         timeout_seconds=0.2,
                         operation="session_end_deferred_drain",
                     ):
@@ -3003,7 +3022,7 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
                                 made_progress = True
                             except (ValueError, UnicodeError) as exc:
                                 quarantined = quarantine_session_end_intent(path)
-                                self._session_end_pending_failures += 1
+                                owner._session_end_pending_failures += 1
                                 logger.error(
                                     "LCM quarantined invalid deferred session-end intent %s as %s: %s",
                                     path,
@@ -3014,7 +3033,7 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
                             except Exception:
                                 if path not in failed_paths:
                                     failed_paths.add(path)
-                                    self._session_end_pending_failures += 1
+                                    owner._session_end_pending_failures += 1
                                 logger.debug(
                                     "LCM deferred session-end intent remains unresolved in current retry budget: %s",
                                     path,
@@ -3025,9 +3044,12 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
                         raise
                 elapsed = time.monotonic() - started_at
                 if elapsed >= _SESSION_END_DEFERRED_RETRY_BUDGET_SECONDS:
-                    retained = tuple(iter_session_end_intents(self._store.db_path))
-                    with self._session_end_drain_lock:
-                        self._session_end_drain_thread = None
+                    retained = tuple(iter_session_end_intents(owner.store.db_path))
+                    with owner._session_end_drain_lock:
+                        if owner._session_end_drain_rescan.is_set():
+                            return
+                    from .lifecycle_metrics import record_session_end_drain_exhausted
+                    record_session_end_drain_exhausted()
                     logger.warning(
                         "LCM deferred session-end drain exhausted bounded retry budget; "
                         "retaining %d unresolved intent(s) after %.3fs",
@@ -3038,29 +3060,82 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
                 if not made_progress:
                     time.sleep(_SESSION_END_DEFERRED_RETRY_INTERVAL_SECONDS)
         finally:
-            owner.release()
-            self._session_end_drain_done.set()
+            retiring_thread = threading.current_thread()
+            with owner._session_end_drain_lock:
+                registered_worker = owner._session_end_drain_thread is retiring_thread
+            retirement_started = False
+            if registered_worker:
+                retirement = threading.Thread(
+                    target=self._complete_session_end_drain_retirement,
+                    args=(owner, retiring_thread),
+                    name="lcm-session-end-drain-retire",
+                    daemon=True,
+                )
+                try:
+                    retirement.start()
+                    retirement_started = True
+                except BaseException:
+                    logger.exception(
+                        "LCM failed to start deferred session-end drain retirement handoff"
+                    )
+                    with owner._session_end_drain_lock:
+                        if owner._session_end_drain_thread is retiring_thread:
+                            owner._session_end_drain_thread = None
+                        owner._session_end_drain_done.set()
+            try:
+                owner.release()
+            finally:
+                if not registered_worker or not retirement_started:
+                    owner._session_end_drain_done.set()
+
+    def _complete_session_end_drain_retirement(
+        self,
+        owner: _SharedStorageOwner,
+        retiring_thread: threading.Thread,
+    ) -> None:
+        """Finish one drain generation before allowing its replacement to start."""
+        retiring_thread.join()
+        with owner._session_end_drain_lock:
+            if owner._session_end_drain_thread is retiring_thread:
+                owner._session_end_drain_thread = None
+            restart_requested = owner._session_end_drain_rescan.is_set()
+            if not restart_requested:
+                owner._session_end_drain_done.set()
+        if not restart_requested:
+            return
+        try:
+            self._schedule_session_end_drain()
+        except Exception:
+            logger.exception(
+                "LCM failed to restart deferred session-end drain after rescan request"
+            )
+            with owner._session_end_drain_lock:
+                owner._session_end_drain_done.set()
 
     def _schedule_session_end_drain(self) -> None:
-        with self._session_end_drain_lock:
-            self._session_end_drain_rescan.set()
-            thread = self._session_end_drain_thread
+        owner = self._storage_owner
+        with owner._session_end_drain_lock:
+            owner._session_end_drain_rescan.set()
+            thread = owner._session_end_drain_thread
             if thread is not None and thread.is_alive():
                 return
-            owner = self._storage_owner.acquire()
-            self._session_end_drain_done.clear()
+            acquired_owner = owner.acquire()
+            owner._session_end_drain_done.clear()
             thread = threading.Thread(
                 target=self._drain_pending_session_ends,
-                args=(owner,),
+                args=(acquired_owner,),
                 name="lcm-session-end-drain",
                 daemon=True,
             )
-            self._session_end_drain_thread = thread
+            owner._session_end_drain_thread = thread
             try:
                 thread.start()
+                from .lifecycle_metrics import record_session_end_drain_started
+                record_session_end_drain_started()
             except BaseException:
-                owner.release()
-                self._session_end_drain_done.set()
+                owner._session_end_drain_thread = None
+                acquired_owner.release()
+                owner._session_end_drain_done.set()
                 raise
 
     def on_session_end(self, session_id: str, messages: List[Dict[str, Any]]) -> None:
