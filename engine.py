@@ -1968,10 +1968,13 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
         # boundary as stale instead of falling back to a synthetic child-keyed
         # conversation and leaving an uncollectable lifecycle row.
         if (
-            session_state
+            not requested_conversation_id
+            and session_state
             and session_state.last_finalized_session_id == old_session_id
             and session_state.current_session_id
             and session_state.current_session_id not in {old_session_id, session_id}
+            and previous_session_id
+            not in {old_session_id, session_id, session_state.current_session_id}
             and self._dag.get_session_nodes(session_state.current_session_id)
         ):
             logger.info(
@@ -2018,6 +2021,12 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
                 return "", None
             if state.current_session_id == old_session_id and _has_summary_nodes(old_session_id):
                 return old_session_id, state
+            if (
+                state.last_finalized_session_id == old_session_id
+                and state.current_session_id
+                and _has_summary_nodes(state.current_session_id)
+            ):
+                return state.current_session_id, state
             if (
                 state.current_session_id is None
                 and state.last_finalized_session_id == old_session_id
