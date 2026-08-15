@@ -12307,7 +12307,7 @@ class TestSessionRollover:
         try:
             assert ingest_entered.wait(timeout=1.0)
             assert engine._store._write_lock.owner_snapshot()["operation"] == (
-                "session_end_ingest_finalize"
+                "session_end_raw_message_ingest"
             )
         finally:
             release_ingest.set()

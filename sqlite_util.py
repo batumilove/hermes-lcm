@@ -83,6 +83,7 @@ class ProcessSQLiteWriteLock:
         self._owner_thread_name = ""
         self._owner_operation = ""
         self._owner_acquired_at = 0.0
+        self._owner_operation_started_at = 0.0
         self._owner_depth = 0
 
     def acquire(
@@ -114,6 +115,7 @@ class ProcessSQLiteWriteLock:
                 self._owner_thread_name = thread_name
                 self._owner_operation = operation
                 self._owner_acquired_at = now
+                self._owner_operation_started_at = now
                 self._owner_depth = 1
         return True
 
@@ -127,6 +129,7 @@ class ProcessSQLiteWriteLock:
                 self._owner_thread_name = ""
                 self._owner_operation = ""
                 self._owner_acquired_at = 0.0
+                self._owner_operation_started_at = 0.0
             self._lock.release()
 
     def owner_snapshot(self) -> dict[str, Any]:
@@ -135,15 +138,21 @@ class ProcessSQLiteWriteLock:
             if self._owner_thread_id is None:
                 return {}
             try:
-                age_seconds = max(0.0, time.monotonic() - self._owner_acquired_at)
+                now = time.monotonic()
+                age_seconds = max(0.0, now - self._owner_acquired_at)
+                operation_age_seconds = max(
+                    0.0, now - self._owner_operation_started_at
+                )
             except Exception:
                 age_seconds = 0.0
+                operation_age_seconds = 0.0
             return {
                 "thread_id": self._owner_thread_id,
                 "thread_name": self._owner_thread_name,
                 "operation": self._owner_operation,
                 "depth": self._owner_depth,
                 "age_seconds": age_seconds,
+                "operation_age_seconds": operation_age_seconds,
             }
 
     def timeout_detail(self) -> str:
@@ -154,7 +163,8 @@ class ProcessSQLiteWriteLock:
             f"owner_thread_id={owner['thread_id']} "
             f"owner_thread_name={owner['thread_name']} "
             f"owner_operation={owner['operation']} "
-            f"owner_age_s={owner['age_seconds']:.3f}"
+            f"owner_age_s={owner['age_seconds']:.3f} "
+            f"owner_operation_age_s={owner['operation_age_seconds']:.3f}"
         )
 
     def _is_owned(self) -> bool:
@@ -186,6 +196,30 @@ class ProcessSQLiteWriteLock:
             yield self
         finally:
             self.release()
+
+    @contextmanager
+    def attributed_phase(self, operation: str) -> Iterator["ProcessSQLiteWriteLock"]:
+        """Temporarily refine diagnostics for a phase of the current writer hold."""
+        thread_id = threading.get_ident()
+        with self._metadata_lock:
+            if self._owner_thread_id != thread_id or self._owner_depth <= 0:
+                raise RuntimeError(
+                    "current thread does not own the process-wide SQLite writer"
+                )
+            previous_operation = self._owner_operation
+            previous_started_at = self._owner_operation_started_at
+            self._owner_operation = _bounded_diagnostic_label(operation)
+            try:
+                self._owner_operation_started_at = time.monotonic()
+            except Exception:
+                self._owner_operation_started_at = self._owner_acquired_at
+        try:
+            yield self
+        finally:
+            with self._metadata_lock:
+                if self._owner_thread_id == thread_id and self._owner_depth > 0:
+                    self._owner_operation = previous_operation
+                    self._owner_operation_started_at = previous_started_at
 
 
 _PROCESS_SQLITE_WRITE_LOCKS: dict[str, ProcessSQLiteWriteLock] = {}

@@ -147,6 +147,61 @@ _SESSION_END_DEFERRED_RETRY_BUDGET_SECONDS = 30.0
 _SESSION_END_DEFERRED_RETRY_INTERVAL_SECONDS = 0.05
 _CODEX_GPT55_COMPACTION_THRESHOLD = 0.85
 
+
+def _session_end_intent_digest_from_path(path: Path) -> str:
+    """Return the content-addressed v2 digest without reopening the sidecar."""
+    candidate = path.stem.rsplit("-", 1)[-1]
+    if re.fullmatch(r"[0-9a-f]{64}", candidate):
+        return candidate
+    return "unknown"
+
+
+def _bounded_session_end_log_detail(value: Any, *, limit: int = 512) -> str:
+    """Keep exception telemetry single-line, bounded, and payload-free."""
+    text = " ".join(str(value).split())
+    return text[:limit] if text else "-"
+
+
+def _log_session_end_deferred_event(
+    level: int,
+    *,
+    stage: str,
+    outcome: str,
+    operation: str,
+    intent_sha256: str,
+    session_id: str,
+    conversation_id: str,
+    wait_seconds: float,
+    receipt_id: str = "-",
+    error: BaseException | None = None,
+) -> None:
+    stage = _bounded_session_end_log_detail(stage, limit=64)
+    outcome = _bounded_session_end_log_detail(outcome, limit=64)
+    operation = _bounded_session_end_log_detail(operation, limit=96)
+    intent_sha256 = _bounded_session_end_log_detail(intent_sha256, limit=64)
+    receipt_id = _bounded_session_end_log_detail(receipt_id, limit=64)
+    session_id = _bounded_session_end_log_detail(session_id, limit=256)
+    conversation_id = _bounded_session_end_log_detail(conversation_id, limit=256)
+    error_type = _bounded_session_end_log_detail(
+        type(error).__name__ if error is not None else "-", limit=64
+    )
+    logger.log(
+        level,
+        "event=session_end_deferred stage=%s outcome=%s "
+        "operation=%s intent_sha256=%s receipt_id=%s "
+        "session_id=%r conversation_id=%r wait_s=%.3f error_type=%s detail=%s",
+        stage,
+        outcome,
+        operation,
+        intent_sha256,
+        receipt_id,
+        str(session_id),
+        str(conversation_id),
+        max(0.0, float(wait_seconds)),
+        error_type,
+        _bounded_session_end_log_detail(error) if error is not None else "-",
+    )
+
 # Auto-focus topic derivation: infer a compact focus hint from the most recent
 # real user turns so that summarization can prioritise current user intent.
 # Mirrors Hermes upstream fix/compression-auto-focus-topic (#44687 branch).
@@ -2921,6 +2976,49 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
 
     def _drain_one_session_end_intent(self, path: Path) -> None:
         intent = load_session_end_intent(path)
+        started_at = time.monotonic()
+        intent_sha256 = str(intent.get("intent_sha256") or "unknown")
+        session_id = str(intent["session_id"])
+        conversation_id = str(intent["conversation_id"])
+        try:
+            self._drain_loaded_session_end_intent(path, intent)
+        except Exception as exc:
+            receipt_id = "-"
+            if int(intent.get("version") or 0) >= 2:
+                try:
+                    if self._store.has_session_end_ingest_receipt(intent_sha256):
+                        receipt_id = intent_sha256
+                except Exception:
+                    pass
+            _log_session_end_deferred_event(
+                logging.DEBUG,
+                stage="drain",
+                outcome="retry_pending",
+                operation="session_end_deferred_drain",
+                intent_sha256=intent_sha256,
+                receipt_id=receipt_id,
+                session_id=session_id,
+                conversation_id=conversation_id,
+                wait_seconds=time.monotonic() - started_at,
+                error=exc,
+            )
+            raise
+        if int(intent.get("version") or 0) >= 2:
+            _log_session_end_deferred_event(
+                logging.INFO,
+                stage="drain",
+                outcome="settled",
+                operation="session_end_deferred_drain",
+                intent_sha256=intent_sha256,
+                receipt_id=intent_sha256,
+                session_id=session_id,
+                conversation_id=conversation_id,
+                wait_seconds=time.monotonic() - started_at,
+            )
+
+    def _drain_loaded_session_end_intent(
+        self, path: Path, intent: Dict[str, Any]
+    ) -> None:
         session_id = str(intent["session_id"])
         conversation_id = str(intent["conversation_id"])
         messages = list(intent["messages"])
@@ -2998,7 +3096,8 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
 
     def _drain_pending_session_ends(self, owner: _SharedStorageOwner) -> None:
         started_at = time.monotonic()
-        failed_paths: set[Path] = set()
+        failed_paths: dict[Path, BaseException] = {}
+        last_coordinator_error: BaseException | None = None
         try:
             owner._session_end_drain_rescan.clear()
             while True:
@@ -3030,10 +3129,10 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
                                     exc,
                                 )
                                 made_progress = True
-                            except Exception:
+                            except Exception as exc:
                                 if path not in failed_paths:
-                                    failed_paths.add(path)
                                     owner._session_end_pending_failures += 1
+                                failed_paths[path] = exc
                                 logger.debug(
                                     "LCM deferred session-end intent remains unresolved in current retry budget: %s",
                                     path,
@@ -3042,12 +3141,46 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
                 except Exception as exc:
                     if not _is_sqlite_locked_error(exc):
                         raise
+                    last_coordinator_error = exc
                 elapsed = time.monotonic() - started_at
                 if elapsed >= _SESSION_END_DEFERRED_RETRY_BUDGET_SECONDS:
                     retained = tuple(iter_session_end_intents(owner.store.db_path))
                     with owner._session_end_drain_lock:
                         if owner._session_end_drain_rescan.is_set():
                             return
+                    for retained_path in retained:
+                        try:
+                            retained_intent = load_session_end_intent(retained_path)
+                        except (OSError, ValueError, UnicodeError):
+                            continue
+                        retained_digest = str(
+                            retained_intent.get("intent_sha256") or "unknown"
+                        )
+                        receipt_id = "-"
+                        if int(retained_intent.get("version") or 0) >= 2:
+                            try:
+                                if owner.store.has_session_end_ingest_receipt(
+                                    retained_digest
+                                ):
+                                    receipt_id = retained_digest
+                            except Exception:
+                                pass
+                        _log_session_end_deferred_event(
+                            logging.WARNING,
+                            stage="drain",
+                            outcome="unresolved",
+                            operation="session_end_deferred_drain",
+                            intent_sha256=retained_digest,
+                            receipt_id=receipt_id,
+                            session_id=str(retained_intent["session_id"]),
+                            conversation_id=str(
+                                retained_intent["conversation_id"]
+                            ),
+                            wait_seconds=elapsed,
+                            error=failed_paths.get(
+                                retained_path, last_coordinator_error
+                            ),
+                        )
                     from .lifecycle_metrics import record_session_end_drain_exhausted
                     record_session_end_drain_exhausted()
                     logger.warning(
@@ -3406,6 +3539,7 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
             )
             return
         pending_intent_path = self._persist_session_end_intent(session_id, messages)
+        bounded_flush_started_at = time.monotonic()
         try:
             with _temporary_sqlite_busy_timeout(
                 [
@@ -3417,18 +3551,23 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
                 write_lock_timeout_ms=_SESSION_END_PROCESS_WRITE_TIMEOUT_MS,
                 write_lock_operation="session_end_ingest_finalize",
             ):
+                raw_ingest_started_at = time.monotonic()
                 try:
                     # Best-effort final flush. Keep this path bounded because
                     # host gateways call session-end hooks from lifecycle paths
                     # that must not wait through SQLite's normal busy timeout.
                     pending_intent = load_session_end_intent(pending_intent_path)
-                    self._ingest_messages(
-                        messages,
-                        session_end_intent_sha256=str(pending_intent["intent_sha256"]),
-                        session_end_message_fingerprints=list(
-                            pending_intent["message_fingerprints"]
-                        ),
-                    )
+                    intent_sha256 = str(pending_intent["intent_sha256"])
+                    with self._store._write_lock.attributed_phase(
+                        "session_end_raw_message_ingest"
+                    ):
+                        self._ingest_messages(
+                            messages,
+                            session_end_intent_sha256=intent_sha256,
+                            session_end_message_fingerprints=list(
+                                pending_intent["message_fingerprints"]
+                            ),
+                        )
                 except KeyboardInterrupt:
                     logger.warning(
                         "LCM session-end raw-message ingest interrupted; "
@@ -3442,16 +3581,32 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
                             "final messages may be absent from the plugin-local store: %s",
                             exc,
                         )
+                        _log_session_end_deferred_event(
+                            logging.WARNING,
+                            stage="raw_ingest",
+                            outcome="scheduled",
+                            operation="session_end_raw_message_ingest",
+                            intent_sha256=intent_sha256,
+                            receipt_id="-",
+                            session_id=session_id,
+                            conversation_id=self._conversation_id,
+                            wait_seconds=time.monotonic() - raw_ingest_started_at,
+                            error=exc,
+                        )
                         self._schedule_session_end_drain()
                         return
                     raise
 
+                lifecycle_finalize_started_at = time.monotonic()
                 try:
-                    self._lifecycle.finalize_session(
-                        self._conversation_id,
-                        session_id,
-                        frontier_store_id=self._last_compacted_store_id,
-                    )
+                    with self._store._write_lock.attributed_phase(
+                        "session_end_lifecycle_finalize"
+                    ):
+                        self._lifecycle.finalize_session(
+                            self._conversation_id,
+                            session_id,
+                            frontier_store_id=self._last_compacted_store_id,
+                        )
                     remove_session_end_intent(pending_intent_path)
                 except KeyboardInterrupt:
                     logger.warning(
@@ -3466,6 +3621,20 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
                             "raw messages were ingested but lifecycle state may be finalized later: %s",
                             exc,
                         )
+                        _log_session_end_deferred_event(
+                            logging.WARNING,
+                            stage="lifecycle_finalize",
+                            outcome="scheduled",
+                            operation="session_end_lifecycle_finalize",
+                            intent_sha256=intent_sha256,
+                            receipt_id=intent_sha256,
+                            session_id=session_id,
+                            conversation_id=self._conversation_id,
+                            wait_seconds=(
+                                time.monotonic() - lifecycle_finalize_started_at
+                            ),
+                            error=exc,
+                        )
                         self._schedule_session_end_drain()
                         return
                     raise
@@ -3477,6 +3646,19 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
                 logger.warning(
                     "LCM session-end ingest/finalize deferred after SQLite lock before bounded flush: %s",
                     exc,
+                )
+                _log_session_end_deferred_event(
+                    logging.WARNING,
+                    stage="bounded_flush",
+                    outcome="scheduled",
+                    operation="session_end_ingest_finalize",
+                    intent_sha256=_session_end_intent_digest_from_path(
+                        pending_intent_path
+                    ),
+                    session_id=session_id,
+                    conversation_id=self._conversation_id,
+                    wait_seconds=time.monotonic() - bounded_flush_started_at,
+                    error=exc,
                 )
                 self._schedule_session_end_drain()
                 return
