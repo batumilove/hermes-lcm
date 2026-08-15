@@ -1963,6 +1963,25 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
         session_state = self._lifecycle.get_by_session(old_session_id)
         conversation_state = self._lifecycle.get_by_conversation(old_session_id)
 
+        # A delayed duplicate callback can arrive after the parent was already
+        # finalized and its summaries moved to the real child. Treat that parent
+        # boundary as stale instead of falling back to a synthetic child-keyed
+        # conversation and leaving an uncollectable lifecycle row.
+        if (
+            session_state
+            and session_state.last_finalized_session_id == old_session_id
+            and session_state.current_session_id
+            and session_state.current_session_id not in {old_session_id, session_id}
+            and self._dag.get_session_nodes(session_state.current_session_id)
+        ):
+            logger.info(
+                "LCM ignored replayed compression boundary from finalized parent %s to %s; active child=%s",
+                old_session_id,
+                session_id,
+                session_state.current_session_id,
+            )
+            return
+
         def _state_conversation_matches(state: Any) -> bool:
             return bool(
                 state
@@ -3762,7 +3781,8 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
             status["source_lineage"] = {"error": str(exc)}
         try:
             status["lifecycle_fragmentation"] = self._lifecycle.get_fragmentation_stats(
-                state_db_path=self._state_db_path()
+                state_db_path=self._state_db_path(),
+                empty_lifecycle_max_age_hours=self._config.empty_lifecycle_gc_max_age_hours,
             )
         except Exception as exc:  # pragma: no cover - defensive
             status["lifecycle_fragmentation"] = {"error": str(exc), "read_only": True}

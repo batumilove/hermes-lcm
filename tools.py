@@ -5067,7 +5067,8 @@ def lcm_doctor(args: Dict[str, Any], **kwargs) -> str:
     # 6. Lifecycle/session fragmentation
     try:
         lifecycle_fragmentation = engine._lifecycle.get_fragmentation_stats(
-            state_db_path=_state_db_path_for_engine(engine)
+            state_db_path=_state_db_path_for_engine(engine),
+            empty_lifecycle_max_age_hours=c.empty_lifecycle_gc_max_age_hours,
         )
         checks.append({
             "check": "lifecycle_fragmentation",

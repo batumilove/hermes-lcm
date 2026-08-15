@@ -5,6 +5,7 @@ from pathlib import Path
 import importlib.util
 import sqlite3
 import sys
+import time
 from types import SimpleNamespace
 
 import pytest
@@ -1029,6 +1030,55 @@ def test_lcm_doctor_reports_lifecycle_fragmentation_as_read_only_observation(eng
     assert "inspect lifecycle fragmentation before any cleanup/repair behavior mutates state" in result
     assert "read-only" in result
     assert engine._lifecycle.row_count() == 2
+
+
+def test_lcm_doctor_does_not_warn_for_recent_gc_protected_empty_lifecycle_row(engine):
+    engine._config.empty_lifecycle_gc_max_age_hours = 24.0
+    engine._lifecycle._conn.execute(
+        """INSERT INTO lcm_lifecycle_state
+           (conversation_id, current_session_id, current_frontier_store_id,
+            last_finalized_frontier_store_id, current_bound_at, updated_at)
+           VALUES (?, ?, ?, ?, ?, ?)""",
+        ("recent-empty", "recent-empty", 0, 0, time.time(), time.time()),
+    )
+    engine._lifecycle._conn.commit()
+
+    result = handle_lcm_command("doctor", engine)
+    payload = json.loads(lcm_tools.lcm_doctor({}, engine=engine))
+    lifecycle_check = next(
+        check for check in payload["checks"] if check["check"] == "lifecycle_fragmentation"
+    )
+
+    assert "status: ok" in result
+    assert lifecycle_check["status"] == "pass"
+    assert "empty_lifecycle_rows=1" in result
+    assert "actionable_empty_lifecycle_rows=0" in result
+    assert "recent_gc_protected_empty_lifecycle_rows=1" in result
+
+
+def test_lcm_doctor_warns_for_gc_eligible_empty_lifecycle_row(engine):
+    engine._config.empty_lifecycle_gc_max_age_hours = 24.0
+    old = time.time() - (25 * 3600)
+    engine._lifecycle._conn.execute(
+        """INSERT INTO lcm_lifecycle_state
+           (conversation_id, current_session_id, current_frontier_store_id,
+            last_finalized_frontier_store_id, current_bound_at, updated_at)
+           VALUES (?, ?, ?, ?, ?, ?)""",
+        ("old-empty", "old-empty", 0, 0, old, old),
+    )
+    engine._lifecycle._conn.commit()
+
+    result = handle_lcm_command("doctor", engine)
+    payload = json.loads(lcm_tools.lcm_doctor({}, engine=engine))
+    lifecycle_check = next(
+        check for check in payload["checks"] if check["check"] == "lifecycle_fragmentation"
+    )
+
+    assert "status: action-recommended" in result
+    assert lifecycle_check["status"] == "warn"
+    assert "empty_lifecycle_rows=1" in result
+    assert "actionable_empty_lifecycle_rows=1" in result
+    assert "recent_gc_protected_empty_lifecycle_rows=0" in result
 
 
 def test_lcm_doctor_reports_lcm_sessions_without_lifecycle_references_as_observations(engine):

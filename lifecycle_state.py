@@ -387,7 +387,12 @@ class LifecycleStateStore:
         assert updated is not None
         return updated
 
-    def get_fragmentation_stats(self, state_db_path: str | Path | None = None) -> dict[str, Any]:
+    def get_fragmentation_stats(
+        self,
+        state_db_path: str | Path | None = None,
+        *,
+        empty_lifecycle_max_age_hours: float | None = None,
+    ) -> dict[str, Any]:
         """Return read-only lifecycle/session fragmentation diagnostics.
 
         This intentionally reports mismatches only. It does not infer that every
@@ -422,9 +427,17 @@ class LifecycleStateStore:
         lifecycle_referenced_sessions = lifecycle_current_sessions | lifecycle_last_finalized_sessions
 
         empty_lifecycle_rows = 0
+        actionable_empty_lifecycle_rows = 0
+        now = time.time()
+        max_age_seconds = (
+            float(empty_lifecycle_max_age_hours) * 3600.0
+            if empty_lifecycle_max_age_hours is not None
+            else None
+        )
         for row in conn.execute(
             """
-            SELECT current_session_id, last_finalized_session_id
+            SELECT current_session_id, last_finalized_session_id,
+                   current_bound_at, last_finalized_at, updated_at
             FROM lcm_lifecycle_state
             """
         ).fetchall():
@@ -435,11 +448,26 @@ class LifecycleStateStore:
             }
             if not refs or refs.isdisjoint(lcm_any_sessions):
                 empty_lifecycle_rows += 1
+                row_age_anchor = (
+                    row["current_bound_at"]
+                    or row["last_finalized_at"]
+                    or row["updated_at"]
+                )
+                if (
+                    max_age_seconds is None
+                    or row_age_anchor is None
+                    or (now - float(row_age_anchor)) >= max_age_seconds
+                ):
+                    actionable_empty_lifecycle_rows += 1
 
         stats: dict[str, Any] = {
             "read_only": True,
             "lifecycle_rows": _count("SELECT COUNT(*) FROM lcm_lifecycle_state"),
             "empty_lifecycle_rows": empty_lifecycle_rows,
+            "actionable_empty_lifecycle_rows": actionable_empty_lifecycle_rows,
+            "recent_gc_protected_empty_lifecycle_rows": (
+                empty_lifecycle_rows - actionable_empty_lifecycle_rows
+            ),
             "messages_total": _count("SELECT COUNT(*) FROM messages"),
             "summary_nodes_total": _count("SELECT COUNT(*) FROM summary_nodes"),
             "distinct_message_sessions": len(message_sessions),
