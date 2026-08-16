@@ -299,6 +299,94 @@ def test_lifecycle_lock_deferral_logs_exact_receipt_pairing(
         engine.shutdown()
 
 
+def test_concurrent_session_end_queues_behind_active_flush_without_writer_timeout(
+    tmp_path, monkeypatch, caplog
+):
+    first = _engine(tmp_path, "concurrent-session-end-flush")
+    second = first.clone_for_agent()
+    second.on_session_start("concurrent-session-end-second", platform="telegram")
+    first_finalize_entered = threading.Event()
+    release_first_finalize = threading.Event()
+    second_done = threading.Event()
+    errors = []
+    original_finalize = first._lifecycle.finalize_session
+
+    def hold_first_finalize(conversation_id, session_id, *args, **kwargs):
+        if session_id == first._session_id:
+            first_finalize_entered.set()
+            assert release_first_finalize.wait(timeout=2.0)
+        return original_finalize(conversation_id, session_id, *args, **kwargs)
+
+    def end(engine, message, done=None):
+        try:
+            engine.on_session_end(
+                engine._session_id,
+                [{"role": "user", "content": message}],
+            )
+        except BaseException as exc:
+            errors.append(exc)
+        finally:
+            if done is not None:
+                done.set()
+
+    monkeypatch.setattr(first._lifecycle, "finalize_session", hold_first_finalize)
+    first_worker = threading.Thread(
+        target=end,
+        args=(first, "first flush owns the writer"),
+        name="first-session-end-flush",
+    )
+    second_worker = threading.Thread(
+        target=end,
+        args=(second, "second flush must queue", second_done),
+        name="second-session-end-flush",
+    )
+
+    try:
+        with caplog.at_level(logging.DEBUG, logger="hermes_lcm.engine"):
+            first_worker.start()
+            assert first_finalize_entered.wait(timeout=3.0)
+            second_worker.start()
+            queued_without_waiting_for_writer_timeout = second_done.wait(timeout=0.1)
+            if not queued_without_waiting_for_writer_timeout:
+                # Let the unfixed implementation reproduce the production
+                # 200 ms process-writer timeout before releasing the owner.
+                second_done.wait(timeout=0.2)
+            release_first_finalize.set()
+            first_worker.join(timeout=2.0)
+            second_worker.join(timeout=2.0)
+            assert first._session_end_drain_done.wait(timeout=2.0)
+
+        events = _event_messages(caplog)
+        assert queued_without_waiting_for_writer_timeout
+        assert errors == []
+        assert not first_worker.is_alive()
+        assert not second_worker.is_alive()
+        assert any(
+            "stage=queue" in event
+            and "outcome=scheduled" in event
+            and "operation=session_end_flush_queue" in event
+            and "error_type=-" in event
+            for event in events
+        )
+        assert any(
+            "stage=drain" in event
+            and "outcome=settled" in event
+            and "operation=session_end_deferred_drain" in event
+            for event in events
+        )
+        assert not any("database is locked" in event.lower() for event in events)
+        assert not any("writer timeout" in event.lower() for event in events)
+        assert list(pending_session_end_dir(first._store.db_path).glob("*.json")) == []
+    finally:
+        release_first_finalize.set()
+        if first_worker.ident is not None:
+            first_worker.join(timeout=2.0)
+        if second_worker.ident is not None:
+            second_worker.join(timeout=2.0)
+        second.shutdown()
+        first.shutdown()
+
+
 def test_session_end_writer_owner_reports_exact_active_phase(tmp_path, monkeypatch):
     engine = _engine(tmp_path, "writer-phase-attribution")
     ingest_entered = threading.Event()
