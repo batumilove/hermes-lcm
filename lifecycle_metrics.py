@@ -29,6 +29,8 @@ __all__ = [
     "complete_lifecycle_state_store_close",
     "fail_lifecycle_state_store_close",
     "record_storage_bind",
+    "record_session_end_drain_started",
+    "record_session_end_drain_exhausted",
     "configure",
     "configure_from_host_policy",
     "snapshot",
@@ -211,6 +213,20 @@ def record_storage_bind() -> None:
         _TOTALS["storage_binds_total"] += 1
 
 
+def record_session_end_drain_started() -> None:
+    if not _enabled():
+        return
+    with _LOCK:
+        _TOTALS["session_end_drains_started_total"] += 1
+
+
+def record_session_end_drain_exhausted() -> None:
+    if not _enabled():
+        return
+    with _LOCK:
+        _TOTALS["session_end_drains_exhausted_total"] += 1
+
+
 def _registered_unique_engine_count() -> int:
     """Count unique currently bound engines without exposing registry keys."""
     if not _enabled():
@@ -271,6 +287,8 @@ def snapshot() -> dict[str, dict[str, int]]:
             "lifecycle_state_store_close_idempotent_total",
             "lifecycle_state_store_close_failures_total",
             "storage_binds_total",
+            "session_end_drains_started_total",
+            "session_end_drains_exhausted_total",
         ):
             values[key] = int(_TOTALS[key]) if is_enabled else 0
 
