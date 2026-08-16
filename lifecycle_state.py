@@ -925,6 +925,12 @@ class LifecycleStateStore:
                 deleted = 0
                 now = time.time()
                 for conversation_id, snapshot_cur, snapshot_fin, snapshot_updated_at in candidates:
+                    if protected_session_ids_provider is not None:
+                        protected.update(
+                            str(item)
+                            for item in protected_session_ids_provider()
+                            if item
+                        )
                     row = conn.execute(
                         "SELECT * FROM lcm_lifecycle_state WHERE conversation_id = ?",
                         (conversation_id,),
