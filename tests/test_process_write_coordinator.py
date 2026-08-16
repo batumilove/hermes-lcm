@@ -162,7 +162,7 @@ def test_process_write_lock_attributes_nested_phase_without_reacquiring(tmp_path
             assert phase["operation"] == "session_end_raw_message_ingest"
             assert phase["depth"] == outer["depth"]
             assert phase["age_seconds"] >= outer["age_seconds"]
-            assert phase["operation_age_seconds"] >= 0.0
+            assert 0.0 <= phase["operation_age_seconds"] <= phase["age_seconds"]
         restored = coordinator.owner_snapshot()
         assert restored["operation"] == "session_end_ingest_finalize"
         assert restored["depth"] == outer["depth"]

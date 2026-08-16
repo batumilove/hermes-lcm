@@ -3321,13 +3321,16 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
             owner._session_end_drain_thread = thread
             try:
                 thread.start()
-                from .lifecycle_metrics import record_session_end_drain_started
-                record_session_end_drain_started()
             except BaseException:
                 owner._session_end_drain_thread = None
                 acquired_owner.release()
                 owner._session_end_drain_done.set()
                 raise
+        try:
+            from .lifecycle_metrics import record_session_end_drain_started
+            record_session_end_drain_started()
+        except Exception:
+            logger.exception("LCM failed to record deferred session-end drain start")
 
     def on_session_end(self, session_id: str, messages: List[Dict[str, Any]]) -> None:
         ended_generation = self._in_process_auxiliary_caller_generation(session_id)

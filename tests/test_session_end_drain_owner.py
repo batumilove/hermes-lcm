@@ -260,6 +260,44 @@ def test_successful_zero_budget_drain_does_not_record_exhaustion(tmp_path, monke
         intent_path.unlink(missing_ok=True)
 
 
+def test_started_metric_failure_cannot_undo_a_running_drain_worker(tmp_path, monkeypatch):
+    db_path = tmp_path / "started-metric-error.db"
+    engine = LCMEngine(config=LCMConfig(database_path=str(db_path)))
+    intent_path = _v2_intent(db_path, session_id="metric-session")
+    entered = threading.Event()
+    release = threading.Event()
+
+    def blocked_drain(self, path):
+        entered.set()
+        assert release.wait(timeout=2.0)
+        path.unlink(missing_ok=True)
+
+    def fail_metric():
+        raise RuntimeError("metrics backend unavailable")
+
+    monkeypatch.setattr(LCMEngine, "_drain_one_session_end_intent", blocked_drain)
+    monkeypatch.setattr(
+        "hermes_lcm.lifecycle_metrics.record_session_end_drain_started",
+        fail_metric,
+    )
+    try:
+        engine._schedule_session_end_drain()
+        assert entered.wait(timeout=1.0)
+        worker = engine._session_end_drain_thread
+        assert worker is not None
+        assert worker.is_alive()
+        assert not engine._session_end_drain_done.is_set()
+
+        release.set()
+        assert engine._session_end_drain_done.wait(timeout=1.0)
+        assert not intent_path.exists()
+    finally:
+        release.set()
+        engine._session_end_drain_done.wait(timeout=1.0)
+        engine.shutdown()
+        intent_path.unlink(missing_ok=True)
+
+
 def test_exhaustion_rescan_waits_for_retiring_generation_to_exit(tmp_path, monkeypatch):
     db_path = tmp_path / "exhaustion-handoff.db"
     engine = LCMEngine(config=LCMConfig(database_path=str(db_path)))
