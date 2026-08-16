@@ -9,7 +9,7 @@ import time
 import pytest
 
 from hermes_lcm import command as command_mod
-from hermes_lcm import db_bootstrap, maintenance, sqlite_util
+from hermes_lcm import db_bootstrap, lifecycle_state, maintenance, sqlite_util
 from hermes_lcm.dag import SummaryDAG, SummaryNode
 from hermes_lcm.lifecycle_state import LifecycleStateStore
 from hermes_lcm.rollup_store import RollupStore

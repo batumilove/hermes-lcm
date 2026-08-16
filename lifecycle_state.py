@@ -34,7 +34,7 @@ def _synchronized(method):
     """
     @functools.wraps(method)
     def wrapper(self, *args, **kwargs):
-        with self._lock:
+        with self._lock.attributed(method.__name__):
             return method(self, *args, **kwargs)
     return wrapper
 
