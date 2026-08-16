@@ -23,6 +23,7 @@ class _GCState:
     next_allowed_at: float = 0.0
     thread: threading.Thread | None = None
     protected_session_ids: set[str] = field(default_factory=set)
+    protected_session_ids_provider: Callable[[], Iterable[str]] | None = None
 
 
 class EmptyLifecycleGCCoordinator:
@@ -59,6 +60,7 @@ class EmptyLifecycleGCCoordinator:
         threshold: int,
         max_age_hours: float | None,
         protected_session_ids: Iterable[str] = (),
+        protected_session_ids_provider: Callable[[], Iterable[str]] | None = None,
         interval_seconds: float = _DEFAULT_INTERVAL_SECONDS,
         batch_size: int = _DEFAULT_BATCH_SIZE,
     ) -> bool:
@@ -69,6 +71,8 @@ class EmptyLifecycleGCCoordinator:
         with self._lock:
             state = self._states.setdefault(key, _GCState())
             state.protected_session_ids.update(protected)
+            if protected_session_ids_provider is not None:
+                state.protected_session_ids_provider = protected_session_ids_provider
             if state.running or now < state.next_allowed_at:
                 return False
             state.running = True
@@ -85,6 +89,7 @@ class EmptyLifecycleGCCoordinator:
             except BaseException:
                 state.running = False
                 state.thread = None
+                state.next_allowed_at = 0.0
                 logger.warning(
                     "LCM could not start asynchronous empty-lifecycle GC",
                     exc_info=True,
@@ -95,7 +100,11 @@ class EmptyLifecycleGCCoordinator:
     def _protected_snapshot(self, key: str) -> set[str]:
         with self._lock:
             state = self._states.get(key)
-            return set(state.protected_session_ids) if state is not None else set()
+            protected = set(state.protected_session_ids) if state is not None else set()
+            provider = state.protected_session_ids_provider if state is not None else None
+        if provider is not None:
+            protected.update(str(item) for item in provider() if item)
+        return protected
 
     def _run(
         self,

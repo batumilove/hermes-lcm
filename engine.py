@@ -162,6 +162,16 @@ _PRESERVED_TODO_CONTEXT_PREFIX = "[Your active task list was preserved across co
 _LCM_MESSAGE_PREFIX_FINGERPRINT_LIMIT = 8
 
 
+def _active_lifecycle_gc_session_ids() -> set[str]:
+    """Return every process-local session currently registered to an LCM engine."""
+    with _ACTIVE_ENGINE_REGISTRY_LOCK:
+        return {
+            str(session_id)
+            for session_id in _ACTIVE_ENGINES_BY_SESSION_ID
+            if session_id
+        }
+
+
 class _SharedStorageOwner:
     """Reference-count one SQLite helper stack across related agent runtimes."""
 
@@ -1481,6 +1491,7 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
                 threshold=self._config.empty_lifecycle_gc_threshold,
                 max_age_hours=self._config.empty_lifecycle_gc_max_age_hours,
                 protected_session_ids={str(self._session_id)} if self._session_id else (),
+                protected_session_ids_provider=_active_lifecycle_gc_session_ids,
             )
         # Bypassed/stateless sessions skip every LCM write, so they must also skip
         # rollup maintenance — otherwise the bind-time hook would build rollups for

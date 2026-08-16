@@ -22,6 +22,9 @@ from .db_bootstrap import configure_connection, refuse_schema_version_too_new, r
 from .sqlite_util import process_sqlite_write_lock
 
 
+_MAX_EMPTY_LIFECYCLE_GC_BATCH_SIZE = 100
+
+
 def _synchronized(method):
     """Serialize a read-modify-write method on the store's reentrant lock.
 
@@ -838,14 +841,46 @@ class LifecycleStateStore:
         protected_session_ids: set[str] | list[str] | tuple[str, ...] | None = None,
         protected_session_ids_provider: Callable[[], Iterable[str]] | None = None,
         max_age_hours: float | None = None,
-        max_candidates: int = 100,
+        max_candidates: int | None = None,
     ) -> int:
-        """Delete a bounded batch of empty lifecycle rows.
+        """Delete empty lifecycle rows using transactions bounded to 100 rows.
 
-        Candidate discovery runs on an independent read-only connection. Only
-        final identity/data rechecks and deletions occur under the attributed
-        writer lock and ``BEGIN IMMEDIATE`` transaction.
+        The default preserves the legacy complete-cleanup contract by running
+        multiple bounded transactions. An explicit limit requests one bounded
+        pass and is clamped to the hard safety ceiling.
         """
+        if max_candidates is not None:
+            return self._prune_empty_sessions_batch(
+                protected_session_ids=protected_session_ids,
+                protected_session_ids_provider=protected_session_ids_provider,
+                max_age_hours=max_age_hours,
+                max_candidates=min(
+                    _MAX_EMPTY_LIFECYCLE_GC_BATCH_SIZE,
+                    max(0, int(max_candidates)),
+                ),
+            )
+
+        deleted_total = 0
+        while True:
+            deleted = self._prune_empty_sessions_batch(
+                protected_session_ids=protected_session_ids,
+                protected_session_ids_provider=protected_session_ids_provider,
+                max_age_hours=max_age_hours,
+                max_candidates=_MAX_EMPTY_LIFECYCLE_GC_BATCH_SIZE,
+            )
+            deleted_total += deleted
+            if deleted < _MAX_EMPTY_LIFECYCLE_GC_BATCH_SIZE:
+                return deleted_total
+
+    def _prune_empty_sessions_batch(
+        self,
+        *,
+        protected_session_ids: set[str] | list[str] | tuple[str, ...] | None,
+        protected_session_ids_provider: Callable[[], Iterable[str]] | None,
+        max_age_hours: float | None,
+        max_candidates: int,
+    ) -> int:
+        """Delete one bounded batch after read-only candidate discovery."""
         candidates = self._collect_empty_session_candidates(
             protected_session_ids=protected_session_ids,
             max_age_hours=max_age_hours,

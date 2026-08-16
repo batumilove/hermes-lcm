@@ -1,6 +1,7 @@
 import threading
 import time
 
+from hermes_lcm import engine as engine_mod
 from hermes_lcm.config import LCMConfig
 from hermes_lcm.engine import LCMEngine
 from hermes_lcm.lifecycle_state import LifecycleStateStore
@@ -101,16 +102,52 @@ def test_empty_lifecycle_gc_is_rate_limited_after_completion(tmp_path, monkeypat
 
 def test_session_bind_survives_gc_thread_start_failure(tmp_path, monkeypatch):
     engine = _gc_engine(tmp_path)
+    original_start = threading.Thread.start
+    gc_started = threading.Event()
 
     def fail_start(self):
         raise RuntimeError("thread unavailable")
 
     monkeypatch.setattr(threading.Thread, "start", fail_start)
+    engine.on_session_start("failed-start", platform="cli", context_length=200_000)
+    assert engine._session_id == "failed-start"
+
+    monkeypatch.setattr(threading.Thread, "start", original_start)
+    monkeypatch.setattr(
+        LifecycleStateStore,
+        "prune_empty_sessions",
+        lambda self, **kwargs: gc_started.set() or 0,
+    )
     try:
-        engine.on_session_start("live-session", platform="cli", context_length=200_000)
-        assert engine._session_id == "live-session"
+        engine.on_session_start("retry-session", platform="cli", context_length=200_000)
+        assert gc_started.wait(timeout=1.0), "failed thread start consumed the retry window"
     finally:
         engine.shutdown()
+
+
+def test_gc_request_includes_all_active_registry_sessions(tmp_path, monkeypatch):
+    config = LCMConfig(
+        database_path=str(tmp_path / "active-registry.db"),
+        empty_lifecycle_gc_enabled=True,
+        empty_lifecycle_gc_threshold=1,
+        empty_lifecycle_gc_max_age_hours=0,
+    )
+    requests = []
+    monkeypatch.setattr(
+        engine_mod,
+        "request_empty_lifecycle_gc",
+        lambda *args, **kwargs: requests.append(kwargs) or True,
+    )
+    engine_a = LCMEngine(config=config)
+    engine_b = LCMEngine(config=config)
+    try:
+        engine_a.on_session_start("long-active", platform="cli", context_length=200_000)
+        engine_b.on_session_start("gc-trigger", platform="cli", context_length=200_000)
+        provider = requests[-1]["protected_session_ids_provider"]
+        assert {"long-active", "gc-trigger"} <= set(provider())
+    finally:
+        engine_a.shutdown()
+        engine_b.shutdown()
 
 
 def test_inflight_gc_preserves_session_bound_while_candidate_scan_runs(tmp_path, monkeypatch):
@@ -163,6 +200,24 @@ def test_prune_empty_sessions_bounds_final_write_transaction(tmp_path):
         assert lifecycle.row_count() == 5_100
     finally:
         lifecycle.close()
+
+
+def test_prune_clamps_explicit_batch_but_default_completes_cleanup(tmp_path):
+    bounded = LifecycleStateStore(tmp_path / "bounded.db")
+    complete = LifecycleStateStore(tmp_path / "complete.db")
+    try:
+        for index in range(150):
+            bounded.bind_session(f"bounded-{index}")
+            complete.bind_session(f"complete-{index}")
+
+        assert bounded.prune_empty_sessions(max_age_hours=0, max_candidates=1_000) == 100
+        assert bounded.row_count() == 50
+
+        assert complete.prune_empty_sessions(max_age_hours=0) == 150
+        assert complete.row_count() == 0
+    finally:
+        bounded.close()
+        complete.close()
 
 
 def test_prune_preserves_conversation_rebound_after_candidate_snapshot(tmp_path):
