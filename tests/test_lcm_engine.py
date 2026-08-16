@@ -12396,18 +12396,7 @@ class TestSessionRollover:
         holder.join(timeout=1.0)
         assert not holder.is_alive()
 
-        deadline = time.monotonic() + 2.0
-        while time.monotonic() < deadline:
-            persisted = engine._store.get_session_messages("test-session")
-            state = engine._lifecycle.get_by_conversation(engine._conversation_id)
-            if (
-                [message.get("content") for message in persisted]
-                == ["duplicate-safe final message"]
-                and state is not None
-                and state.last_finalized_session_id == "test-session"
-            ):
-                break
-            time.sleep(0.01)
+        assert engine._session_end_drain_done.wait(timeout=2.0)
 
         persisted = engine._store.get_session_messages("test-session")
         state = engine._lifecycle.get_by_conversation(engine._conversation_id)
@@ -12441,17 +12430,7 @@ class TestSessionRollover:
         holder.join(timeout=1.0)
         assert not holder.is_alive()
 
-        deadline = time.monotonic() + 2.0
-        while time.monotonic() < deadline:
-            persisted = engine._store.get_session_messages("test-session")
-            state = engine._lifecycle.get_by_conversation(engine._conversation_id)
-            if (
-                [message.get("content") for message in persisted] == ["one", "two"]
-                and state is not None
-                and state.last_finalized_session_id == "test-session"
-            ):
-                break
-            time.sleep(0.01)
+        assert engine._session_end_drain_done.wait(timeout=2.0)
 
         persisted = engine._store.get_session_messages("test-session")
         assert [message.get("content") for message in persisted] == ["one", "two"]
