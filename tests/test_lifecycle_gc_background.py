@@ -244,6 +244,29 @@ def test_prune_refreshes_protection_for_each_final_delete(tmp_path):
         lifecycle.close()
 
 
+def test_delete_statement_rechecks_protection_at_sql_linearization_point(tmp_path):
+    lifecycle = LifecycleStateStore(tmp_path / "sql-protection.db")
+    try:
+        lifecycle.bind_session("late-protected")
+        calls = 0
+
+        def live_protection():
+            nonlocal calls
+            calls += 1
+            return {"late-protected"} if calls >= 3 else set()
+
+        deleted = lifecycle.prune_empty_sessions(
+            max_age_hours=0,
+            max_candidates=100,
+            protected_session_ids_provider=live_protection,
+        )
+        assert calls >= 3
+        assert deleted == 0
+        assert lifecycle.get_by_session("late-protected") is not None
+    finally:
+        lifecycle.close()
+
+
 def test_prune_preserves_conversation_rebound_after_candidate_snapshot(tmp_path):
     db_path = tmp_path / "rebound-lcm.db"
     lifecycle = LifecycleStateStore(db_path)

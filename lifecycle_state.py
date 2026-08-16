@@ -922,6 +922,22 @@ class LifecycleStateStore:
                             return True
                     return False
 
+                def session_is_protected(current: str | None, finalized: str | None) -> int:
+                    live = set(protected)
+                    if protected_session_ids_provider is not None:
+                        live.update(
+                            str(item)
+                            for item in protected_session_ids_provider()
+                            if item
+                        )
+                    return int(bool({str(item) for item in (current, finalized) if item} & live))
+
+                conn.create_function(
+                    "lcm_gc_session_is_protected",
+                    2,
+                    session_is_protected,
+                )
+
                 deleted = 0
                 now = time.time()
                 for conversation_id, snapshot_cur, snapshot_fin, snapshot_updated_at in candidates:
@@ -958,11 +974,18 @@ class LifecycleStateStore:
                             continue
                     if session_has_data(cur) or session_has_data(fin):
                         continue
-                    conn.execute(
-                        "DELETE FROM lcm_lifecycle_state WHERE conversation_id = ?",
+                    cursor = conn.execute(
+                        """
+                        DELETE FROM lcm_lifecycle_state
+                        WHERE conversation_id = ?
+                          AND lcm_gc_session_is_protected(
+                              current_session_id,
+                              last_finalized_session_id
+                          ) = 0
+                        """,
                         (conversation_id,),
                     )
-                    deleted += 1
+                    deleted += max(0, int(cursor.rowcount or 0))
                 if deleted:
                     conn.commit()
                 else:
