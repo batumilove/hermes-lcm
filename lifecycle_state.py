@@ -16,7 +16,7 @@ import time
 from contextlib import nullcontext
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Optional
+from typing import Any, Callable, Iterable, Optional
 
 from .db_bootstrap import configure_connection, refuse_schema_version_too_new, run_versioned_migrations
 from .sqlite_util import process_sqlite_write_lock
@@ -836,6 +836,7 @@ class LifecycleStateStore:
         self,
         *,
         protected_session_ids: set[str] | list[str] | tuple[str, ...] | None = None,
+        protected_session_ids_provider: Callable[[], Iterable[str]] | None = None,
         max_age_hours: float | None = None,
         max_candidates: int = 100,
     ) -> int:
@@ -863,6 +864,12 @@ class LifecycleStateStore:
         with self._lock.attributed("prune_empty_sessions"):
             conn.execute("BEGIN IMMEDIATE")
             try:
+                if protected_session_ids_provider is not None:
+                    protected.update(
+                        str(item)
+                        for item in protected_session_ids_provider()
+                        if item
+                    )
                 tables = {
                     str(row[0]) for row in conn.execute(
                         "SELECT name FROM sqlite_master WHERE type='table'"

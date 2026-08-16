@@ -125,7 +125,10 @@ from .compaction import CompactionMixin
 from .reset_state import ResetStateMixin
 from .bypass import BypassMixin
 from .lifecycle_state import LifecycleStateStore
-from .lifecycle_gc import request_empty_lifecycle_gc
+from .lifecycle_gc import (
+    protect_empty_lifecycle_sessions,
+    request_empty_lifecycle_gc,
+)
 from .message_content import (
     normalize_content_value,
     stored_text_content_for_pattern_matching,
@@ -1455,6 +1458,8 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
         *,
         conversation_id: str | None = None,
     ) -> None:
+        if self._config.empty_lifecycle_gc_enabled:
+            protect_empty_lifecycle_sessions(self._lifecycle.db_path, {session_id})
         state = self._lifecycle.bind_session(session_id, conversation_id=conversation_id)
         self._conversation_id = state.conversation_id
         self._lcm_session_last_conversation_id[session_id] = state.conversation_id

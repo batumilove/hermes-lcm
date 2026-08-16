@@ -43,6 +43,15 @@ class EmptyLifecycleGCCoordinator:
     def _key(db_path: str | Path) -> str:
         return str(Path(db_path).expanduser().resolve())
 
+    def protect(self, db_path: str | Path, session_ids: Iterable[str]) -> None:
+        """Protect sessions before their bind can race an in-flight GC pass."""
+        key = self._key(db_path)
+        protected = {str(item) for item in session_ids if item}
+        if not protected:
+            return
+        with self._lock:
+            self._states.setdefault(key, _GCState()).protected_session_ids.update(protected)
+
     def request(
         self,
         db_path: str | Path,
@@ -102,6 +111,7 @@ class EmptyLifecycleGCCoordinator:
                 return
             deleted = store.prune_empty_sessions(
                 protected_session_ids=self._protected_snapshot(key),
+                protected_session_ids_provider=lambda: self._protected_snapshot(key),
                 max_age_hours=max_age_hours,
                 max_candidates=batch_size,
             )
@@ -130,6 +140,13 @@ class EmptyLifecycleGCCoordinator:
 
 
 EMPTY_LIFECYCLE_GC_COORDINATOR = EmptyLifecycleGCCoordinator()
+
+
+def protect_empty_lifecycle_sessions(
+    db_path: str | Path,
+    session_ids: Iterable[str],
+) -> None:
+    EMPTY_LIFECYCLE_GC_COORDINATOR.protect(db_path, session_ids)
 
 
 def request_empty_lifecycle_gc(
