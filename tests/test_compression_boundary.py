@@ -77,3 +77,127 @@ def test_compression_boundary_carries_summaries_without_moving_raw_messages(tmp_
         assert payload["session_id"] == "parent-session"
     finally:
         engine.shutdown()
+
+
+def test_replayed_parent_boundary_reuses_existing_child_conversation(tmp_path):
+    """A late duplicate parent boundary must not mint a child-keyed lifecycle row."""
+    config = LCMConfig(
+        database_path=str(tmp_path / "lcm.db"),
+        large_output_externalization_path=str(tmp_path / "externalized"),
+    )
+    engine = LCMEngine(config=config, hermes_home=str(tmp_path / "home"))
+    try:
+        engine.on_session_start(
+            "parent-session",
+            platform="telegram",
+            conversation_id="telegram-thread",
+            context_length=200_000,
+        )
+        store_id = engine._store.append(
+            "parent-session",
+            {"role": "user", "content": "durable parent payload"},
+            source="telegram",
+        )
+        engine._dag.add_node(
+            SummaryNode(
+                session_id="parent-session",
+                depth=0,
+                summary="parent summary",
+                token_count=4,
+                source_token_count=4,
+                source_ids=[store_id],
+                source_type="messages",
+                created_at=time.time(),
+            )
+        )
+        engine.on_session_start(
+            "first-child",
+            platform="telegram",
+            conversation_id="telegram-thread",
+            boundary_reason="compression",
+            old_session_id="parent-session",
+        )
+        assert engine._dag.get_session_nodes("parent-session") == []
+        assert engine._dag.get_session_nodes("first-child")
+
+        # A side-channel can temporarily own the shared engine before a delayed
+        # duplicate compression callback arrives for the already-finalized parent.
+        engine.on_session_start(
+            "auxiliary-session",
+            platform="subagent",
+            conversation_id="auxiliary-conversation",
+        )
+        engine.on_session_start(
+            "abandoned-second-child",
+            platform="telegram",
+            boundary_reason="compression",
+            old_session_id="parent-session",
+        )
+
+        stable = engine._lifecycle.get_by_conversation("telegram-thread")
+        assert stable is not None
+        assert stable.current_session_id == "first-child"
+        assert engine._lifecycle.get_by_conversation("abandoned-second-child") is None
+    finally:
+        engine.shutdown()
+
+
+def test_explicit_conversation_boundary_survives_temporary_auxiliary_binding(tmp_path):
+    """A host-identified boundary must still carry the active sibling forward."""
+    config = LCMConfig(
+        database_path=str(tmp_path / "lcm.db"),
+        large_output_externalization_path=str(tmp_path / "externalized"),
+    )
+    engine = LCMEngine(config=config, hermes_home=str(tmp_path / "home"))
+    try:
+        engine.on_session_start(
+            "parent-session",
+            platform="telegram",
+            conversation_id="telegram-thread",
+            context_length=200_000,
+        )
+        store_id = engine._store.append(
+            "parent-session",
+            {"role": "user", "content": "durable parent payload"},
+            source="telegram",
+        )
+        engine._dag.add_node(
+            SummaryNode(
+                session_id="parent-session",
+                depth=0,
+                summary="parent summary",
+                token_count=4,
+                source_token_count=4,
+                source_ids=[store_id],
+                source_type="messages",
+                created_at=time.time(),
+            )
+        )
+        engine.on_session_start(
+            "first-child",
+            platform="telegram",
+            conversation_id="telegram-thread",
+            boundary_reason="compression",
+            old_session_id="parent-session",
+        )
+        engine.on_session_start(
+            "auxiliary-session",
+            platform="subagent",
+            conversation_id="auxiliary-conversation",
+        )
+
+        engine.on_session_start(
+            "second-real-child",
+            platform="telegram",
+            conversation_id="telegram-thread",
+            boundary_reason="compression",
+            old_session_id="parent-session",
+        )
+
+        stable = engine._lifecycle.get_by_conversation("telegram-thread")
+        assert stable is not None
+        assert stable.current_session_id == "second-real-child"
+        assert engine._dag.get_session_nodes("first-child") == []
+        assert engine._dag.get_session_nodes("second-real-child")
+    finally:
+        engine.shutdown()

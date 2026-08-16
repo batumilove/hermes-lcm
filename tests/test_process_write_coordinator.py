@@ -117,6 +117,41 @@ def test_temporary_busy_timeout_uses_requested_bound_for_coordinator(
     assert attempted_timeouts == [0.05]
 
 
+def test_temporary_busy_timeout_accepts_separate_coordinator_bound(
+    tmp_path, monkeypatch
+):
+    coordinator = sqlite_util.process_sqlite_write_lock(tmp_path / "lcm.db")
+    attempted_timeouts = []
+
+    def reject_acquire(*, timeout):
+        attempted_timeouts.append(timeout)
+        return False
+
+    monkeypatch.setattr(coordinator, "acquire", reject_acquire)
+
+    with pytest.raises(sqlite3.OperationalError, match="process-wide SQLite writer"):
+        with sqlite_util._temporary_sqlite_busy_timeout(
+            [], 50, write_lock=coordinator, write_lock_timeout_ms=200
+        ):
+            pass
+
+    assert attempted_timeouts == [0.2]
+
+
+def test_temporary_busy_timeout_attributes_semantic_operation(tmp_path):
+    coordinator = sqlite_util.process_sqlite_write_lock(tmp_path / "lcm.db")
+
+    with sqlite_util._temporary_sqlite_busy_timeout(
+        [],
+        50,
+        write_lock=coordinator,
+        write_lock_operation="session_end_ingest_finalize",
+    ):
+        assert coordinator.owner_snapshot()["operation"] == "session_end_ingest_finalize"
+
+    assert coordinator.owner_snapshot() == {}
+
+
 def test_process_write_lock_wait_is_bounded(tmp_path, monkeypatch):
     coordinator = sqlite_util.process_sqlite_write_lock(tmp_path / "lcm.db")
     holder_entered = threading.Event()
@@ -178,6 +213,79 @@ def test_process_write_lock_timeout_reports_owner_identity_and_age(tmp_path, mon
     assert "owner_age_s=" in message
     assert "owner_operation=hold_coordinator_for_probe" in message
     assert not holder.is_alive()
+
+
+def test_coordinated_connection_write_attributes_decorated_operation(tmp_path):
+    db_path = tmp_path / "lcm.db"
+    connection = sqlite3.connect(db_path, check_same_thread=False)
+    coordinator = sqlite_util.process_sqlite_write_lock(db_path)
+    holder_entered = threading.Event()
+    release_holder = threading.Event()
+
+    @command_mod._coordinated_connection_write
+    def persist_diagnostic_probe(conn):
+        holder_entered.set()
+        assert release_holder.wait(timeout=2.0)
+
+    holder = threading.Thread(
+        target=persist_diagnostic_probe,
+        args=(connection,),
+        name="lcm-coordinated-probe",
+    )
+    holder.start()
+    assert holder_entered.wait(timeout=1.0)
+
+    try:
+        snapshot = coordinator.owner_snapshot()
+        assert snapshot["operation"] == "persist_diagnostic_probe"
+    finally:
+        release_holder.set()
+        holder.join(timeout=1.0)
+        connection.close()
+
+    assert not holder.is_alive()
+    assert coordinator.owner_snapshot() == {}
+
+
+def test_coordinated_engine_write_attributes_decorated_operation(tmp_path):
+    db_path = tmp_path / "lcm.db"
+    connection = sqlite3.connect(db_path, check_same_thread=False)
+    coordinator = sqlite_util.process_sqlite_write_lock(db_path)
+    holder_entered = threading.Event()
+    release_holder = threading.Event()
+
+    class StoreProbe:
+        def __init__(self):
+            self.db_path = db_path
+            self.connection = connection
+
+    class EngineProbe:
+        def __init__(self):
+            self._store = StoreProbe()
+
+    @command_mod._coordinated_engine_store_write
+    def persist_engine_diagnostic_probe(engine):
+        holder_entered.set()
+        assert release_holder.wait(timeout=2.0)
+
+    holder = threading.Thread(
+        target=persist_engine_diagnostic_probe,
+        args=(EngineProbe(),),
+        name="lcm-engine-coordinated-probe",
+    )
+    holder.start()
+    assert holder_entered.wait(timeout=1.0)
+
+    try:
+        snapshot = coordinator.owner_snapshot()
+        assert snapshot["operation"] == "persist_engine_diagnostic_probe"
+    finally:
+        release_holder.set()
+        holder.join(timeout=1.0)
+        connection.close()
+
+    assert not holder.is_alive()
+    assert coordinator.owner_snapshot() == {}
 
 
 def test_process_write_lock_owner_snapshot_clears_after_release(tmp_path):

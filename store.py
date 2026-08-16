@@ -276,6 +276,16 @@ class MessageStore:
                 key TEXT PRIMARY KEY,
                 value TEXT
             );
+
+            CREATE TABLE IF NOT EXISTS lcm_session_end_ingest_receipts (
+                intent_sha256 TEXT PRIMARY KEY,
+                session_id TEXT NOT NULL,
+                conversation_id TEXT NOT NULL DEFAULT '',
+                message_fingerprints TEXT NOT NULL,
+                recorded_at REAL NOT NULL
+            );
+            CREATE INDEX IF NOT EXISTS idx_session_end_receipts_session_conversation
+                ON lcm_session_end_ingest_receipts(session_id, conversation_id);
         """)
         ensure_external_content_fts(
             self._conn,
@@ -372,7 +382,9 @@ class MessageStore:
                                 messages: List[Dict[str, Any]],
                                 token_estimates: List[int] | None = None,
                                 source: str = "",
-                                conversation_id: str = "") -> List[int]:
+                                conversation_id: str = "",
+                                session_end_intent_sha256: str | None = None,
+                                session_end_message_fingerprints: list[str] | None = None) -> List[int]:
         """Persist messages that already passed ingest protection.
 
         This is an internal fast path for callers that need the protected form
@@ -409,7 +421,101 @@ class MessageStore:
                     ),
                 )
                 ids.append(cur.lastrowid)
+            if session_end_intent_sha256:
+                self._record_session_end_ingest_receipt_in_transaction(
+                    session_end_intent_sha256,
+                    session_id=session_id,
+                    conversation_id=conversation_id,
+                    message_fingerprints=session_end_message_fingerprints or [],
+                )
         return ids
+
+    def _record_session_end_ingest_receipt_in_transaction(
+        self,
+        intent_sha256: str,
+        *,
+        session_id: str,
+        conversation_id: str,
+        message_fingerprints: list[str],
+    ) -> None:
+        conn = self._conn
+        if conn is None:
+            raise RuntimeError("message store is closed")
+        conn.execute(
+            """
+            INSERT OR IGNORE INTO lcm_session_end_ingest_receipts
+                (intent_sha256, session_id, conversation_id, message_fingerprints, recorded_at)
+            VALUES (?, ?, ?, ?, ?)
+            """,
+            (
+                str(intent_sha256),
+                str(session_id),
+                _normalize_conversation_id_value(conversation_id),
+                json.dumps(message_fingerprints, separators=(",", ":")),
+                time.time(),
+            ),
+        )
+
+    def record_session_end_ingest_receipt(
+        self,
+        intent_sha256: str,
+        *,
+        session_id: str,
+        conversation_id: str,
+        message_fingerprints: list[str],
+    ) -> None:
+        conn = self._conn
+        if conn is None:
+            raise RuntimeError("message store is closed")
+        with self._write_lock, conn:
+            self._record_session_end_ingest_receipt_in_transaction(
+                intent_sha256,
+                session_id=session_id,
+                conversation_id=conversation_id,
+                message_fingerprints=message_fingerprints,
+            )
+
+    def has_session_end_ingest_receipt(self, intent_sha256: str) -> bool:
+        conn = self._conn
+        if conn is None:
+            raise RuntimeError("message store is closed")
+        row = conn.execute(
+            "SELECT 1 FROM lcm_session_end_ingest_receipts WHERE intent_sha256 = ?",
+            (str(intent_sha256),),
+        ).fetchone()
+        return row is not None
+
+    def session_end_ingested_prefix_count(
+        self,
+        *,
+        session_id: str,
+        conversation_id: str,
+        message_fingerprints: list[str],
+    ) -> int:
+        conn = self._conn
+        if conn is None:
+            raise RuntimeError("message store is closed")
+        rows = conn.execute(
+            """
+            SELECT message_fingerprints
+            FROM lcm_session_end_ingest_receipts
+            WHERE session_id = ? AND conversation_id = ?
+            """,
+            (str(session_id), _normalize_conversation_id_value(conversation_id)),
+        ).fetchall()
+        best = 0
+        for row in rows:
+            try:
+                prior = json.loads(row[0])
+            except (TypeError, json.JSONDecodeError):
+                continue
+            if (
+                isinstance(prior, list)
+                and len(prior) <= len(message_fingerprints)
+                and prior == message_fingerprints[: len(prior)]
+            ):
+                best = max(best, len(prior))
+        return best
 
     def reassign_session_messages(self, old_session_id: str, new_session_id: str) -> int:
         """Move all persisted messages from one session_id to another."""

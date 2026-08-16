@@ -15,6 +15,7 @@ counts.  They verify:
 
 from __future__ import annotations
 
+import copy
 import gc
 import json
 import sys
@@ -298,6 +299,155 @@ class TestStorageBindCounter:
 # ---------------------------------------------------------------------------
 
 class TestConcurrency:
+    def test_agent_clones_share_one_storage_stack_until_final_shutdown(self, tmp_path):
+        """Per-agent runtime isolation must not multiply SQLite connections."""
+        before = _snapshot()["runtime_lifecycle"]
+        prototype = _make_engine(tmp_path, "shared-clones")
+        clones = [prototype.clone_for_agent() for _ in range(8)]
+
+        after_clone = _snapshot()["runtime_lifecycle"]
+        assert after_clone["engines_created_total"] == before["engines_created_total"] + 9
+        assert after_clone["message_stores_created_total"] == before["message_stores_created_total"] + 1
+        assert after_clone["summary_dags_created_total"] == before["summary_dags_created_total"] + 1
+        assert (
+            after_clone["lifecycle_state_stores_created_total"]
+            == before["lifecycle_state_stores_created_total"] + 1
+        )
+        assert all(clone._store is prototype._store for clone in clones)
+        assert all(clone._dag is prototype._dag for clone in clones)
+        assert all(clone._lifecycle is prototype._lifecycle for clone in clones)
+
+        prototype.shutdown()
+        assert clones[0]._store._conn is not None
+        clones[0].shutdown()
+        assert clones[1]._store._conn is not None
+        for clone in clones[1:]:
+            clone.shutdown()
+
+        after_final = _snapshot()["runtime_lifecycle"]
+        assert after_final["message_stores_closed_total"] == before["message_stores_closed_total"] + 1
+        assert after_final["summary_dags_closed_total"] == before["summary_dags_closed_total"] + 1
+        assert (
+            after_final["lifecycle_state_stores_closed_total"]
+            == before["lifecycle_state_stores_closed_total"] + 1
+        )
+
+    def test_deepcopy_shares_storage_but_keeps_session_state_isolated(self, tmp_path):
+        prototype = _make_engine(tmp_path, "deepcopy-storage")
+        prototype._session_id = "prototype-session"
+        clone = copy.deepcopy(prototype)
+        try:
+            assert clone._store is prototype._store
+            assert clone._dag is prototype._dag
+            assert clone._lifecycle is prototype._lifecycle
+            assert clone._session_id == ""
+            clone._session_id = "clone-session"
+            assert prototype._session_id == "prototype-session"
+        finally:
+            prototype.shutdown()
+            clone.shutdown()
+
+    def test_one_clone_profile_rebind_does_not_close_sibling_storage(self, tmp_path):
+        prototype = _make_engine(tmp_path, "profile-source")
+        clone = prototype.clone_for_agent()
+        original_store = prototype._store
+        original_dag = prototype._dag
+        original_lifecycle = prototype._lifecycle
+        try:
+            assert clone._rebind_storage_for_home(str(tmp_path / "other-home")) is True
+            # A different profile home must detach because MessageStore uses it
+            # for payload paths even when database_path itself stays fixed.
+            assert clone._store is not original_store
+            assert prototype._store is original_store
+            assert original_store._conn is not None
+            assert original_dag._conn is not None
+            assert original_lifecycle._conn is not None
+        finally:
+            prototype.shutdown()
+            clone.shutdown()
+
+    def test_concurrent_clone_creation_and_shutdown_keeps_one_storage_stack(self, tmp_path):
+        before = _snapshot()["runtime_lifecycle"]
+        prototype = _make_engine(tmp_path, "concurrent-clones")
+        errors = []
+
+        def worker():
+            try:
+                clone = prototype.clone_for_agent()
+                assert clone._store is prototype._store
+                clone.shutdown()
+            except Exception as exc:
+                errors.append(exc)
+
+        threads = [threading.Thread(target=worker) for _ in range(24)]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join()
+
+        assert not errors
+        assert prototype._store._conn is not None
+        after_workers = _snapshot()["runtime_lifecycle"]
+        assert after_workers["message_stores_created_total"] == before["message_stores_created_total"] + 1
+        assert after_workers["summary_dags_created_total"] == before["summary_dags_created_total"] + 1
+        assert (
+            after_workers["lifecycle_state_stores_created_total"]
+            == before["lifecycle_state_stores_created_total"] + 1
+        )
+        prototype.shutdown()
+
+    def test_shared_clone_storage_preserves_rows_and_sqlite_integrity_under_overlapping_writes(self, tmp_path):
+        prototype = _make_engine(tmp_path, "overlapping-clone-writes")
+        clones = [prototype.clone_for_agent() for _ in range(8)]
+        errors = []
+        writes_per_clone = 20
+
+        def worker(index, clone):
+            try:
+                for sequence in range(writes_per_clone):
+                    clone._store.append(
+                        f"session-{index}",
+                        {"role": "user", "content": f"message-{index}-{sequence}"},
+                    )
+            except Exception as exc:
+                errors.append(exc)
+
+        threads = [
+            threading.Thread(target=worker, args=(index, clone))
+            for index, clone in enumerate(clones)
+        ]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join()
+
+        try:
+            assert not errors
+            assert prototype._store._conn.execute("PRAGMA quick_check").fetchone()[0] == "ok"
+            assert (
+                prototype._store._conn.execute("SELECT COUNT(*) FROM messages").fetchone()[0]
+                == len(clones) * writes_per_clone
+            )
+        finally:
+            prototype.shutdown()
+            for clone in clones:
+                clone.shutdown()
+
+    def test_independent_roots_keep_distinct_storage_stacks(self, tmp_path):
+        """Shared ownership is family-scoped, never global across roots."""
+        first = _make_engine(tmp_path, "independent-roots")
+        second = _make_engine(tmp_path, "independent-roots")
+        try:
+            assert first._storage_owner is not second._storage_owner
+            assert first._store is not second._store
+            assert first._dag is not second._dag
+            assert first._lifecycle is not second._lifecycle
+            first.shutdown()
+            assert second._store._conn is not None
+        finally:
+            first.shutdown()
+            second.shutdown()
+
     def test_concurrent_engine_creation_and_shutdown(self, tmp_path):
         before = _snapshot()["runtime_lifecycle"]
         errors = []
@@ -343,6 +493,32 @@ class TestConcurrency:
 
 
 class TestFailureAndRegistryCounters:
+    def test_shared_owner_attempts_every_close_and_raises_first_error(self):
+        from hermes_lcm.engine import _SharedStorageOwner
+
+        calls = []
+
+        class BrokenHelper:
+            def __init__(self, name):
+                self.name = name
+
+            def close(self):
+                calls.append(self.name)
+                raise RuntimeError(f"{self.name} close failed")
+
+        owner = _SharedStorageOwner(
+            BrokenHelper("store"),
+            BrokenHelper("dag"),
+            BrokenHelper("lifecycle"),
+        )
+
+        with pytest.raises(RuntimeError, match="store close failed"):
+            owner.release()
+
+        assert calls == ["store", "dag", "lifecycle"]
+        owner.release()
+        assert calls == ["store", "dag", "lifecycle"]
+
     def test_helper_close_failure_is_not_reported_as_closed(self):
         from hermes_lcm.store import MessageStore
 

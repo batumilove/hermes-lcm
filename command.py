@@ -88,14 +88,17 @@ _EMBEDDING_BACKFILL_CLAIM_TTL_S = 10 * 60
 _EMBEDDING_BACKFILL_BATCH_SIZE = 32
 
 
-def _database_write_context(engine, conn: sqlite3.Connection):
+def _database_write_context(
+    engine, conn: sqlite3.Connection, *, operation: str | None = None
+):
     db_path = getattr(getattr(engine, "_store", None), "db_path", None)
     if not db_path:
         row = conn.execute("PRAGMA database_list").fetchone()
         db_path = row[2] if row and len(row) > 2 else None
     if not db_path or str(db_path) == ":memory:":
         return nullcontext()
-    return process_sqlite_write_lock(db_path)
+    coordinator = process_sqlite_write_lock(db_path)
+    return coordinator.attributed(operation) if operation else coordinator
 
 
 def _coordinated_connection_write(method):
@@ -104,7 +107,7 @@ def _coordinated_connection_write(method):
     @wraps(method)
     def wrapper(connection_or_owner, *args, **kwargs):
         conn = getattr(connection_or_owner, "conn", connection_or_owner)
-        with _database_write_context(None, conn):
+        with _database_write_context(None, conn, operation=method.__name__):
             return method(connection_or_owner, *args, **kwargs)
 
     return wrapper
@@ -116,7 +119,7 @@ def _coordinated_engine_store_write(method):
     @wraps(method)
     def wrapper(engine, *args, **kwargs):
         conn = engine._store.connection
-        with _database_write_context(engine, conn):
+        with _database_write_context(engine, conn, operation=method.__name__):
             return method(engine, *args, **kwargs)
 
     return wrapper
@@ -1570,7 +1573,8 @@ def _doctor_text(engine) -> str:
 
     try:
         lifecycle_stats = engine._lifecycle.get_fragmentation_stats(
-            state_db_path=_state_db_path_for_engine(engine)
+            state_db_path=_state_db_path_for_engine(engine),
+            empty_lifecycle_max_age_hours=engine._config.empty_lifecycle_gc_max_age_hours,
         )
     except Exception as exc:  # pragma: no cover - defensive
         issues.append("lifecycle_fragmentation")
@@ -1580,6 +1584,8 @@ def _doctor_text(engine) -> str:
             "lifecycle_fragmentation: "
             f"lifecycle_rows={lifecycle_stats['lifecycle_rows']} "
             f"empty_lifecycle_rows={lifecycle_stats.get('empty_lifecycle_rows', 0)} "
+            f"actionable_empty_lifecycle_rows={lifecycle_stats.get('actionable_empty_lifecycle_rows', 0)} "
+            f"recent_gc_protected_empty_lifecycle_rows={lifecycle_stats.get('recent_gc_protected_empty_lifecycle_rows', 0)} "
             f"message_sessions={lifecycle_stats['distinct_message_sessions']} "
             f"node_sessions={lifecycle_stats['distinct_node_sessions']} "
             f"current_missing_in_lcm_any={lifecycle_stats['lifecycle_current_missing_in_lcm_any']} "

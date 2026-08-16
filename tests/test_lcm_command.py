@@ -5,6 +5,7 @@ from pathlib import Path
 import importlib.util
 import sqlite3
 import sys
+import time
 from types import SimpleNamespace
 
 import pytest
@@ -1031,6 +1032,55 @@ def test_lcm_doctor_reports_lifecycle_fragmentation_as_read_only_observation(eng
     assert engine._lifecycle.row_count() == 2
 
 
+def test_lcm_doctor_does_not_warn_for_recent_gc_protected_empty_lifecycle_row(engine):
+    engine._config.empty_lifecycle_gc_max_age_hours = 24.0
+    engine._lifecycle._conn.execute(
+        """INSERT INTO lcm_lifecycle_state
+           (conversation_id, current_session_id, current_frontier_store_id,
+            last_finalized_frontier_store_id, current_bound_at, updated_at)
+           VALUES (?, ?, ?, ?, ?, ?)""",
+        ("recent-empty", "recent-empty", 0, 0, time.time(), time.time()),
+    )
+    engine._lifecycle._conn.commit()
+
+    result = handle_lcm_command("doctor", engine)
+    payload = json.loads(lcm_tools.lcm_doctor({}, engine=engine))
+    lifecycle_check = next(
+        check for check in payload["checks"] if check["check"] == "lifecycle_fragmentation"
+    )
+
+    assert "status: ok" in result
+    assert lifecycle_check["status"] == "pass"
+    assert "empty_lifecycle_rows=1" in result
+    assert "actionable_empty_lifecycle_rows=0" in result
+    assert "recent_gc_protected_empty_lifecycle_rows=1" in result
+
+
+def test_lcm_doctor_warns_for_gc_eligible_empty_lifecycle_row(engine):
+    engine._config.empty_lifecycle_gc_max_age_hours = 24.0
+    old = time.time() - (25 * 3600)
+    engine._lifecycle._conn.execute(
+        """INSERT INTO lcm_lifecycle_state
+           (conversation_id, current_session_id, current_frontier_store_id,
+            last_finalized_frontier_store_id, current_bound_at, updated_at)
+           VALUES (?, ?, ?, ?, ?, ?)""",
+        ("old-empty", "old-empty", 0, 0, old, old),
+    )
+    engine._lifecycle._conn.commit()
+
+    result = handle_lcm_command("doctor", engine)
+    payload = json.loads(lcm_tools.lcm_doctor({}, engine=engine))
+    lifecycle_check = next(
+        check for check in payload["checks"] if check["check"] == "lifecycle_fragmentation"
+    )
+
+    assert "status: action-recommended" in result
+    assert lifecycle_check["status"] == "warn"
+    assert "empty_lifecycle_rows=1" in result
+    assert "actionable_empty_lifecycle_rows=1" in result
+    assert "recent_gc_protected_empty_lifecycle_rows=0" in result
+
+
 def test_lcm_doctor_reports_lcm_sessions_without_lifecycle_references_as_observations(engine):
     engine.on_session_start("current-session", platform="cli", context_length=200000)
     engine._store.append("current-session", {"role": "user", "content": "covered"}, source="cli")
@@ -1869,6 +1919,97 @@ def test_register_skips_lcm_slash_command_by_default(tmp_path, monkeypatch):
 
     assert ctx.engine is not None
     assert "lcm" not in ctx.commands
+
+
+def test_repeated_register_shuts_down_superseded_root_engine(tmp_path, monkeypatch):
+    """Plugin rediscovery must not strand the previous root SQLite stack."""
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / "hermes_home"))
+    monkeypatch.delenv("LCM_ENABLE_SLASH_COMMAND", raising=False)
+
+    spec = importlib.util.spec_from_file_location(
+        "hermes_lcm_init_runtime_rediscovery",
+        str(Path(__file__).resolve().parent.parent / "__init__.py"),
+        submodule_search_locations=[str(Path(__file__).resolve().parent.parent)],
+    )
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[spec.name] = module
+    assert spec.loader is not None
+    spec.loader.exec_module(module)
+
+    class _Ctx:
+        def __init__(self):
+            self.engine = None
+
+        def register_context_engine(self, engine):
+            self.engine = engine
+
+        def register_tool(self, name, toolset, schema, handler, description="", emoji=""):
+            pass
+
+    first_ctx = _Ctx()
+    module.register(first_ctx)
+    first = first_ctx.engine
+    assert first._store._conn is not None
+
+    second_ctx = _Ctx()
+    module.register(second_ctx)
+    second = second_ctx.engine
+    try:
+        assert second is not first
+        assert first._store._conn is None
+        assert first._dag._conn is None
+        assert first._lifecycle._conn is None
+        assert second._store._conn is not None
+    finally:
+        second.shutdown()
+
+
+def test_rejected_reregistration_keeps_previous_root_and_closes_rejected_engine(
+    tmp_path, monkeypatch
+):
+    """A host collision must not retire the still-registered root engine."""
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / "hermes_home"))
+    monkeypatch.delenv("LCM_ENABLE_SLASH_COMMAND", raising=False)
+
+    spec = importlib.util.spec_from_file_location(
+        "hermes_lcm_init_runtime_rejected_rediscovery",
+        str(Path(__file__).resolve().parent.parent / "__init__.py"),
+        submodule_search_locations=[str(Path(__file__).resolve().parent.parent)],
+    )
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[spec.name] = module
+    assert spec.loader is not None
+    spec.loader.exec_module(module)
+
+    class _Ctx:
+        def __init__(self, *, accept=True, registered=None):
+            self.accept = accept
+            self.engine = registered
+            self.attempted = None
+
+        def register_context_engine(self, engine):
+            self.attempted = engine
+            if self.accept:
+                self.engine = engine
+
+        def register_tool(self, name, toolset, schema, handler, description="", emoji=""):
+            pass
+
+    first_ctx = _Ctx()
+    module.register(first_ctx)
+    first = first_ctx.engine
+
+    rejected_ctx = _Ctx(accept=False, registered=first)
+    module.register(rejected_ctx)
+    rejected = rejected_ctx.attempted
+    try:
+        assert rejected is not first
+        assert rejected_ctx.engine is first
+        assert first._store._conn is not None
+        assert rejected._store._conn is None
+        assert module._registered_root_engine is first
+    finally:
+        first.shutdown()
 
 
 def test_register_allows_lcm_slash_command_when_explicitly_enabled(tmp_path, monkeypatch):

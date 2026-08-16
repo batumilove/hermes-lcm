@@ -54,8 +54,14 @@ def has_lifecycle_fragmentation(stats: dict[str, Any]) -> bool:
     do not make overall health unhealthy solely because historical LCM/state
     indexes no longer agree.
     """
-    empty_lifecycle_rows = int(stats.get("empty_lifecycle_rows", 0) or 0)
-    return empty_lifecycle_rows > 0 or (
+    actionable_empty_lifecycle_rows = int(
+        stats.get(
+            "actionable_empty_lifecycle_rows",
+            stats.get("empty_lifecycle_rows", 0),
+        )
+        or 0
+    )
+    return actionable_empty_lifecycle_rows > 0 or (
         bool(stats.get("state_db_checked")) and bool(stats.get("state_db_error"))
     )
 

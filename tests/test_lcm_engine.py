@@ -12200,7 +12200,7 @@ class TestSessionRollover:
     def test_on_session_end_fails_open_when_ingest_store_is_locked(self, engine, monkeypatch, caplog):
         engine.on_session_start("test-session", platform="discord")
 
-        def locked_ingest(messages):
+        def locked_ingest(messages, **_kwargs):
             raise sqlite3.OperationalError("database is locked")
 
         monkeypatch.setattr(engine, "_ingest_messages", locked_ingest)
@@ -12213,7 +12213,7 @@ class TestSessionRollover:
     def test_on_session_end_fails_open_when_ingest_is_interrupted(self, engine, monkeypatch, caplog):
         engine.on_session_start("test-session", platform="discord")
 
-        def interrupted_ingest(messages):
+        def interrupted_ingest(messages, **_kwargs):
             raise KeyboardInterrupt()
 
         monkeypatch.setattr(engine, "_ingest_messages", interrupted_ingest)
@@ -12271,10 +12271,465 @@ class TestSessionRollover:
         assert engine._lifecycle._conn.execute("PRAGMA busy_timeout").fetchone()[0] == 750
         assert "LCM session-end raw-message ingest skipped due to SQLite lock" in caplog.text
 
+    def test_on_session_end_waits_for_short_same_process_writer_overlap(self, engine, caplog):
+        engine.on_session_start("test-session", platform="discord")
+        holder_entered = threading.Event()
+
+        def hold_writer_briefly():
+            with engine._store._write_lock.attributed("concurrent_idle_shutdown"):
+                holder_entered.set()
+                time.sleep(0.08)
+
+        holder = threading.Thread(target=hold_writer_briefly, name="short-lcm-writer")
+        holder.start()
+        assert holder_entered.wait(timeout=1.0)
+
+        with caplog.at_level(logging.WARNING):
+            engine.on_session_end("test-session", [{"role": "user", "content": "hello"}])
+        holder.join(timeout=1.0)
+
+        assert not holder.is_alive()
+        assert "LCM session-end ingest/finalize skipped due to SQLite lock" not in caplog.text
+        assert len(engine._store.get_session_messages("test-session")) == 1
+
+    def test_on_session_end_attributes_its_process_writer_hold(self, engine, monkeypatch):
+        engine.on_session_start("test-session", platform="discord")
+        ingest_entered = threading.Event()
+        release_ingest = threading.Event()
+
+        def hold_inside_ingest(messages, **_kwargs):
+            del messages
+            ingest_entered.set()
+            assert release_ingest.wait(timeout=2.0)
+
+        monkeypatch.setattr(engine, "_ingest_messages", hold_inside_ingest)
+        worker = threading.Thread(
+            target=engine.on_session_end,
+            args=("test-session", [{"role": "user", "content": "hello"}]),
+            name="session-end-attribution-probe",
+        )
+        worker.start()
+        try:
+            assert ingest_entered.wait(timeout=1.0)
+            assert engine._store._write_lock.owner_snapshot()["operation"] == (
+                "session_end_ingest_finalize"
+            )
+        finally:
+            release_ingest.set()
+            worker.join(timeout=2.0)
+
+        assert not worker.is_alive()
+        assert engine._store._write_lock.owner_snapshot() == {}
+
+    def test_on_session_end_eventually_persists_after_long_same_process_writer_overlap(
+        self,
+        engine,
+    ):
+        engine.on_session_start("test-session", platform="discord")
+        holder_entered = threading.Event()
+        release_holder = threading.Event()
+        final_messages = [{"role": "user", "content": "durable final message"}]
+
+        def hold_writer():
+            with engine._store._write_lock.attributed("timed_out_compression_writer"):
+                holder_entered.set()
+                assert release_holder.wait(timeout=2.0)
+
+        holder = threading.Thread(target=hold_writer, name="long-lcm-writer")
+        holder.start()
+        assert holder_entered.wait(timeout=1.0)
+
+        started = time.monotonic()
+        engine.on_session_end("test-session", final_messages)
+        elapsed = time.monotonic() - started
+
+        assert elapsed < 0.75
+        assert engine._store.get_session_messages("test-session") == []
+
+        release_holder.set()
+        holder.join(timeout=1.0)
+        assert not holder.is_alive()
+
+        deadline = time.monotonic() + 2.0
+        while time.monotonic() < deadline:
+            persisted = engine._store.get_session_messages("test-session")
+            state = engine._lifecycle.get_by_conversation(engine._conversation_id)
+            if (
+                len(persisted) == 1
+                and persisted[0].get("content") == "durable final message"
+                and state is not None
+                and state.last_finalized_session_id == "test-session"
+            ):
+                break
+            time.sleep(0.01)
+
+        persisted = engine._store.get_session_messages("test-session")
+        state = engine._lifecycle.get_by_conversation(engine._conversation_id)
+        assert [message.get("content") for message in persisted] == ["durable final message"]
+        assert state is not None
+        assert state.last_finalized_session_id == "test-session"
+
+    def test_duplicate_session_end_callbacks_eventually_persist_exactly_once(
+        self,
+        engine,
+    ):
+        engine.on_session_start("test-session", platform="discord")
+        holder_entered = threading.Event()
+        release_holder = threading.Event()
+        final_messages = [{"role": "user", "content": "duplicate-safe final message"}]
+
+        def hold_writer():
+            with engine._store._write_lock.attributed("duplicate_callback_writer"):
+                holder_entered.set()
+                assert release_holder.wait(timeout=2.0)
+
+        holder = threading.Thread(target=hold_writer, name="duplicate-callback-writer")
+        holder.start()
+        assert holder_entered.wait(timeout=1.0)
+
+        engine.on_session_end("test-session", final_messages)
+        engine.on_session_end("test-session", final_messages)
+        release_holder.set()
+        holder.join(timeout=1.0)
+        assert not holder.is_alive()
+
+        deadline = time.monotonic() + 2.0
+        while time.monotonic() < deadline:
+            persisted = engine._store.get_session_messages("test-session")
+            state = engine._lifecycle.get_by_conversation(engine._conversation_id)
+            if (
+                [message.get("content") for message in persisted]
+                == ["duplicate-safe final message"]
+                and state is not None
+                and state.last_finalized_session_id == "test-session"
+            ):
+                break
+            time.sleep(0.01)
+
+        persisted = engine._store.get_session_messages("test-session")
+        state = engine._lifecycle.get_by_conversation(engine._conversation_id)
+        assert [message.get("content") for message in persisted] == [
+            "duplicate-safe final message"
+        ]
+        assert state is not None
+        assert state.last_finalized_session_id == "test-session"
+
+    def test_extending_duplicate_session_end_callbacks_persist_latest_payload_once(
+        self,
+        engine,
+    ):
+        engine.on_session_start("test-session", platform="discord")
+        holder_entered = threading.Event()
+        release_holder = threading.Event()
+        first = [{"role": "user", "content": "one"}]
+        latest = first + [{"role": "assistant", "content": "two"}]
+
+        def hold_writer():
+            with engine._store._write_lock.attributed("extending_duplicate_writer"):
+                holder_entered.set()
+                assert release_holder.wait(timeout=2.0)
+
+        holder = threading.Thread(target=hold_writer, name="extending-duplicate-writer")
+        holder.start()
+        assert holder_entered.wait(timeout=1.0)
+        engine.on_session_end("test-session", first)
+        engine.on_session_end("test-session", latest)
+        release_holder.set()
+        holder.join(timeout=1.0)
+        assert not holder.is_alive()
+
+        deadline = time.monotonic() + 2.0
+        while time.monotonic() < deadline:
+            persisted = engine._store.get_session_messages("test-session")
+            state = engine._lifecycle.get_by_conversation(engine._conversation_id)
+            if (
+                [message.get("content") for message in persisted] == ["one", "two"]
+                and state is not None
+                and state.last_finalized_session_id == "test-session"
+            ):
+                break
+            time.sleep(0.01)
+
+        persisted = engine._store.get_session_messages("test-session")
+        assert [message.get("content") for message in persisted] == ["one", "two"]
+
+    def test_shutdown_boundedly_drains_session_end_after_writer_release(
+        self,
+        tmp_path,
+    ):
+        config = LCMConfig(database_path=str(tmp_path / "shutdown-drain.db"))
+        ending = LCMEngine(config=config)
+        ending.on_session_start("shutdown-session", platform="discord")
+        holder_entered = threading.Event()
+        release_holder = threading.Event()
+
+        def hold_writer():
+            with ending._store._write_lock.attributed("shutdown_drain_writer"):
+                holder_entered.set()
+                assert release_holder.wait(timeout=2.0)
+
+        holder = threading.Thread(target=hold_writer, name="shutdown-drain-writer")
+        holder.start()
+        assert holder_entered.wait(timeout=1.0)
+        ending.on_session_end(
+            "shutdown-session",
+            [{"role": "user", "content": "shutdown-drained final message"}],
+        )
+        release_holder.set()
+        holder.join(timeout=1.0)
+        assert not holder.is_alive()
+
+        started = time.monotonic()
+        ending.shutdown()
+        assert time.monotonic() - started < 1.0
+
+        restarted = LCMEngine(config=config)
+        try:
+            restarted.on_session_start("shutdown-session", platform="discord")
+            persisted = restarted._store.get_session_messages("shutdown-session")
+            state = restarted._lifecycle.get_by_conversation(restarted._conversation_id)
+            assert [message.get("content") for message in persisted] == [
+                "shutdown-drained final message"
+            ]
+            assert state is not None
+            assert state.last_finalized_session_id == "shutdown-session"
+        finally:
+            restarted.shutdown()
+
+    def test_pending_session_end_recovers_exactly_once_after_engine_restart(
+        self,
+        tmp_path,
+    ):
+        config = LCMConfig(database_path=str(tmp_path / "restart-recovery.db"))
+        ending = LCMEngine(config=config)
+        ending.on_session_start("restart-session", platform="discord")
+        holder_entered = threading.Event()
+        release_holder = threading.Event()
+
+        def hold_writer():
+            with ending._store._write_lock.attributed("restart_recovery_writer"):
+                holder_entered.set()
+                release_holder.wait()
+
+        holder = threading.Thread(target=hold_writer, name="restart-recovery-writer")
+        holder.start()
+        assert holder_entered.wait(timeout=1.0)
+        ending.on_session_end(
+            "restart-session",
+            [{"role": "user", "content": "restart-recovered final message"}],
+        )
+
+        shutdown_done = threading.Event()
+        shutdown_errors = []
+
+        def shut_down_ending_engine():
+            try:
+                ending.shutdown()
+            except BaseException as exc:
+                shutdown_errors.append(exc)
+            finally:
+                shutdown_done.set()
+
+        shutdown_thread = threading.Thread(
+            target=shut_down_ending_engine,
+            name="restart-recovery-shutdown",
+        )
+        shutdown_thread.start()
+        shutdown_was_bounded = shutdown_done.wait(timeout=1.0)
+
+        # Always release and join both test-owned threads before asserting the
+        # protected bound, so RED cannot leak work into later tests.
+        release_holder.set()
+        holder.join(timeout=1.0)
+        shutdown_thread.join(timeout=1.0)
+        assert not holder.is_alive()
+        assert not shutdown_thread.is_alive()
+        assert shutdown_errors == []
+        assert shutdown_was_bounded
+
+        restarted = LCMEngine(config=config)
+        try:
+            restarted.on_session_start("restart-session", platform="discord")
+            deadline = time.monotonic() + 2.0
+            while time.monotonic() < deadline:
+                persisted = restarted._store.get_session_messages("restart-session")
+                state = restarted._lifecycle.get_by_conversation(
+                    restarted._conversation_id
+                )
+                if (
+                    [message.get("content") for message in persisted]
+                    == ["restart-recovered final message"]
+                    and state is not None
+                    and state.last_finalized_session_id == "restart-session"
+                ):
+                    break
+                time.sleep(0.01)
+
+            persisted = restarted._store.get_session_messages("restart-session")
+            state = restarted._lifecycle.get_by_conversation(
+                restarted._conversation_id
+            )
+            assert [message.get("content") for message in persisted] == [
+                "restart-recovered final message"
+            ]
+            assert state is not None
+            assert state.last_finalized_session_id == "restart-session"
+        finally:
+            restarted.shutdown()
+
+    def test_corrupt_pending_session_end_is_quarantined_without_retry_loop(
+        self,
+        engine,
+        monkeypatch,
+    ):
+        from hermes_lcm.session_end_pending import pending_session_end_dir
+
+        directory = pending_session_end_dir(engine._store.db_path)
+        directory.mkdir(parents=True, exist_ok=True)
+        corrupt = directory / "corrupt.json"
+        corrupt.write_text("{not-json", encoding="utf-8")
+        calls = 0
+        original = engine._drain_one_session_end_intent
+
+        def counted(path):
+            nonlocal calls
+            calls += 1
+            return original(path)
+
+        monkeypatch.setattr(engine, "_drain_one_session_end_intent", counted)
+        engine._schedule_session_end_drain()
+        assert engine._session_end_drain_done.wait(timeout=1.0)
+        assert calls == 1
+        assert not corrupt.exists()
+        assert list(directory.glob("*.invalid"))
+
+    def test_session_end_drain_does_not_lose_wakeup_at_empty_exit(
+        self,
+        engine,
+        monkeypatch,
+    ):
+        from hermes_lcm.session_end_pending import iter_session_end_intents
+
+        original_iter = iter_session_end_intents
+        empty_scan_entered = threading.Event()
+        release_empty_scan = threading.Event()
+        scans = 0
+
+        def gated_iter(db_path):
+            nonlocal scans
+            result = tuple(original_iter(db_path))
+            scans += 1
+            if scans == 1 and not result:
+                empty_scan_entered.set()
+                assert release_empty_scan.wait(timeout=2.0)
+            return result
+
+        monkeypatch.setattr("hermes_lcm.engine.iter_session_end_intents", gated_iter)
+        engine._schedule_session_end_drain()
+        assert empty_scan_entered.wait(timeout=1.0)
+        engine._persist_session_end_intent(
+            "test-session",
+            [{"role": "user", "content": "published at worker exit"}],
+        )
+        engine._schedule_session_end_drain()
+        release_empty_scan.set()
+
+        deadline = time.monotonic() + 2.0
+        while time.monotonic() < deadline:
+            if engine._store.get_session_messages("test-session"):
+                break
+            time.sleep(0.01)
+        assert [
+            message.get("content")
+            for message in engine._store.get_session_messages("test-session")
+        ] == ["published at worker exit"]
+
+    def test_deferred_session_end_retries_transient_lifecycle_failure_without_duplicate_ingest(
+        self,
+        engine,
+        monkeypatch,
+    ):
+        engine.on_session_start("test-session", platform="discord")
+        original_finalize = engine._lifecycle.finalize_session
+        attempts = 0
+
+        def fail_once(*args, **kwargs):
+            nonlocal attempts
+            attempts += 1
+            if attempts == 1:
+                raise RuntimeError("transient lifecycle failure")
+            return original_finalize(*args, **kwargs)
+
+        monkeypatch.setattr(engine._lifecycle, "finalize_session", fail_once)
+        intent = engine._persist_session_end_intent(
+            "test-session",
+            [{"role": "user", "content": "persist exactly once"}],
+        )
+        engine._schedule_session_end_drain()
+
+        deadline = time.monotonic() + 2.0
+        while time.monotonic() < deadline and intent.exists():
+            time.sleep(0.01)
+
+        persisted = engine._store.get_session_messages("test-session")
+        state = engine._lifecycle.get_by_conversation(engine._conversation_id)
+        assert not intent.exists()
+        assert attempts >= 2
+        assert [message.get("content") for message in persisted] == [
+            "persist exactly once"
+        ]
+        assert state is not None
+        assert state.last_finalized_session_id == "test-session"
+
+    def test_deferred_session_end_retries_when_writer_outlives_first_drain_attempt(
+        self,
+        engine,
+    ):
+        engine.on_session_start("test-session", platform="discord")
+        holder_entered = threading.Event()
+        release_holder = threading.Event()
+
+        def hold_writer():
+            with engine._store._write_lock.attributed("long_retry_writer"):
+                holder_entered.set()
+                assert release_holder.wait(timeout=4.0)
+
+        holder = threading.Thread(target=hold_writer, name="long-retry-writer")
+        holder.start()
+        assert holder_entered.wait(timeout=1.0)
+        engine.on_session_end(
+            "test-session",
+            [{"role": "user", "content": "retry after coordinator timeout"}],
+        )
+        time.sleep(2.2)
+        release_holder.set()
+        holder.join(timeout=1.0)
+        assert not holder.is_alive()
+
+        deadline = time.monotonic() + 2.0
+        while time.monotonic() < deadline:
+            persisted = engine._store.get_session_messages("test-session")
+            state = engine._lifecycle.get_by_conversation(engine._conversation_id)
+            if (
+                persisted
+                and state is not None
+                and state.last_finalized_session_id == "test-session"
+            ):
+                break
+            time.sleep(0.01)
+
+        persisted = engine._store.get_session_messages("test-session")
+        state = engine._lifecycle.get_by_conversation(engine._conversation_id)
+        assert [message.get("content") for message in persisted] == [
+            "retry after coordinator timeout"
+        ]
+        assert state is not None
+        assert state.last_finalized_session_id == "test-session"
+
     def test_on_session_end_reraises_non_lock_errors(self, engine, monkeypatch):
         engine.on_session_start("test-session", platform="discord")
 
-        def broken_ingest(messages):
+        def broken_ingest(messages, **_kwargs):
             raise RuntimeError("not a lock")
 
         monkeypatch.setattr(engine, "_ingest_messages", broken_ingest)
@@ -25511,6 +25966,39 @@ class TestEngineTools:
         assert "orphaned_dag_nodes" in check_names
         assert "config_validation" in check_names
         assert all(c["status"] == "pass" for c in result["checks"])
+
+    def test_handle_doctor_integrity_checks_avoid_shared_store_connection(self, engine):
+        original_connection = engine._store._conn
+
+        class GuardedConnection:
+            def __init__(self, wrapped):
+                self._wrapped = wrapped
+
+            def execute(self, sql, *args, **kwargs):
+                normalized = " ".join(str(sql).lower().split())
+                if normalized.startswith("pragma integrity_check") or normalized.startswith(
+                    "pragma quick_check"
+                ):
+                    raise AssertionError("doctor used the shared store connection")
+                return self._wrapped.execute(sql, *args, **kwargs)
+
+            def __getattr__(self, name):
+                return getattr(self._wrapped, name)
+
+        engine._store._conn = GuardedConnection(original_connection)
+        try:
+            result = json.loads(engine.handle_tool_call("lcm_doctor", {}))
+        finally:
+            engine._store._conn = original_connection
+
+        checks = {check["check"]: check for check in result["checks"]}
+        assert checks["database_integrity"] == {
+            "check": "database_integrity",
+            "status": "pass",
+            "detail": "ok",
+        }
+        assert checks["sqlite_storage"]["status"] == "pass"
+        assert checks["sqlite_storage"]["detail"]["quick_check"] == "ok"
 
     def test_handle_doctor_reports_fts_integrity_failures_separately(self, engine, monkeypatch):
         def fake_fts_integrity(_conn, spec):
