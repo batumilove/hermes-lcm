@@ -125,6 +125,10 @@ from .compaction import CompactionMixin
 from .reset_state import ResetStateMixin
 from .bypass import BypassMixin
 from .lifecycle_state import LifecycleStateStore
+from .lifecycle_gc import (
+    protect_empty_lifecycle_sessions,
+    request_empty_lifecycle_gc,
+)
 from .message_content import (
     normalize_content_value,
     stored_text_content_for_pattern_matching,
@@ -156,6 +160,16 @@ _AUTO_FOCUS_MAX_CHARS = 700
 
 _PRESERVED_TODO_CONTEXT_PREFIX = "[Your active task list was preserved across context compression]"
 _LCM_MESSAGE_PREFIX_FINGERPRINT_LIMIT = 8
+
+
+def _active_lifecycle_gc_session_ids() -> set[str]:
+    """Return every process-local session currently registered to an LCM engine."""
+    with _ACTIVE_ENGINE_REGISTRY_LOCK:
+        return {
+            str(session_id)
+            for session_id in _ACTIVE_ENGINES_BY_SESSION_ID
+            if session_id
+        }
 
 
 class _SharedStorageOwner:
@@ -1454,6 +1468,14 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
         *,
         conversation_id: str | None = None,
     ) -> None:
+        if self._config.empty_lifecycle_gc_enabled:
+            try:
+                protect_empty_lifecycle_sessions(self._lifecycle.db_path, {session_id})
+            except Exception:
+                logger.warning(
+                    "LCM could not protect session from empty-lifecycle GC",
+                    exc_info=True,
+                )
         state = self._lifecycle.bind_session(session_id, conversation_id=conversation_id)
         self._conversation_id = state.conversation_id
         self._lcm_session_last_conversation_id[session_id] = state.conversation_id
@@ -1466,29 +1488,22 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
             self._foreground_session_platform = self._session_platform
             self._foreground_conversation_id = state.conversation_id
 
-        # Garbage-collect empty lifecycle rows when the table exceeds threshold.
-        # Gateway restarts, ephemeral cron ticks, and crash-loops all create
-        # lifecycle rows that never ingest data — prune them here so they
-        # don't accumulate forever.
-        if (
-            self._config.empty_lifecycle_gc_enabled
-            and self._lifecycle.row_count() > self._config.empty_lifecycle_gc_threshold
-        ):
-            protected = {str(self._session_id)} if self._session_id else None
-            max_age = self._config.empty_lifecycle_gc_max_age_hours
+        # Empty lifecycle maintenance must never add database-scan latency to a
+        # session bind. The process-wide coordinator rate-limits and single-flights
+        # bounded background passes for this database.
+        if self._config.empty_lifecycle_gc_enabled:
             try:
-                deleted = self._lifecycle.prune_empty_sessions(
-                    protected_session_ids=protected,
-                    max_age_hours=max_age,
+                request_empty_lifecycle_gc(
+                    self._lifecycle.db_path,
+                    threshold=self._config.empty_lifecycle_gc_threshold,
+                    max_age_hours=self._config.empty_lifecycle_gc_max_age_hours,
+                    protected_session_ids={str(self._session_id)} if self._session_id else (),
+                    protected_session_ids_provider=_active_lifecycle_gc_session_ids,
                 )
             except Exception:
-                deleted = 0
-            if deleted:
-                logger.info(
-                    "LCM pruned %d lifecycle rows with zero stored data "
-                    "(table exceeded threshold of %d rows)",
-                    deleted,
-                    self._config.empty_lifecycle_gc_threshold,
+                logger.warning(
+                    "LCM could not schedule empty-lifecycle GC",
+                    exc_info=True,
                 )
         # Bypassed/stateless sessions skip every LCM write, so they must also skip
         # rollup maintenance — otherwise the bind-time hook would build rollups for

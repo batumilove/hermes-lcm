@@ -16,10 +16,13 @@ import time
 from contextlib import nullcontext
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Optional
+from typing import Any, Callable, ContextManager, Iterable, Optional
 
 from .db_bootstrap import configure_connection, refuse_schema_version_too_new, run_versioned_migrations
 from .sqlite_util import process_sqlite_write_lock
+
+
+_MAX_EMPTY_LIFECYCLE_GC_BATCH_SIZE = 100
 
 
 def _synchronized(method):
@@ -31,7 +34,7 @@ def _synchronized(method):
     """
     @functools.wraps(method)
     def wrapper(self, *args, **kwargs):
-        with self._lock:
+        with self._lock.attributed(method.__name__):
             return method(self, *args, **kwargs)
     return wrapper
 
@@ -737,123 +740,290 @@ class LifecycleStateStore:
         self._conn.commit()
         return self.get_by_conversation(conversation_id)
 
-    @_synchronized
-    def prune_empty_sessions(
+    def _collect_empty_session_candidates(
         self,
         *,
         protected_session_ids: set[str] | list[str] | tuple[str, ...] | None = None,
         max_age_hours: float | None = None,
-    ) -> int:
-        """Delete lifecycle rows for sessions with no stored data.
-
-        A row is eligible when BOTH referenced session IDs
-        (``current_session_id`` and ``last_finalized_session_id``)
-        have zero messages AND zero summary_nodes in the main store.
-
-        Only the lifecycle table is modified — messages, nodes, and FTS
-        indexes are untouched (they already contain no data for these sessions).
-
-        Args:
-            protected_session_ids: Sessions that must never be deleted
-                (typically the actively-bound engine session).
-            max_age_hours: Only delete rows older than this many hours.
-                ``None`` means delete all eligible rows regardless of age.
-
-        Returns:
-            Number of rows deleted.
-        """
-        conn = self._conn
-        assert conn is not None
-        protected = {str(s) for s in (protected_session_ids or ()) if s}
-
-        conn.execute("BEGIN IMMEDIATE")
+        max_candidates: int = 100,
+    ) -> list[tuple[str, str, str, float]]:
+        """Find a bounded set of empty rows without holding the writer lock."""
+        limit = max(0, int(max_candidates))
+        if limit == 0:
+            return []
+        protected = sorted({str(item) for item in (protected_session_ids or ()) if item})
+        uri = self.db_path.expanduser().resolve().as_uri() + "?mode=ro"
+        conn = sqlite3.connect(uri, uri=True, timeout=5.0)
+        conn.row_factory = sqlite3.Row
         try:
-            sessions_with_data: set[str] = set()
+            conn.execute("PRAGMA query_only=ON")
             tables = {
-                row[0] for row in conn.execute(
+                str(row[0])
+                for row in conn.execute(
                     "SELECT name FROM sqlite_master WHERE type='table'"
                 ).fetchall()
             }
-
-            def _session_has_data(session_id: str) -> bool:
-                if not session_id:
-                    return False
-                if "messages" in tables and conn.execute(
-                    "SELECT 1 FROM messages WHERE session_id = ? LIMIT 1",
-                    (session_id,),
-                ).fetchone():
-                    return True
-                if "summary_nodes" in tables and conn.execute(
-                    "SELECT 1 FROM summary_nodes WHERE session_id = ? LIMIT 1",
-                    (session_id,),
-                ).fetchone():
-                    return True
-                return False
-
-            if "messages" in tables:
-                for row in conn.execute(
-                    "SELECT DISTINCT session_id FROM messages"
-                ).fetchall():
-                    sessions_with_data.add(str(row[0]))
-            if "summary_nodes" in tables:
-                for row in conn.execute(
-                    "SELECT DISTINCT session_id FROM summary_nodes"
-                ).fetchall():
-                    sessions_with_data.add(str(row[0]))
-
-            now = time.time()
-            max_age_seconds = (
-                float(max_age_hours) * 3600.0
-                if max_age_hours is not None
-                else None
-            )
-            deleted = 0
-
-            rows = conn.execute(
-                "SELECT * FROM lcm_lifecycle_state"
-            ).fetchall()
-            for row in rows:
-                cur = str(row["current_session_id"] or "")
-                fin = str(row["last_finalized_session_id"] or "")
-
-                if ((cur and cur in sessions_with_data)
-                        or (fin and fin in sessions_with_data)):
-                    continue
-
-                refs = {r for r in (cur, fin) if r}
-                if refs & protected:
-                    continue
-
-                if max_age_seconds is not None:
-                    row_age = (
-                        row["current_bound_at"]
-                        or row["last_finalized_at"]
-                        or row["updated_at"]
+            predicates: list[str] = []
+            params: list[Any] = []
+            for column in ("current_session_id", "last_finalized_session_id"):
+                if "messages" in tables:
+                    predicates.append(
+                        f"(COALESCE(state.{column}, '') = '' OR NOT EXISTS ("
+                        f"SELECT 1 FROM messages WHERE session_id = state.{column}))"
                     )
-                    if row_age is not None and (now - float(row_age)) < max_age_seconds:
-                        continue
-
-                # Recheck against the tables right before deletion. BEGIN
-                # IMMEDIATE blocks concurrent writers while this transaction is
-                # open; this fresh query also keeps the safety check honest if
-                # the broad snapshot logic above changes later.
-                if _session_has_data(cur) or _session_has_data(fin):
-                    continue
-
-                conn.execute(
-                    "DELETE FROM lcm_lifecycle_state WHERE conversation_id = ?",
-                    (row["conversation_id"],),
+                if "summary_nodes" in tables:
+                    predicates.append(
+                        f"(COALESCE(state.{column}, '') = '' OR NOT EXISTS ("
+                        f"SELECT 1 FROM summary_nodes WHERE session_id = state.{column}))"
+                    )
+            if protected:
+                placeholders = ", ".join("?" for _ in protected)
+                predicates.extend((
+                    f"COALESCE(state.current_session_id, '') NOT IN ({placeholders})",
+                    f"COALESCE(state.last_finalized_session_id, '') NOT IN ({placeholders})",
+                ))
+                params.extend(protected)
+                params.extend(protected)
+            if max_age_hours is not None:
+                predicates.append(
+                    "COALESCE(state.current_bound_at, state.last_finalized_at, "
+                    "state.updated_at, 0) <= ?"
                 )
-                deleted += 1
+                params.append(time.time() - (float(max_age_hours) * 3600.0))
+            params.append(limit)
+            rows = conn.execute(
+                "SELECT state.conversation_id, state.current_session_id, "
+                "state.last_finalized_session_id, state.updated_at "
+                "FROM lcm_lifecycle_state AS state WHERE "
+                + (" AND ".join(predicates) if predicates else "1")
+                + " ORDER BY state.updated_at, state.conversation_id LIMIT ?",
+                params,
+            ).fetchall()
+            return [
+                (
+                    str(row["conversation_id"]),
+                    str(row["current_session_id"] or ""),
+                    str(row["last_finalized_session_id"] or ""),
+                    float(row["updated_at"] or 0.0),
+                )
+                for row in rows
+            ]
+        finally:
+            conn.close()
 
-            if deleted:
-                conn.commit()
-            else:
+    def _snapshot_sessions_with_data(self) -> set[str]:
+        """Compatibility helper used by older diagnostics and tests."""
+        uri = self.db_path.resolve().as_uri() + "?mode=ro"
+        conn = sqlite3.connect(uri, uri=True)
+        try:
+            tables = {
+                str(row[0]) for row in conn.execute(
+                    "SELECT name FROM sqlite_master WHERE type='table'"
+                ).fetchall()
+            }
+            sessions: set[str] = set()
+            for table in ("messages", "summary_nodes"):
+                if table in tables:
+                    sessions.update(
+                        str(row[0])
+                        for row in conn.execute(
+                            f"SELECT DISTINCT session_id FROM {table}"
+                        ).fetchall()
+                        if row[0]
+                    )
+            return sessions
+        finally:
+            conn.close()
+
+    def prune_empty_sessions(
+        self,
+        *,
+        protected_session_ids: set[str] | list[str] | tuple[str, ...] | None = None,
+        protected_session_ids_provider: Callable[[], Iterable[str]] | None = None,
+        protection_revision_provider: Callable[[], int] | None = None,
+        protection_commit_guard: Callable[[], ContextManager[None]] | None = None,
+        max_age_hours: float | None = None,
+        max_candidates: int | None = None,
+    ) -> int:
+        """Delete empty lifecycle rows using transactions bounded to 100 rows.
+
+        The default preserves the legacy complete-cleanup contract by running
+        multiple bounded transactions. An explicit limit requests one bounded
+        pass and is clamped to the hard safety ceiling.
+        """
+        if max_candidates is not None:
+            return self._prune_empty_sessions_batch(
+                protected_session_ids=protected_session_ids,
+                protected_session_ids_provider=protected_session_ids_provider,
+                protection_revision_provider=protection_revision_provider,
+                protection_commit_guard=protection_commit_guard,
+                max_age_hours=max_age_hours,
+                max_candidates=min(
+                    _MAX_EMPTY_LIFECYCLE_GC_BATCH_SIZE,
+                    max(0, int(max_candidates)),
+                ),
+            )
+
+        deleted_total = 0
+        while True:
+            deleted = self._prune_empty_sessions_batch(
+                protected_session_ids=protected_session_ids,
+                protected_session_ids_provider=protected_session_ids_provider,
+                protection_revision_provider=protection_revision_provider,
+                protection_commit_guard=protection_commit_guard,
+                max_age_hours=max_age_hours,
+                max_candidates=_MAX_EMPTY_LIFECYCLE_GC_BATCH_SIZE,
+            )
+            deleted_total += deleted
+            if deleted < _MAX_EMPTY_LIFECYCLE_GC_BATCH_SIZE:
+                return deleted_total
+
+    def _prune_empty_sessions_batch(
+        self,
+        *,
+        protected_session_ids: set[str] | list[str] | tuple[str, ...] | None,
+        protected_session_ids_provider: Callable[[], Iterable[str]] | None,
+        protection_revision_provider: Callable[[], int] | None,
+        protection_commit_guard: Callable[[], ContextManager[None]] | None,
+        max_age_hours: float | None,
+        max_candidates: int,
+    ) -> int:
+        """Delete one hard-bounded batch after read-only candidate discovery."""
+        max_candidates = min(
+            _MAX_EMPTY_LIFECYCLE_GC_BATCH_SIZE,
+            max(0, int(max_candidates)),
+        )
+        protection_revision = (
+            int(protection_revision_provider())
+            if protection_revision_provider is not None
+            else None
+        )
+        candidates = self._collect_empty_session_candidates(
+            protected_session_ids=protected_session_ids,
+            max_age_hours=max_age_hours,
+            max_candidates=max_candidates,
+        )
+        if not candidates:
+            return 0
+        protected = {str(item) for item in (protected_session_ids or ()) if item}
+        max_age_seconds = (
+            float(max_age_hours) * 3600.0
+            if max_age_hours is not None
+            else None
+        )
+        conn = self._conn
+        assert conn is not None
+        with self._lock.attributed("prune_empty_sessions"):
+            conn.execute("BEGIN IMMEDIATE")
+            try:
+                if protected_session_ids_provider is not None:
+                    protected.update(
+                        str(item)
+                        for item in protected_session_ids_provider()
+                        if item
+                    )
+                tables = {
+                    str(row[0]) for row in conn.execute(
+                        "SELECT name FROM sqlite_master WHERE type='table'"
+                    ).fetchall()
+                }
+
+                def session_has_data(session_id: str) -> bool:
+                    if not session_id:
+                        return False
+                    for table in ("messages", "summary_nodes"):
+                        if table in tables and conn.execute(
+                            f"SELECT 1 FROM {table} WHERE session_id = ? LIMIT 1",
+                            (session_id,),
+                        ).fetchone():
+                            return True
+                    return False
+
+                def session_is_protected(current: str | None, finalized: str | None) -> int:
+                    live = set(protected)
+                    if protected_session_ids_provider is not None:
+                        live.update(
+                            str(item)
+                            for item in protected_session_ids_provider()
+                            if item
+                        )
+                    return int(bool({str(item) for item in (current, finalized) if item} & live))
+
+                conn.create_function(
+                    "lcm_gc_session_is_protected",
+                    2,
+                    session_is_protected,
+                )
+
+                deleted = 0
+                now = time.time()
+                for conversation_id, snapshot_cur, snapshot_fin, snapshot_updated_at in candidates:
+                    if protected_session_ids_provider is not None:
+                        protected.update(
+                            str(item)
+                            for item in protected_session_ids_provider()
+                            if item
+                        )
+                    row = conn.execute(
+                        "SELECT * FROM lcm_lifecycle_state WHERE conversation_id = ?",
+                        (conversation_id,),
+                    ).fetchone()
+                    if row is None:
+                        continue
+                    cur = str(row["current_session_id"] or "")
+                    fin = str(row["last_finalized_session_id"] or "")
+                    updated_at = float(row["updated_at"] or 0.0)
+                    if (cur, fin, updated_at) != (
+                        snapshot_cur,
+                        snapshot_fin,
+                        snapshot_updated_at,
+                    ):
+                        continue
+                    if {ref for ref in (cur, fin) if ref} & protected:
+                        continue
+                    if max_age_seconds is not None:
+                        row_age = (
+                            row["current_bound_at"]
+                            or row["last_finalized_at"]
+                            or row["updated_at"]
+                        )
+                        if row_age is not None and (now - float(row_age)) < max_age_seconds:
+                            continue
+                    if session_has_data(cur) or session_has_data(fin):
+                        continue
+                    cursor = conn.execute(
+                        """
+                        DELETE FROM lcm_lifecycle_state
+                        WHERE conversation_id = ?
+                          AND lcm_gc_session_is_protected(
+                              current_session_id,
+                              last_finalized_session_id
+                          ) = 0
+                        """,
+                        (conversation_id,),
+                    )
+                    deleted += max(0, int(cursor.rowcount or 0))
+                if deleted:
+                    commit_guard = (
+                        protection_commit_guard()
+                        if protection_commit_guard is not None
+                        else nullcontext()
+                    )
+                    with commit_guard:
+                        if (
+                            protection_revision is not None
+                            and protection_revision_provider is not None
+                            and int(protection_revision_provider()) != protection_revision
+                        ):
+                            conn.rollback()
+                            return 0
+                        conn.commit()
+                else:
+                    conn.rollback()
+                return deleted
+            except Exception:
                 conn.rollback()
-            return deleted
-        except Exception:
-            conn.rollback()
-            raise
+                raise
 
     @_synchronized
     def delete_safe_rows_for_sessions(

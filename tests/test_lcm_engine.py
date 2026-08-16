@@ -31,6 +31,9 @@ def engine(tmp_path):
     config.fresh_tail_count = 4  # small for testing
     config.leaf_chunk_tokens = 100  # low threshold for testing
     config.database_path = str(tmp_path / "lcm_test.db")
+    # The shared fixture exercises non-GC engine behavior. Lifecycle-GC tests
+    # opt in explicitly so background maintenance cannot race unrelated tests.
+    config.empty_lifecycle_gc_enabled = False
     e = LCMEngine(config=config)
     e._session_id = "test-session"
     e.context_length = 200000
@@ -12393,18 +12396,7 @@ class TestSessionRollover:
         holder.join(timeout=1.0)
         assert not holder.is_alive()
 
-        deadline = time.monotonic() + 2.0
-        while time.monotonic() < deadline:
-            persisted = engine._store.get_session_messages("test-session")
-            state = engine._lifecycle.get_by_conversation(engine._conversation_id)
-            if (
-                [message.get("content") for message in persisted]
-                == ["duplicate-safe final message"]
-                and state is not None
-                and state.last_finalized_session_id == "test-session"
-            ):
-                break
-            time.sleep(0.01)
+        assert engine._session_end_drain_done.wait(timeout=2.0)
 
         persisted = engine._store.get_session_messages("test-session")
         state = engine._lifecycle.get_by_conversation(engine._conversation_id)
@@ -12438,17 +12430,7 @@ class TestSessionRollover:
         holder.join(timeout=1.0)
         assert not holder.is_alive()
 
-        deadline = time.monotonic() + 2.0
-        while time.monotonic() < deadline:
-            persisted = engine._store.get_session_messages("test-session")
-            state = engine._lifecycle.get_by_conversation(engine._conversation_id)
-            if (
-                [message.get("content") for message in persisted] == ["one", "two"]
-                and state is not None
-                and state.last_finalized_session_id == "test-session"
-            ):
-                break
-            time.sleep(0.01)
+        assert engine._session_end_drain_done.wait(timeout=2.0)
 
         persisted = engine._store.get_session_messages("test-session")
         assert [message.get("content") for message in persisted] == ["one", "two"]
@@ -20538,6 +20520,67 @@ class TestSessionRollover:
         assert recovered is not None
         assert recovered.current_session_id == "active-session"
 
+    def test_bind_lifecycle_gc_protection_failure_does_not_fail_session_bind(
+        self,
+        tmp_path,
+        monkeypatch,
+        caplog,
+    ):
+        config = LCMConfig(
+            database_path=str(tmp_path / "lcm_gc_protection_failure.db"),
+            empty_lifecycle_gc_enabled=True,
+        )
+        engine = LCMEngine(config=config)
+
+        def fail_protection(*_args, **_kwargs):
+            raise OSError("bad GC path")
+
+        monkeypatch.setattr(
+            lcm_engine,
+            "protect_empty_lifecycle_sessions",
+            fail_protection,
+        )
+        try:
+            with caplog.at_level(logging.WARNING):
+                engine.on_session_start("live-session", platform="cli", context_length=200000)
+            state = engine._lifecycle.get_by_session("live-session")
+            assert state is not None
+            assert state.current_session_id == "live-session"
+            assert "LCM could not protect session from empty-lifecycle GC" in caplog.text
+        finally:
+            engine.shutdown()
+
+    def test_bind_lifecycle_gc_scheduling_failure_does_not_fail_session_bind(
+        self,
+        tmp_path,
+        monkeypatch,
+        caplog,
+    ):
+        config = LCMConfig(
+            database_path=str(tmp_path / "lcm_gc_scheduling_failure.db"),
+            empty_lifecycle_gc_enabled=True,
+        )
+        engine = LCMEngine(config=config)
+
+        def fail_scheduling(*_args, **_kwargs):
+            raise OSError("bad GC path")
+
+        monkeypatch.setattr(lcm_engine, "protect_empty_lifecycle_sessions", lambda *_args: None)
+        monkeypatch.setattr(
+            lcm_engine,
+            "request_empty_lifecycle_gc",
+            fail_scheduling,
+        )
+        try:
+            with caplog.at_level(logging.WARNING):
+                engine.on_session_start("live-session", platform="cli", context_length=200000)
+            state = engine._lifecycle.get_by_session("live-session")
+            assert state is not None
+            assert state.current_session_id == "live-session"
+            assert "LCM could not schedule empty-lifecycle GC" in caplog.text
+        finally:
+            engine.shutdown()
+
     def test_bind_lifecycle_gc_prunes_empty_rows_above_threshold(self, tmp_path, monkeypatch):
         config = LCMConfig(
             database_path=str(tmp_path / "lcm_gc_lifecycle.db"),
@@ -20560,9 +20603,12 @@ class TestSessionRollover:
             engine._lifecycle._conn.commit()
             assert engine._lifecycle.row_count() == 5
 
-            # Bind to a new session — should trigger GC since threshold(1) < 5.
+            # Bind to a new session — schedules background GC since threshold(1) < 5.
             engine.on_session_start("live-session", platform="cli", context_length=200000)
-            # All 5 stale empty rows should be pruned, leaving only the live one.
+            deadline = time.monotonic() + 2.0
+            while engine._lifecycle.row_count() != 1 and time.monotonic() < deadline:
+                time.sleep(0.01)
+            # All 5 stale empty rows are pruned without blocking the bind.
             assert engine._lifecycle.row_count() == 1
             state = engine._lifecycle.get_by_conversation("live-session")
             assert state is not None
