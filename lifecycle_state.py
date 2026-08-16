@@ -737,123 +737,192 @@ class LifecycleStateStore:
         self._conn.commit()
         return self.get_by_conversation(conversation_id)
 
-    @_synchronized
+    def _collect_empty_session_candidates(
+        self,
+        *,
+        protected_session_ids: set[str] | list[str] | tuple[str, ...] | None = None,
+        max_age_hours: float | None = None,
+        max_candidates: int = 100,
+    ) -> list[tuple[str, str, str, float]]:
+        """Find a bounded set of empty rows without holding the writer lock."""
+        limit = max(0, int(max_candidates))
+        if limit == 0:
+            return []
+        protected = sorted({str(item) for item in (protected_session_ids or ()) if item})
+        uri = self.db_path.expanduser().resolve().as_uri() + "?mode=ro"
+        conn = sqlite3.connect(uri, uri=True, timeout=5.0)
+        conn.row_factory = sqlite3.Row
+        try:
+            conn.execute("PRAGMA query_only=ON")
+            tables = {
+                str(row[0])
+                for row in conn.execute(
+                    "SELECT name FROM sqlite_master WHERE type='table'"
+                ).fetchall()
+            }
+            predicates: list[str] = []
+            params: list[Any] = []
+            for column in ("current_session_id", "last_finalized_session_id"):
+                if "messages" in tables:
+                    predicates.append(
+                        f"(COALESCE(state.{column}, '') = '' OR NOT EXISTS ("
+                        f"SELECT 1 FROM messages WHERE session_id = state.{column}))"
+                    )
+                if "summary_nodes" in tables:
+                    predicates.append(
+                        f"(COALESCE(state.{column}, '') = '' OR NOT EXISTS ("
+                        f"SELECT 1 FROM summary_nodes WHERE session_id = state.{column}))"
+                    )
+            if protected:
+                placeholders = ", ".join("?" for _ in protected)
+                predicates.extend((
+                    f"COALESCE(state.current_session_id, '') NOT IN ({placeholders})",
+                    f"COALESCE(state.last_finalized_session_id, '') NOT IN ({placeholders})",
+                ))
+                params.extend(protected)
+                params.extend(protected)
+            if max_age_hours is not None:
+                predicates.append(
+                    "COALESCE(state.current_bound_at, state.last_finalized_at, "
+                    "state.updated_at, 0) <= ?"
+                )
+                params.append(time.time() - (float(max_age_hours) * 3600.0))
+            params.append(limit)
+            rows = conn.execute(
+                "SELECT state.conversation_id, state.current_session_id, "
+                "state.last_finalized_session_id, state.updated_at "
+                "FROM lcm_lifecycle_state AS state WHERE "
+                + (" AND ".join(predicates) if predicates else "1")
+                + " ORDER BY state.updated_at, state.conversation_id LIMIT ?",
+                params,
+            ).fetchall()
+            return [
+                (
+                    str(row["conversation_id"]),
+                    str(row["current_session_id"] or ""),
+                    str(row["last_finalized_session_id"] or ""),
+                    float(row["updated_at"] or 0.0),
+                )
+                for row in rows
+            ]
+        finally:
+            conn.close()
+
+    def _snapshot_sessions_with_data(self) -> set[str]:
+        """Compatibility helper used by older diagnostics and tests."""
+        uri = self.db_path.resolve().as_uri() + "?mode=ro"
+        conn = sqlite3.connect(uri, uri=True)
+        try:
+            tables = {
+                str(row[0]) for row in conn.execute(
+                    "SELECT name FROM sqlite_master WHERE type='table'"
+                ).fetchall()
+            }
+            sessions: set[str] = set()
+            for table in ("messages", "summary_nodes"):
+                if table in tables:
+                    sessions.update(
+                        str(row[0])
+                        for row in conn.execute(
+                            f"SELECT DISTINCT session_id FROM {table}"
+                        ).fetchall()
+                        if row[0]
+                    )
+            return sessions
+        finally:
+            conn.close()
+
     def prune_empty_sessions(
         self,
         *,
         protected_session_ids: set[str] | list[str] | tuple[str, ...] | None = None,
         max_age_hours: float | None = None,
+        max_candidates: int = 100,
     ) -> int:
-        """Delete lifecycle rows for sessions with no stored data.
+        """Delete a bounded batch of empty lifecycle rows.
 
-        A row is eligible when BOTH referenced session IDs
-        (``current_session_id`` and ``last_finalized_session_id``)
-        have zero messages AND zero summary_nodes in the main store.
-
-        Only the lifecycle table is modified — messages, nodes, and FTS
-        indexes are untouched (they already contain no data for these sessions).
-
-        Args:
-            protected_session_ids: Sessions that must never be deleted
-                (typically the actively-bound engine session).
-            max_age_hours: Only delete rows older than this many hours.
-                ``None`` means delete all eligible rows regardless of age.
-
-        Returns:
-            Number of rows deleted.
+        Candidate discovery runs on an independent read-only connection. Only
+        final identity/data rechecks and deletions occur under the attributed
+        writer lock and ``BEGIN IMMEDIATE`` transaction.
         """
+        candidates = self._collect_empty_session_candidates(
+            protected_session_ids=protected_session_ids,
+            max_age_hours=max_age_hours,
+            max_candidates=max_candidates,
+        )
+        if not candidates:
+            return 0
+        protected = {str(item) for item in (protected_session_ids or ()) if item}
+        max_age_seconds = (
+            float(max_age_hours) * 3600.0
+            if max_age_hours is not None
+            else None
+        )
         conn = self._conn
         assert conn is not None
-        protected = {str(s) for s in (protected_session_ids or ()) if s}
+        with self._lock.attributed("prune_empty_sessions"):
+            conn.execute("BEGIN IMMEDIATE")
+            try:
+                tables = {
+                    str(row[0]) for row in conn.execute(
+                        "SELECT name FROM sqlite_master WHERE type='table'"
+                    ).fetchall()
+                }
 
-        conn.execute("BEGIN IMMEDIATE")
-        try:
-            sessions_with_data: set[str] = set()
-            tables = {
-                row[0] for row in conn.execute(
-                    "SELECT name FROM sqlite_master WHERE type='table'"
-                ).fetchall()
-            }
-
-            def _session_has_data(session_id: str) -> bool:
-                if not session_id:
+                def session_has_data(session_id: str) -> bool:
+                    if not session_id:
+                        return False
+                    for table in ("messages", "summary_nodes"):
+                        if table in tables and conn.execute(
+                            f"SELECT 1 FROM {table} WHERE session_id = ? LIMIT 1",
+                            (session_id,),
+                        ).fetchone():
+                            return True
                     return False
-                if "messages" in tables and conn.execute(
-                    "SELECT 1 FROM messages WHERE session_id = ? LIMIT 1",
-                    (session_id,),
-                ).fetchone():
-                    return True
-                if "summary_nodes" in tables and conn.execute(
-                    "SELECT 1 FROM summary_nodes WHERE session_id = ? LIMIT 1",
-                    (session_id,),
-                ).fetchone():
-                    return True
-                return False
 
-            if "messages" in tables:
-                for row in conn.execute(
-                    "SELECT DISTINCT session_id FROM messages"
-                ).fetchall():
-                    sessions_with_data.add(str(row[0]))
-            if "summary_nodes" in tables:
-                for row in conn.execute(
-                    "SELECT DISTINCT session_id FROM summary_nodes"
-                ).fetchall():
-                    sessions_with_data.add(str(row[0]))
-
-            now = time.time()
-            max_age_seconds = (
-                float(max_age_hours) * 3600.0
-                if max_age_hours is not None
-                else None
-            )
-            deleted = 0
-
-            rows = conn.execute(
-                "SELECT * FROM lcm_lifecycle_state"
-            ).fetchall()
-            for row in rows:
-                cur = str(row["current_session_id"] or "")
-                fin = str(row["last_finalized_session_id"] or "")
-
-                if ((cur and cur in sessions_with_data)
-                        or (fin and fin in sessions_with_data)):
-                    continue
-
-                refs = {r for r in (cur, fin) if r}
-                if refs & protected:
-                    continue
-
-                if max_age_seconds is not None:
-                    row_age = (
-                        row["current_bound_at"]
-                        or row["last_finalized_at"]
-                        or row["updated_at"]
-                    )
-                    if row_age is not None and (now - float(row_age)) < max_age_seconds:
+                deleted = 0
+                now = time.time()
+                for conversation_id, snapshot_cur, snapshot_fin, snapshot_updated_at in candidates:
+                    row = conn.execute(
+                        "SELECT * FROM lcm_lifecycle_state WHERE conversation_id = ?",
+                        (conversation_id,),
+                    ).fetchone()
+                    if row is None:
                         continue
-
-                # Recheck against the tables right before deletion. BEGIN
-                # IMMEDIATE blocks concurrent writers while this transaction is
-                # open; this fresh query also keeps the safety check honest if
-                # the broad snapshot logic above changes later.
-                if _session_has_data(cur) or _session_has_data(fin):
-                    continue
-
-                conn.execute(
-                    "DELETE FROM lcm_lifecycle_state WHERE conversation_id = ?",
-                    (row["conversation_id"],),
-                )
-                deleted += 1
-
-            if deleted:
-                conn.commit()
-            else:
+                    cur = str(row["current_session_id"] or "")
+                    fin = str(row["last_finalized_session_id"] or "")
+                    updated_at = float(row["updated_at"] or 0.0)
+                    if (cur, fin, updated_at) != (
+                        snapshot_cur,
+                        snapshot_fin,
+                        snapshot_updated_at,
+                    ):
+                        continue
+                    if {ref for ref in (cur, fin) if ref} & protected:
+                        continue
+                    if max_age_seconds is not None:
+                        row_age = (
+                            row["current_bound_at"]
+                            or row["last_finalized_at"]
+                            or row["updated_at"]
+                        )
+                        if row_age is not None and (now - float(row_age)) < max_age_seconds:
+                            continue
+                    if session_has_data(cur) or session_has_data(fin):
+                        continue
+                    conn.execute(
+                        "DELETE FROM lcm_lifecycle_state WHERE conversation_id = ?",
+                        (conversation_id,),
+                    )
+                    deleted += 1
+                if deleted:
+                    conn.commit()
+                else:
+                    conn.rollback()
+                return deleted
+            except Exception:
                 conn.rollback()
-            return deleted
-        except Exception:
-            conn.rollback()
-            raise
+                raise
 
     @_synchronized
     def delete_safe_rows_for_sessions(

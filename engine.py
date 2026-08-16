@@ -125,6 +125,7 @@ from .compaction import CompactionMixin
 from .reset_state import ResetStateMixin
 from .bypass import BypassMixin
 from .lifecycle_state import LifecycleStateStore
+from .lifecycle_gc import request_empty_lifecycle_gc
 from .message_content import (
     normalize_content_value,
     stored_text_content_for_pattern_matching,
@@ -1466,30 +1467,16 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
             self._foreground_session_platform = self._session_platform
             self._foreground_conversation_id = state.conversation_id
 
-        # Garbage-collect empty lifecycle rows when the table exceeds threshold.
-        # Gateway restarts, ephemeral cron ticks, and crash-loops all create
-        # lifecycle rows that never ingest data — prune them here so they
-        # don't accumulate forever.
-        if (
-            self._config.empty_lifecycle_gc_enabled
-            and self._lifecycle.row_count() > self._config.empty_lifecycle_gc_threshold
-        ):
-            protected = {str(self._session_id)} if self._session_id else None
-            max_age = self._config.empty_lifecycle_gc_max_age_hours
-            try:
-                deleted = self._lifecycle.prune_empty_sessions(
-                    protected_session_ids=protected,
-                    max_age_hours=max_age,
-                )
-            except Exception:
-                deleted = 0
-            if deleted:
-                logger.info(
-                    "LCM pruned %d lifecycle rows with zero stored data "
-                    "(table exceeded threshold of %d rows)",
-                    deleted,
-                    self._config.empty_lifecycle_gc_threshold,
-                )
+        # Empty lifecycle maintenance must never add database-scan latency to a
+        # session bind. The process-wide coordinator rate-limits and single-flights
+        # bounded background passes for this database.
+        if self._config.empty_lifecycle_gc_enabled:
+            request_empty_lifecycle_gc(
+                self._lifecycle.db_path,
+                threshold=self._config.empty_lifecycle_gc_threshold,
+                max_age_hours=self._config.empty_lifecycle_gc_max_age_hours,
+                protected_session_ids={str(self._session_id)} if self._session_id else (),
+            )
         # Bypassed/stateless sessions skip every LCM write, so they must also skip
         # rollup maintenance — otherwise the bind-time hook would build rollups for
         # a session whose ingest is suppressed (maintainer #388: gate on the same

@@ -20560,9 +20560,12 @@ class TestSessionRollover:
             engine._lifecycle._conn.commit()
             assert engine._lifecycle.row_count() == 5
 
-            # Bind to a new session — should trigger GC since threshold(1) < 5.
+            # Bind to a new session — schedules background GC since threshold(1) < 5.
             engine.on_session_start("live-session", platform="cli", context_length=200000)
-            # All 5 stale empty rows should be pruned, leaving only the live one.
+            deadline = time.monotonic() + 2.0
+            while engine._lifecycle.row_count() != 1 and time.monotonic() < deadline:
+                time.sleep(0.01)
+            # All 5 stale empty rows are pruned without blocking the bind.
             assert engine._lifecycle.row_count() == 1
             state = engine._lifecycle.get_by_conversation("live-session")
             assert state is not None

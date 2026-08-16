@@ -288,6 +288,88 @@ def test_coordinated_engine_write_attributes_decorated_operation(tmp_path):
     assert coordinator.owner_snapshot() == {}
 
 
+def test_lifecycle_synchronized_attributes_wrapped_method(tmp_path):
+    coordinator = sqlite_util.process_sqlite_write_lock(tmp_path / "lcm.db")
+    holder_entered = threading.Event()
+    release_holder = threading.Event()
+
+    class LifecycleProbe:
+        def __init__(self):
+            self._lock = coordinator
+
+        @lifecycle_state._synchronized
+        def persist_lifecycle_probe(self):
+            holder_entered.set()
+            assert release_holder.wait(timeout=2.0)
+
+    holder = threading.Thread(
+        target=LifecycleProbe().persist_lifecycle_probe,
+        name="lcm-lifecycle-probe",
+    )
+    holder.start()
+    assert holder_entered.wait(timeout=1.0)
+
+    try:
+        assert coordinator.owner_snapshot()["operation"] == "persist_lifecycle_probe"
+    finally:
+        release_holder.set()
+        holder.join(timeout=1.0)
+
+    assert not holder.is_alive()
+    assert coordinator.owner_snapshot() == {}
+
+
+def test_prune_empty_sessions_scans_without_holding_writer_coordinator(tmp_path):
+    db_path = tmp_path / "lcm.db"
+    lifecycle = LifecycleStateStore(db_path)
+    store = MessageStore(db_path)
+    lifecycle.bind_session("orphan-session")
+    snapshot_started = threading.Event()
+    release_snapshot = threading.Event()
+    deleted = []
+    errors = []
+
+    def blocked_candidate_scan(**kwargs):
+        state = lifecycle.get_by_conversation("orphan-session")
+        assert state is not None
+        snapshot_started.set()
+        assert release_snapshot.wait(timeout=2.0)
+        return [(
+            "orphan-session",
+            "orphan-session",
+            "",
+            state.updated_at,
+        )]
+
+    lifecycle._collect_empty_session_candidates = blocked_candidate_scan
+
+    def prune():
+        try:
+            deleted.append(lifecycle.prune_empty_sessions())
+        except BaseException as exc:
+            errors.append(exc)
+
+    worker = threading.Thread(target=prune, name="lcm-prune-snapshot-probe")
+    worker.start()
+
+    try:
+        assert snapshot_started.wait(timeout=1.0)
+        store.append(
+            "orphan-session",
+            {"role": "user", "content": "arrived after broad snapshot"},
+            source="test",
+        )
+    finally:
+        release_snapshot.set()
+        worker.join(timeout=2.0)
+        store.close()
+        lifecycle.close()
+
+    assert not worker.is_alive()
+    assert errors == []
+    assert deleted == [0]
+
+
 def test_process_write_lock_owner_snapshot_clears_after_release(tmp_path):
     coordinator = sqlite_util.process_sqlite_write_lock(tmp_path / "lcm.db")
 

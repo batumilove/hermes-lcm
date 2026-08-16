@@ -646,8 +646,10 @@ class LCMConfig:
     # -- Lifecycle GC ---
     # Enables automatic pruning of lifecycle rows for sessions that never
     # ingested any messages or nodes (gateway restart orphans, ephemeral
-    # cron ticks, etc.).  Runs at session-start when the lifecycle table
-    # exceeds ``empty_lifecycle_gc_threshold`` rows.
+    # cron ticks, etc.). Session start only schedules maintenance: one
+    # process-wide worker per database runs at most every five minutes and
+    # rechecks/deletes at most 100 candidates in a short write transaction
+    # when the table exceeds ``empty_lifecycle_gc_threshold`` rows.
     empty_lifecycle_gc_enabled: bool = True
     # Number of lifecycle rows at which the GC pass fires.  Default 200
     # so fresh installs skip the work until enough churn has occurred.
