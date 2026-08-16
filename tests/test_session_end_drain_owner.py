@@ -175,9 +175,7 @@ def test_gate_waiting_drain_survives_scheduling_clone_shutdown(tmp_path):
         assert not intent_path.exists()
         assert [
             message.get("content")
-            for message in root._store.get_session_messages(
-                "waiting-clone-session"
-            )
+            for message in root._store.get_session_messages("waiting-clone-session")
         ] == ["deferred:waiting-clone-session"]
     finally:
         if test_gate_held:

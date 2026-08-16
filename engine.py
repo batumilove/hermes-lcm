@@ -3610,9 +3610,7 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
                 stage="singleflight",
                 outcome="scheduled",
                 operation="session_end_singleflight_handoff",
-                intent_sha256=_session_end_intent_digest_from_path(
-                    pending_intent_path
-                ),
+                intent_sha256=_session_end_intent_digest_from_path(pending_intent_path),
                 session_id=session_id,
                 conversation_id=self._conversation_id,
                 wait_seconds=0.0,
@@ -3724,7 +3722,9 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
                         return
                     raise
         except KeyboardInterrupt:
-            logger.warning("LCM session-end ingest/finalize interrupted before bounded flush completed")
+            logger.warning(
+                "LCM session-end ingest/finalize interrupted before bounded flush completed"
+            )
             return
         except Exception as exc:
             if _is_sqlite_locked_error(exc):
