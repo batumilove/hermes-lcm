@@ -202,6 +202,25 @@ def test_prune_empty_sessions_bounds_final_write_transaction(tmp_path):
         lifecycle.close()
 
 
+def test_internal_prune_batch_enforces_hard_transaction_ceiling(tmp_path):
+    lifecycle = LifecycleStateStore(tmp_path / "internal-hard-cap.db")
+    try:
+        for index in range(150):
+            lifecycle.bind_session(f"internal-{index}")
+        deleted = lifecycle._prune_empty_sessions_batch(
+            protected_session_ids=None,
+            protected_session_ids_provider=None,
+            protection_revision_provider=None,
+            protection_commit_guard=None,
+            max_age_hours=0,
+            max_candidates=1_000,
+        )
+        assert deleted == 100
+        assert lifecycle.row_count() == 50
+    finally:
+        lifecycle.close()
+
+
 def test_prune_clamps_explicit_batch_but_default_completes_cleanup(tmp_path):
     bounded = LifecycleStateStore(tmp_path / "bounded.db")
     complete = LifecycleStateStore(tmp_path / "complete.db")
@@ -240,6 +259,56 @@ def test_prune_refreshes_protection_for_each_final_delete(tmp_path):
         assert calls >= 2
         assert deleted == 1
         assert lifecycle.get_by_session("late-protected") is not None
+    finally:
+        lifecycle.close()
+
+
+def test_protection_registered_after_delete_predicate_rolls_back_transaction(tmp_path):
+    lifecycle = LifecycleStateStore(tmp_path / "commit-race.db")
+    revision = [0]
+    commit_lock = threading.RLock()
+    try:
+        lifecycle.bind_session("late-active", conversation_id="stable-conversation")
+        lifecycle._conn.execute(
+            """
+            UPDATE lcm_lifecycle_state
+            SET debt_kind = 'failed_maintenance', debt_size_estimate = 73
+            WHERE conversation_id = 'stable-conversation'
+            """
+        )
+        lifecycle._conn.commit()
+
+        def register_late_protection():
+            with commit_lock:
+                revision[0] += 1
+            return 0
+
+        lifecycle._conn.create_function(
+            "register_late_protection",
+            0,
+            register_late_protection,
+        )
+        lifecycle._conn.execute(
+            """
+            CREATE TEMP TRIGGER register_protection_before_delete
+            BEFORE DELETE ON lcm_lifecycle_state
+            BEGIN
+                SELECT register_late_protection();
+            END
+            """
+        )
+
+        deleted = lifecycle.prune_empty_sessions(
+            max_age_hours=0,
+            max_candidates=100,
+            protection_revision_provider=lambda: revision[0],
+            protection_commit_guard=lambda: commit_lock,
+        )
+        state = lifecycle.get_by_conversation("stable-conversation")
+        assert deleted == 0
+        assert state is not None
+        assert state.debt_kind == "failed_maintenance"
+        assert state.debt_size_estimate == 73
     finally:
         lifecycle.close()
 

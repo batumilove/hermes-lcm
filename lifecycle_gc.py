@@ -5,6 +5,7 @@ from __future__ import annotations
 import logging
 import threading
 import time
+from contextlib import contextmanager
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Callable, Iterable
@@ -24,6 +25,7 @@ class _GCState:
     thread: threading.Thread | None = None
     protected_session_ids: set[str] = field(default_factory=set)
     protected_session_ids_provider: Callable[[], Iterable[str]] | None = None
+    protection_revision: int = 0
 
 
 class EmptyLifecycleGCCoordinator:
@@ -37,7 +39,7 @@ class EmptyLifecycleGCCoordinator:
     ) -> None:
         self._clock = clock
         self._store_factory = store_factory
-        self._lock = threading.Lock()
+        self._lock = threading.RLock()
         self._states: dict[str, _GCState] = {}
 
     @staticmethod
@@ -51,7 +53,9 @@ class EmptyLifecycleGCCoordinator:
         if not protected:
             return
         with self._lock:
-            self._states.setdefault(key, _GCState()).protected_session_ids.update(protected)
+            state = self._states.setdefault(key, _GCState())
+            state.protected_session_ids.update(protected)
+            state.protection_revision += 1
 
     def request(
         self,
@@ -70,7 +74,9 @@ class EmptyLifecycleGCCoordinator:
         protected = {str(item) for item in protected_session_ids if item}
         with self._lock:
             state = self._states.setdefault(key, _GCState())
-            state.protected_session_ids.update(protected)
+            if protected:
+                state.protected_session_ids.update(protected)
+                state.protection_revision += 1
             if protected_session_ids_provider is not None:
                 state.protected_session_ids_provider = protected_session_ids_provider
             if state.running or now < state.next_allowed_at:
@@ -106,6 +112,17 @@ class EmptyLifecycleGCCoordinator:
             protected.update(str(item) for item in provider() if item)
         return protected
 
+    def _protection_revision(self, key: str) -> int:
+        with self._lock:
+            state = self._states.get(key)
+            return state.protection_revision if state is not None else 0
+
+    @contextmanager
+    def _protection_commit_guard(self, key: str):
+        """Linearize GC commit against protect-before-bind registration."""
+        with self._lock:
+            yield
+
     def _run(
         self,
         key: str,
@@ -121,6 +138,8 @@ class EmptyLifecycleGCCoordinator:
             deleted = store.prune_empty_sessions(
                 protected_session_ids=self._protected_snapshot(key),
                 protected_session_ids_provider=lambda: self._protected_snapshot(key),
+                protection_revision_provider=lambda: self._protection_revision(key),
+                protection_commit_guard=lambda: self._protection_commit_guard(key),
                 max_age_hours=max_age_hours,
                 max_candidates=batch_size,
             )

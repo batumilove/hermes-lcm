@@ -16,7 +16,7 @@ import time
 from contextlib import nullcontext
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Callable, Iterable, Optional
+from typing import Any, Callable, ContextManager, Iterable, Optional
 
 from .db_bootstrap import configure_connection, refuse_schema_version_too_new, run_versioned_migrations
 from .sqlite_util import process_sqlite_write_lock
@@ -840,6 +840,8 @@ class LifecycleStateStore:
         *,
         protected_session_ids: set[str] | list[str] | tuple[str, ...] | None = None,
         protected_session_ids_provider: Callable[[], Iterable[str]] | None = None,
+        protection_revision_provider: Callable[[], int] | None = None,
+        protection_commit_guard: Callable[[], ContextManager[None]] | None = None,
         max_age_hours: float | None = None,
         max_candidates: int | None = None,
     ) -> int:
@@ -853,6 +855,8 @@ class LifecycleStateStore:
             return self._prune_empty_sessions_batch(
                 protected_session_ids=protected_session_ids,
                 protected_session_ids_provider=protected_session_ids_provider,
+                protection_revision_provider=protection_revision_provider,
+                protection_commit_guard=protection_commit_guard,
                 max_age_hours=max_age_hours,
                 max_candidates=min(
                     _MAX_EMPTY_LIFECYCLE_GC_BATCH_SIZE,
@@ -865,6 +869,8 @@ class LifecycleStateStore:
             deleted = self._prune_empty_sessions_batch(
                 protected_session_ids=protected_session_ids,
                 protected_session_ids_provider=protected_session_ids_provider,
+                protection_revision_provider=protection_revision_provider,
+                protection_commit_guard=protection_commit_guard,
                 max_age_hours=max_age_hours,
                 max_candidates=_MAX_EMPTY_LIFECYCLE_GC_BATCH_SIZE,
             )
@@ -877,10 +883,21 @@ class LifecycleStateStore:
         *,
         protected_session_ids: set[str] | list[str] | tuple[str, ...] | None,
         protected_session_ids_provider: Callable[[], Iterable[str]] | None,
+        protection_revision_provider: Callable[[], int] | None,
+        protection_commit_guard: Callable[[], ContextManager[None]] | None,
         max_age_hours: float | None,
         max_candidates: int,
     ) -> int:
-        """Delete one bounded batch after read-only candidate discovery."""
+        """Delete one hard-bounded batch after read-only candidate discovery."""
+        max_candidates = min(
+            _MAX_EMPTY_LIFECYCLE_GC_BATCH_SIZE,
+            max(0, int(max_candidates)),
+        )
+        protection_revision = (
+            int(protection_revision_provider())
+            if protection_revision_provider is not None
+            else None
+        )
         candidates = self._collect_empty_session_candidates(
             protected_session_ids=protected_session_ids,
             max_age_hours=max_age_hours,
@@ -987,7 +1004,20 @@ class LifecycleStateStore:
                     )
                     deleted += max(0, int(cursor.rowcount or 0))
                 if deleted:
-                    conn.commit()
+                    commit_guard = (
+                        protection_commit_guard()
+                        if protection_commit_guard is not None
+                        else nullcontext()
+                    )
+                    with commit_guard:
+                        if (
+                            protection_revision is not None
+                            and protection_revision_provider is not None
+                            and int(protection_revision_provider()) != protection_revision
+                        ):
+                            conn.rollback()
+                            return 0
+                        conn.commit()
                 else:
                     conn.rollback()
                 return deleted
