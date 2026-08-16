@@ -1203,12 +1203,27 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
         self._consecutive_ingest_failures += 1
         self._last_ingest_error = f"{type(error).__name__}: {error}"
         self._last_ingest_error_time = time.time()
-        message = "LCM ingest failed (%s): %s [consecutive=%d, total=%d]"
+        lock_diagnostics = ""
+        if _is_sqlite_locked_error(error):
+            try:
+                details = self._store.lock_diagnostics(
+                    operation="ingest_messages",
+                    phase=where,
+                )
+                lock_diagnostics = " sqlite_lock_diagnostics=" + json.dumps(
+                    details,
+                    sort_keys=True,
+                    separators=(",", ":"),
+                )
+            except Exception:
+                logger.debug("LCM SQLite lock diagnostics failed", exc_info=True)
+        message = "LCM ingest failed (%s): %s [consecutive=%d, total=%d]%s"
         args = (
             where,
             error,
             self._consecutive_ingest_failures,
             self._ingest_failure_count,
+            lock_diagnostics,
         )
         if self._consecutive_ingest_failures >= 3:
             logger.error(message, *args)
