@@ -31,6 +31,9 @@ def engine(tmp_path):
     config.fresh_tail_count = 4  # small for testing
     config.leaf_chunk_tokens = 100  # low threshold for testing
     config.database_path = str(tmp_path / "lcm_test.db")
+    # The shared fixture exercises non-GC engine behavior. Lifecycle-GC tests
+    # opt in explicitly so background maintenance cannot race unrelated tests.
+    config.empty_lifecycle_gc_enabled = False
     e = LCMEngine(config=config)
     e._session_id = "test-session"
     e.context_length = 200000
@@ -20537,6 +20540,67 @@ class TestSessionRollover:
         recovered = restarted._lifecycle.get_by_conversation(old_conversation_id)
         assert recovered is not None
         assert recovered.current_session_id == "active-session"
+
+    def test_bind_lifecycle_gc_protection_failure_does_not_fail_session_bind(
+        self,
+        tmp_path,
+        monkeypatch,
+        caplog,
+    ):
+        config = LCMConfig(
+            database_path=str(tmp_path / "lcm_gc_protection_failure.db"),
+            empty_lifecycle_gc_enabled=True,
+        )
+        engine = LCMEngine(config=config)
+
+        def fail_protection(*_args, **_kwargs):
+            raise OSError("bad GC path")
+
+        monkeypatch.setattr(
+            lcm_engine,
+            "protect_empty_lifecycle_sessions",
+            fail_protection,
+        )
+        try:
+            with caplog.at_level(logging.WARNING):
+                engine.on_session_start("live-session", platform="cli", context_length=200000)
+            state = engine._lifecycle.get_by_session("live-session")
+            assert state is not None
+            assert state.current_session_id == "live-session"
+            assert "LCM could not protect session from empty-lifecycle GC" in caplog.text
+        finally:
+            engine.shutdown()
+
+    def test_bind_lifecycle_gc_scheduling_failure_does_not_fail_session_bind(
+        self,
+        tmp_path,
+        monkeypatch,
+        caplog,
+    ):
+        config = LCMConfig(
+            database_path=str(tmp_path / "lcm_gc_scheduling_failure.db"),
+            empty_lifecycle_gc_enabled=True,
+        )
+        engine = LCMEngine(config=config)
+
+        def fail_scheduling(*_args, **_kwargs):
+            raise OSError("bad GC path")
+
+        monkeypatch.setattr(lcm_engine, "protect_empty_lifecycle_sessions", lambda *_args: None)
+        monkeypatch.setattr(
+            lcm_engine,
+            "request_empty_lifecycle_gc",
+            fail_scheduling,
+        )
+        try:
+            with caplog.at_level(logging.WARNING):
+                engine.on_session_start("live-session", platform="cli", context_length=200000)
+            state = engine._lifecycle.get_by_session("live-session")
+            assert state is not None
+            assert state.current_session_id == "live-session"
+            assert "LCM could not schedule empty-lifecycle GC" in caplog.text
+        finally:
+            engine.shutdown()
 
     def test_bind_lifecycle_gc_prunes_empty_rows_above_threshold(self, tmp_path, monkeypatch):
         config = LCMConfig(

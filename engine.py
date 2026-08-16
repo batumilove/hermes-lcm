@@ -1469,7 +1469,13 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
         conversation_id: str | None = None,
     ) -> None:
         if self._config.empty_lifecycle_gc_enabled:
-            protect_empty_lifecycle_sessions(self._lifecycle.db_path, {session_id})
+            try:
+                protect_empty_lifecycle_sessions(self._lifecycle.db_path, {session_id})
+            except Exception:
+                logger.warning(
+                    "LCM could not protect session from empty-lifecycle GC",
+                    exc_info=True,
+                )
         state = self._lifecycle.bind_session(session_id, conversation_id=conversation_id)
         self._conversation_id = state.conversation_id
         self._lcm_session_last_conversation_id[session_id] = state.conversation_id
@@ -1486,13 +1492,19 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
         # session bind. The process-wide coordinator rate-limits and single-flights
         # bounded background passes for this database.
         if self._config.empty_lifecycle_gc_enabled:
-            request_empty_lifecycle_gc(
-                self._lifecycle.db_path,
-                threshold=self._config.empty_lifecycle_gc_threshold,
-                max_age_hours=self._config.empty_lifecycle_gc_max_age_hours,
-                protected_session_ids={str(self._session_id)} if self._session_id else (),
-                protected_session_ids_provider=_active_lifecycle_gc_session_ids,
-            )
+            try:
+                request_empty_lifecycle_gc(
+                    self._lifecycle.db_path,
+                    threshold=self._config.empty_lifecycle_gc_threshold,
+                    max_age_hours=self._config.empty_lifecycle_gc_max_age_hours,
+                    protected_session_ids={str(self._session_id)} if self._session_id else (),
+                    protected_session_ids_provider=_active_lifecycle_gc_session_ids,
+                )
+            except Exception:
+                logger.warning(
+                    "LCM could not schedule empty-lifecycle GC",
+                    exc_info=True,
+                )
         # Bypassed/stateless sessions skip every LCM write, so they must also skip
         # rollup maintenance — otherwise the bind-time hook would build rollups for
         # a session whose ingest is suppressed (maintainer #388: gate on the same
