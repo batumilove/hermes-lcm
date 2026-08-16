@@ -256,6 +256,7 @@ class _SharedStorageOwner:
         self._lock = threading.Lock()
         self._references = 1
         self._closed = False
+        self._session_end_flush_lock = threading.Lock()
         self._session_end_drain_lock = threading.Lock()
         self._session_end_drain_thread: threading.Thread | None = None
         self._session_end_drain_done = threading.Event()
@@ -3160,6 +3161,7 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
         started_at = time.monotonic()
         failed_paths: dict[Path, BaseException] = {}
         last_coordinator_error: BaseException | None = None
+        owner._session_end_flush_lock.acquire()
         try:
             owner._session_end_drain_rescan.clear()
             while True:
@@ -3257,6 +3259,7 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
                 if not made_progress:
                     time.sleep(_SESSION_END_DEFERRED_RETRY_INTERVAL_SECONDS)
         finally:
+            owner._session_end_flush_lock.release()
             retiring_thread = threading.current_thread()
             with owner._session_end_drain_lock:
                 registered_worker = owner._session_end_drain_thread is retiring_thread
@@ -3599,7 +3602,28 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
                 current_session_bypasses=current_session_bypasses,
             )
             return
-        pending_intent_path = self._persist_session_end_intent(session_id, messages)
+        session_end_flush_lock = self._storage_owner._session_end_flush_lock
+        if not session_end_flush_lock.acquire(blocking=False):
+            pending_intent_path = self._persist_session_end_intent(session_id, messages)
+            _log_session_end_deferred_event(
+                logging.INFO,
+                stage="singleflight",
+                outcome="scheduled",
+                operation="session_end_singleflight_handoff",
+                intent_sha256=_session_end_intent_digest_from_path(
+                    pending_intent_path
+                ),
+                session_id=session_id,
+                conversation_id=self._conversation_id,
+                wait_seconds=0.0,
+            )
+            self._schedule_session_end_drain()
+            return
+        try:
+            pending_intent_path = self._persist_session_end_intent(session_id, messages)
+        except BaseException:
+            session_end_flush_lock.release()
+            raise
         bounded_flush_started_at = time.monotonic()
         try:
             with _temporary_sqlite_busy_timeout(
@@ -3724,6 +3748,8 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
                 self._schedule_session_end_drain()
                 return
             raise
+        finally:
+            session_end_flush_lock.release()
 
     def on_session_reset(self) -> None:
         if self._host_fallback_compressor is not None:

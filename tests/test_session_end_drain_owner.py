@@ -8,6 +8,7 @@ from hermes_lcm.config import LCMConfig
 from hermes_lcm.engine import LCMEngine
 from hermes_lcm.session_end_pending import (
     build_session_end_intent,
+    pending_session_end_dir,
     persist_session_end_intent,
 )
 
@@ -33,6 +34,160 @@ def _wait_until(predicate, timeout=2.0):
             return True
         time.sleep(0.01)
     return bool(predicate())
+
+
+def test_overlapping_clone_session_ends_handoff_without_writer_timeout(
+    tmp_path, monkeypatch, caplog
+):
+    db_path = tmp_path / "overlapping-session-ends.db"
+    root = LCMEngine(config=LCMConfig(database_path=str(db_path)))
+    clone = root.clone_for_agent()
+    root.on_session_start("first-session", platform="telegram")
+    clone.on_session_start("second-session", platform="telegram")
+    first_finalize_entered = threading.Event()
+    release_first_finalize = threading.Event()
+    first_errors = []
+    original_finalize = root._lifecycle.finalize_session
+
+    def hold_first_finalize(conversation_id, session_id, frontier_store_id=0):
+        if session_id == "first-session":
+            first_finalize_entered.set()
+            assert release_first_finalize.wait(timeout=2.0)
+        return original_finalize(
+            conversation_id,
+            session_id,
+            frontier_store_id=frontier_store_id,
+        )
+
+    def end_first_session():
+        try:
+            root.on_session_end(
+                "first-session",
+                [{"role": "user", "content": "first final message"}],
+            )
+        except BaseException as exc:
+            first_errors.append(exc)
+
+    monkeypatch.setattr(root._lifecycle, "finalize_session", hold_first_finalize)
+    monkeypatch.setattr(
+        engine_module,
+        "_SESSION_END_PROCESS_WRITE_TIMEOUT_MS",
+        20,
+    )
+    first = threading.Thread(target=end_first_session, name="first-session-end")
+    try:
+        with caplog.at_level("INFO", logger="hermes_lcm.engine"):
+            first.start()
+            assert first_finalize_entered.wait(timeout=1.0)
+            clone.on_session_end(
+                "second-session",
+                [{"role": "user", "content": "second final message"}],
+            )
+            handoff_records = [
+                record.getMessage()
+                for record in caplog.records
+                if "event=session_end_deferred" in record.getMessage()
+                and "session_id='second-session'" in record.getMessage()
+            ]
+            assert len(handoff_records) == 1
+            assert "stage=singleflight" in handoff_records[0]
+            assert "outcome=scheduled" in handoff_records[0]
+            assert "operation=session_end_singleflight_handoff" in handoff_records[0]
+            assert "error_type=-" in handoff_records[0]
+            assert not any(
+                "database is locked" in record.getMessage().lower()
+                or "timed out waiting for process-wide sqlite writer"
+                in record.getMessage().lower()
+                for record in caplog.records
+            )
+
+            release_first_finalize.set()
+            first.join(timeout=2.0)
+            assert root._session_end_drain_done.wait(timeout=2.0)
+
+        assert not first.is_alive()
+        assert first_errors == []
+        assert tuple(pending_session_end_dir(db_path).glob("*.json")) == ()
+        assert [
+            message.get("content")
+            for message in root._store.get_session_messages("first-session")
+        ] == ["first final message"]
+        assert [
+            message.get("content")
+            for message in root._store.get_session_messages("second-session")
+        ] == ["second final message"]
+    finally:
+        release_first_finalize.set()
+        first.join(timeout=2.0)
+        root._session_end_drain_done.wait(timeout=2.0)
+        clone.shutdown()
+        root.shutdown()
+
+
+def test_session_end_intent_persistence_failure_releases_singleflight_lock(
+    tmp_path, monkeypatch
+):
+    engine = LCMEngine(
+        config=LCMConfig(database_path=str(tmp_path / "persist-failure.db"))
+    )
+    engine.on_session_start("persist-failure", platform="telegram")
+
+    def fail_persist(*args, **kwargs):
+        del args, kwargs
+        raise OSError("intent persistence failed")
+
+    monkeypatch.setattr(engine, "_persist_session_end_intent", fail_persist)
+    try:
+        with pytest.raises(OSError, match="intent persistence failed"):
+            engine.on_session_end(
+                "persist-failure",
+                [{"role": "user", "content": "must not strand the lease"}],
+            )
+
+        lock = engine._storage_owner._session_end_flush_lock
+        assert lock.acquire(blocking=False)
+        lock.release()
+    finally:
+        engine.shutdown()
+
+
+def test_gate_waiting_drain_survives_scheduling_clone_shutdown(tmp_path):
+    db_path = tmp_path / "gate-waiting-clone-shutdown.db"
+    root = LCMEngine(config=LCMConfig(database_path=str(db_path)))
+    clone = root.clone_for_agent()
+    owner = root._storage_owner
+    intent_path = None
+    test_gate_held = False
+    owner._session_end_flush_lock.acquire()
+    test_gate_held = True
+    try:
+        intent_path = _v2_intent(db_path, session_id="waiting-clone-session")
+        clone._schedule_session_end_drain()
+        assert not root._session_end_drain_done.wait(timeout=0.1)
+
+        clone.shutdown()
+        assert not owner._closed
+        assert intent_path.exists()
+
+        owner._session_end_flush_lock.release()
+        test_gate_held = False
+        assert root._session_end_drain_done.wait(timeout=2.0)
+        assert not intent_path.exists()
+        assert [
+            message.get("content")
+            for message in root._store.get_session_messages(
+                "waiting-clone-session"
+            )
+        ] == ["deferred:waiting-clone-session"]
+    finally:
+        if test_gate_held:
+            owner._session_end_flush_lock.release()
+        root._session_end_drain_done.wait(timeout=2.0)
+        if not clone._storage_released:
+            clone.shutdown()
+        root.shutdown()
+        if intent_path is not None:
+            intent_path.unlink(missing_ok=True)
 
 
 def test_clones_share_one_serialized_session_end_drain_worker(tmp_path, monkeypatch):
