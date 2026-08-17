@@ -97,6 +97,21 @@ def register(ctx):
     """Plugin entry point — register the LCM context engine and tools."""
     global _registered_root_engine
 
+    # Modern Hermes hosts expose a runtime role. Only request-producing CLI and
+    # gateway surfaces may own the profile-scoped LCM engine. Passive dashboard
+    # supervisors — and unknown modern surfaces, which must fail closed — would
+    # otherwise keep SQLite connections open for their whole process lifetime
+    # and can block the gateway from loading LCM after a restart. Hosts predating
+    # runtime_role keep the established compatibility behavior.
+    runtime_role = getattr(ctx, "runtime_role", None)
+    normalized_role = str(runtime_role or "").strip().lower()
+    if runtime_role is not None and normalized_role not in {"cli", "gateway"}:
+        logger.info(
+            "LCM context-engine ownership skipped on passive surface: %s",
+            normalized_role or "unknown",
+        )
+        return
+
     from .lifecycle_metrics import configure_from_host_policy
     from .config import LCMConfig
     from .engine import LCMEngine, resolve_active_lcm_engine
