@@ -46,7 +46,7 @@ from .search_query import (
     should_apply_directness_rank_adjustment,
 )
 from .message_content import normalize_content_value as _normalize_content_value
-from .sqlite_util import process_sqlite_write_lock
+from .sqlite_util import process_sqlite_write_lock, sqlite_lock_diagnostics
 from .tokens import count_message_tokens
 
 logger = logging.getLogger(__name__)
@@ -321,6 +321,16 @@ class MessageStore:
         )
 
     # -- Write operations ---------------------------------------------------
+
+    def lock_diagnostics(self, *, operation: str, phase: str) -> dict[str, Any]:
+        """Capture read-only SQLite lock attribution for a failed store operation."""
+        return sqlite_lock_diagnostics(
+            self.db_path,
+            self._conn,
+            self._write_lock,
+            operation=operation,
+            phase=phase,
+        )
 
     def append(self, session_id: str, msg: Dict[str, Any],
                token_estimate: int = 0, source: str = "",

@@ -8,6 +8,7 @@ example the session-end timeout budget).
 
 from __future__ import annotations
 
+import os
 import sqlite3
 import sys
 import threading
@@ -258,6 +259,140 @@ def _is_sqlite_locked_error(exc: BaseException) -> bool:
 def _sqlite_busy_timeout_ms(conn: sqlite3.Connection) -> int:
     row = conn.execute("PRAGMA busy_timeout").fetchone()
     return int(row[0]) if row and row[0] is not None else 0
+
+
+def _sqlite_file_identity(path: Path) -> dict[str, Any]:
+    """Return bounded identity metadata for one SQLite filesystem artifact."""
+    try:
+        result = path.stat()
+    except OSError:
+        return {"exists": False}
+    return {
+        "exists": True,
+        "device": int(result.st_dev),
+        "inode": int(result.st_ino),
+        "size": int(result.st_size),
+        "mtime_ns": int(result.st_mtime_ns),
+    }
+
+
+def _external_proc_lock_holders(
+    file_targets: dict[tuple[int, int, int], str],
+    *,
+    limit: int = 32,
+    holder_pid: int | None = None,
+) -> tuple[list[dict[str, Any]], bool]:
+    """Return bounded Linux /proc/locks attribution for external or one exact PID."""
+    holders: list[dict[str, Any]] = []
+    truncated = False
+    try:
+        lock_lines = Path("/proc/locks").open(encoding="utf-8")
+    except OSError:
+        return holders, truncated
+    current_pid = os.getpid()
+    with lock_lines:
+        for line in lock_lines:
+            fields = line.split()
+            offset = 1 if len(fields) > 1 and fields[1] == "->" else 0
+            if len(fields) < 8 + offset:
+                continue
+            try:
+                pid = int(fields[4 + offset])
+                major_hex, minor_hex, inode_text = fields[5 + offset].split(":", 2)
+                identity = (int(major_hex, 16), int(minor_hex, 16), int(inode_text))
+            except (TypeError, ValueError):
+                continue
+            target = file_targets.get(identity)
+            if target is None:
+                continue
+            if holder_pid is None:
+                if pid == current_pid:
+                    continue
+            elif pid != holder_pid:
+                continue
+            if len(holders) >= max(0, int(limit)):
+                truncated = True
+                continue
+            holders.append(
+                {
+                    "pid": pid,
+                    "target": target,
+                    "class": _bounded_diagnostic_label(fields[1 + offset]),
+                    "mode": _bounded_diagnostic_label(fields[3 + offset]),
+                    "start": _bounded_diagnostic_label(fields[6 + offset]),
+                    "end": _bounded_diagnostic_label(fields[7 + offset]),
+                }
+            )
+    return (
+        sorted(
+            holders,
+            key=lambda item: (
+                item["pid"],
+                item["target"],
+                item["start"],
+                item["end"],
+            ),
+        ),
+        truncated,
+    )
+
+
+def sqlite_lock_diagnostics(
+    db_path: str | Path,
+    connection: sqlite3.Connection | None,
+    process_writer: Any,
+    *,
+    operation: str,
+    phase: str,
+) -> dict[str, Any]:
+    """Capture lock attribution without performing writes or changing timeouts."""
+    database_path = Path(db_path).expanduser().resolve()
+    paths = {
+        "db": database_path,
+        "wal": Path(str(database_path) + "-wal"),
+        "shm": Path(str(database_path) + "-shm"),
+    }
+    files = {name: _sqlite_file_identity(path) for name, path in paths.items()}
+    file_targets: dict[tuple[int, int, int], str] = {}
+    for name, identity in files.items():
+        if not identity.get("exists"):
+            continue
+        device = int(identity["device"])
+        file_targets[(os.major(device), os.minor(device), int(identity["inode"]))] = name
+
+    connection_state: dict[str, Any] = {"available": connection is not None}
+    if connection is not None:
+        try:
+            connection_state["in_transaction"] = bool(connection.in_transaction)
+        except Exception:
+            connection_state["in_transaction"] = None
+        try:
+            connection_state["busy_timeout_ms"] = _sqlite_busy_timeout_ms(connection)
+        except Exception:
+            connection_state["busy_timeout_ms"] = None
+
+    try:
+        owner = process_writer.owner_snapshot()
+    except Exception:
+        owner = {}
+    external_lock_holders, external_lock_holders_truncated = (
+        _external_proc_lock_holders(file_targets)
+    )
+    same_process_lock_holders, same_process_lock_holders_truncated = (
+        _external_proc_lock_holders(file_targets, holder_pid=os.getpid())
+    )
+    return {
+        "operation": _bounded_diagnostic_label(operation),
+        "phase": _bounded_diagnostic_label(phase),
+        "pid": os.getpid(),
+        "process_writer_owner": owner,
+        "connection": connection_state,
+        "files": files,
+        "external_lock_holders": external_lock_holders,
+        "external_lock_holders_truncated": external_lock_holders_truncated,
+        "same_process_lock_holders": same_process_lock_holders,
+        "same_process_lock_holders_truncated": same_process_lock_holders_truncated,
+    }
 
 
 @contextmanager
