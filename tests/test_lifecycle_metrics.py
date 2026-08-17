@@ -146,8 +146,24 @@ class TestRegistryShape:
             "lifecycle_state_store_close_idempotent_total",
             "lifecycle_state_store_close_failures_total",
             "storage_binds_total",
+            "session_end_drains_started_total",
+            "session_end_drains_exhausted_total",
         ):
             assert key in rl, f"missing key {key!r}"
+
+    def test_session_end_drain_metrics_record_truthful_outcomes(self):
+        before = _snapshot()["runtime_lifecycle"]
+
+        lcm_metrics.record_session_end_drain_started()
+        lcm_metrics.record_session_end_drain_exhausted()
+
+        after = _snapshot()["runtime_lifecycle"]
+        assert after["session_end_drains_started_total"] == (
+            before["session_end_drains_started_total"] + 1
+        )
+        assert after["session_end_drains_exhausted_total"] == (
+            before["session_end_drains_exhausted_total"] + 1
+        )
 
     def test_snapshot_is_a_copy(self):
         snap1 = lcm_metrics.snapshot()

@@ -152,6 +152,33 @@ def test_temporary_busy_timeout_attributes_semantic_operation(tmp_path):
     assert coordinator.owner_snapshot() == {}
 
 
+def test_process_write_lock_attributes_nested_phase_without_reacquiring(tmp_path):
+    coordinator = sqlite_util.process_sqlite_write_lock(tmp_path / "lcm.db")
+
+    with coordinator.attributed("session_end_ingest_finalize"):
+        outer = coordinator.owner_snapshot()
+        with coordinator.attributed_phase("session_end_raw_message_ingest"):
+            phase = coordinator.owner_snapshot()
+            assert phase["operation"] == "session_end_raw_message_ingest"
+            assert phase["depth"] == outer["depth"]
+            assert phase["age_seconds"] >= outer["age_seconds"]
+            assert 0.0 <= phase["operation_age_seconds"] <= phase["age_seconds"]
+        restored = coordinator.owner_snapshot()
+        assert restored["operation"] == "session_end_ingest_finalize"
+        assert restored["depth"] == outer["depth"]
+
+    assert coordinator.owner_snapshot() == {}
+
+
+def test_process_write_lock_rejects_phase_without_current_thread_ownership(tmp_path):
+    coordinator = sqlite_util.process_sqlite_write_lock(tmp_path / "lcm.db")
+
+    with pytest.raises(RuntimeError, match="current thread does not own"):
+        with coordinator.attributed_phase("orphan_phase"):
+            pass
+
+
+
 def test_process_write_lock_wait_is_bounded(tmp_path, monkeypatch):
     coordinator = sqlite_util.process_sqlite_write_lock(tmp_path / "lcm.db")
     holder_entered = threading.Event()
