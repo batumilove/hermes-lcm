@@ -280,8 +280,9 @@ def _external_proc_lock_holders(
     file_targets: dict[tuple[int, int, int], str],
     *,
     limit: int = 32,
+    holder_pid: int | None = None,
 ) -> tuple[list[dict[str, Any]], bool]:
-    """Best-effort bounded Linux /proc/locks attribution for SQLite artifacts."""
+    """Return bounded Linux /proc/locks attribution for external or one exact PID."""
     holders: list[dict[str, Any]] = []
     truncated = False
     try:
@@ -302,7 +303,12 @@ def _external_proc_lock_holders(
             except (TypeError, ValueError):
                 continue
             target = file_targets.get(identity)
-            if target is None or pid == current_pid:
+            if target is None:
+                continue
+            if holder_pid is None:
+                if pid == current_pid:
+                    continue
+            elif pid != holder_pid:
                 continue
             if len(holders) >= max(0, int(limit)):
                 truncated = True
@@ -372,6 +378,9 @@ def sqlite_lock_diagnostics(
     external_lock_holders, external_lock_holders_truncated = (
         _external_proc_lock_holders(file_targets)
     )
+    same_process_lock_holders, same_process_lock_holders_truncated = (
+        _external_proc_lock_holders(file_targets, holder_pid=os.getpid())
+    )
     return {
         "operation": _bounded_diagnostic_label(operation),
         "phase": _bounded_diagnostic_label(phase),
@@ -381,6 +390,8 @@ def sqlite_lock_diagnostics(
         "files": files,
         "external_lock_holders": external_lock_holders,
         "external_lock_holders_truncated": external_lock_holders_truncated,
+        "same_process_lock_holders": same_process_lock_holders,
+        "same_process_lock_holders_truncated": same_process_lock_holders_truncated,
     }
 
 

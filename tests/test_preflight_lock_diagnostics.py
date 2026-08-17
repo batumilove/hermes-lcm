@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import logging
 import multiprocessing
+import os
 import sqlite3
 
 from hermes_lcm.config import LCMConfig
@@ -88,3 +89,47 @@ def test_preflight_lock_warning_identifies_external_writer(tmp_path, caplog):
         engine.shutdown()
 
     assert holder.exitcode == 0
+
+
+def test_preflight_lock_warning_identifies_uncoordinated_same_process_writer(
+    tmp_path, caplog
+):
+    database_path = tmp_path / "lcm.db"
+    engine = LCMEngine(config=LCMConfig(database_path=str(database_path)))
+    engine.on_session_start("same-process-lock-session", platform="telegram")
+    engine._store._conn.execute("PRAGMA busy_timeout = 100")
+
+    holder = sqlite3.connect(database_path)
+    try:
+        holder.execute("BEGIN IMMEDIATE")
+        holder.execute(
+            "INSERT INTO metadata(key, value) VALUES (?, ?)",
+            ("same-process-lock-probe", "held"),
+        )
+        with caplog.at_level(logging.WARNING):
+            assert (
+                engine.should_compress_preflight(
+                    [{"role": "user", "content": "must remain durable"}]
+                )
+                is False
+            )
+
+        warning = next(
+            record.getMessage()
+            for record in caplog.records
+            if "LCM ingest failed (preflight): database is locked" in record.getMessage()
+        )
+        diagnostics = json.loads(warning.split(" sqlite_lock_diagnostics=", 1)[1])
+
+        assert diagnostics["process_writer_owner"] == {}
+        assert diagnostics["external_lock_holders"] == []
+        assert diagnostics["same_process_lock_holders_truncated"] is False
+        assert any(
+            holder_info["pid"] == os.getpid()
+            and holder_info["target"] in {"db", "wal", "shm"}
+            for holder_info in diagnostics["same_process_lock_holders"]
+        )
+    finally:
+        holder.rollback()
+        holder.close()
+        engine.shutdown()
