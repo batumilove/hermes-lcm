@@ -95,7 +95,12 @@ def test_preflight_lock_warning_identifies_uncoordinated_same_process_writer(
     tmp_path, caplog
 ):
     database_path = tmp_path / "lcm.db"
-    engine = LCMEngine(config=LCMConfig(database_path=str(database_path)))
+    engine = LCMEngine(
+        config=LCMConfig(
+            database_path=str(database_path),
+            empty_lifecycle_gc_enabled=False,
+        )
+    )
     engine.on_session_start("same-process-lock-session", platform="telegram")
     engine._store._conn.execute("PRAGMA busy_timeout = 100")
 
