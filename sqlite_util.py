@@ -74,6 +74,9 @@ def _optional_timeout_detail(write_lock: Any) -> str:
     return "; " + detail
 
 
+_RECENT_OWNER_HISTORY_LIMIT = 16
+
+
 class ProcessSQLiteWriteLock:
     """Reentrant same-process writer gate with a SQLite-aligned wait bound."""
 
@@ -86,6 +89,11 @@ class ProcessSQLiteWriteLock:
         self._owner_acquired_at = 0.0
         self._owner_operation_started_at = 0.0
         self._owner_depth = 0
+        # Bounded ring of recently released owners so post-failure lock
+        # diagnostics can attribute contention even when the holder already
+        # released (Class B: process_writer_owner == {} after busy failures).
+        self._recent_owners: list[dict[str, Any]] = []
+
 
     def acquire(
         self,
@@ -126,12 +134,42 @@ class ProcessSQLiteWriteLock:
                 raise RuntimeError("cannot release un-acquired lock")
             self._owner_depth -= 1
             if self._owner_depth == 0:
+                self._append_recent_owner_locked()
                 self._owner_thread_id = None
                 self._owner_thread_name = ""
                 self._owner_operation = ""
                 self._owner_acquired_at = 0.0
                 self._owner_operation_started_at = 0.0
             self._lock.release()
+
+    def _append_recent_owner_locked(self) -> None:
+        """Append the departing owner to the bounded history ring.
+
+        Caller must hold ``_metadata_lock``.
+        """
+        try:
+            now = time.monotonic()
+        except Exception:
+            now = self._owner_acquired_at
+        self._recent_owners.append(
+            {
+                "thread_id": self._owner_thread_id,
+                "thread_name": self._owner_thread_name,
+                "operation": self._owner_operation,
+                "depth": self._owner_depth,
+                "held_seconds": max(
+                    0.0, now - self._owner_acquired_at
+                ),
+                "released_monotonic": now,
+            }
+        )
+        if len(self._recent_owners) > _RECENT_OWNER_HISTORY_LIMIT:
+            del self._recent_owners[: len(self._recent_owners) - _RECENT_OWNER_HISTORY_LIMIT]
+
+    def recent_owners(self) -> list[dict[str, Any]]:
+        """Return a bounded snapshot of recently released writer owners."""
+        with self._metadata_lock:
+            return [dict(entry) for entry in self._recent_owners]
 
     def owner_snapshot(self) -> dict[str, Any]:
         """Return bounded lock-owner diagnostics without database or SQL content."""
@@ -375,6 +413,10 @@ def sqlite_lock_diagnostics(
         owner = process_writer.owner_snapshot()
     except Exception:
         owner = {}
+    try:
+        recent_owners = list(process_writer.recent_owners())
+    except Exception:
+        recent_owners = []
     external_lock_holders, external_lock_holders_truncated = (
         _external_proc_lock_holders(file_targets)
     )
@@ -386,6 +428,7 @@ def sqlite_lock_diagnostics(
         "phase": _bounded_diagnostic_label(phase),
         "pid": os.getpid(),
         "process_writer_owner": owner,
+        "process_writer_recent_owners": recent_owners,
         "connection": connection_state,
         "files": files,
         "external_lock_holders": external_lock_holders,
