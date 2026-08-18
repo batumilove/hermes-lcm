@@ -146,7 +146,13 @@ from . import tools as lcm_tools
 logger = logging.getLogger(__name__)
 
 _SESSION_END_BUSY_TIMEOUT_MS = 50
-_SESSION_END_PROCESS_WRITE_TIMEOUT_MS = 200
+# Session-end hooks run from host lifecycle paths that must stay bounded, but
+# the bounded flush competes with _append_protected_batch holds on the shared
+# lcm.db. Observed holds in production: 1.26s-2.13s (2026-08-17 gateway
+# journal, PID 2479926). Waiting those out is cheaper and safer than deferring
+# and re-draining: the intent sidecar keeps the data durable either way, so a
+# longer bounded wait only trades hook latency for completed flushes.
+_SESSION_END_PROCESS_WRITE_TIMEOUT_MS = 4000
 _SESSION_END_DEFERRED_RETRY_BUDGET_SECONDS = 30.0
 _SESSION_END_DEFERRED_RETRY_INTERVAL_SECONDS = 0.05
 _CODEX_GPT55_COMPACTION_THRESHOLD = 0.85

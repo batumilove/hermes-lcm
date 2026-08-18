@@ -12342,14 +12342,22 @@ class TestSessionRollover:
         holder.start()
         assert holder_entered.wait(timeout=1.0)
 
+        # Contract (writer-wait fix, PR #13): the session-end bounded flush
+        # waits out a same-process writer hold instead of deferring fast.
+        # A ~2s held writer is waited out within the 4s process-writer budget;
+        # the message is then persisted exactly once (inline or via the
+        # deferred drain — both acceptable, elapsed must reflect the wait).
         started = time.monotonic()
         engine.on_session_end("test-session", final_messages)
         elapsed = time.monotonic() - started
 
-        assert elapsed < 0.75
-        assert engine._store.get_session_messages("test-session") == []
+        assert elapsed >= 1.0, (
+            f"session-end returned in {elapsed:.2f}s without waiting out the "
+            "same-process writer hold; expected the bounded flush to wait"
+        )
 
-        release_holder.set()
+        if holder.is_alive():
+            release_holder.set()
         holder.join(timeout=1.0)
         assert not holder.is_alive()
 
