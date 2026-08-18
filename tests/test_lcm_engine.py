@@ -12316,6 +12316,64 @@ class TestSessionRollover:
         assert not worker.is_alive()
         assert engine._store._write_lock.owner_snapshot() == {}
 
+    def test_on_session_end_does_not_emit_bounded_flush_deferral_for_production_append_hold(
+        self,
+        engine,
+        caplog,
+    ):
+        """A same-process _append_protected_batch writer holding the process-wide
+        writer for ~1.3s (observed in production) must not cause the session-end
+        bounded flush to emit a hard-marker deferral event.
+
+        The durable sidecar ensures eventual persistence; the deferral event is
+        still a hard acceptance marker. Production owner ages were ~1.259s.
+        """
+        engine.on_session_start("test-session", platform="discord")
+        holder_entered = threading.Event()
+        final_messages = [{"role": "user", "content": "append-hold final message"}]
+        # The append-overlap budget must exceed the modeled production hold
+        # (~1.3s) but stay bounded well below the drain/deferred path.
+        _APPEND_OVERLAP_BUDGET_SECONDS = 2.5
+
+        def hold_append_writer():
+            with engine._store._write_lock.attributed(
+                "_append_protected_batch"
+            ):
+                holder_entered.set()
+                # Production owner age observed at 2026-08-17T18:51:19Z was
+                # 1.259s; model a same-shaped bounded foreground append hold
+                # that releases on its own.
+                time.sleep(1.3)
+
+        holder = threading.Thread(
+            target=hold_append_writer, name="append-batch-holder"
+        )
+        holder.start()
+        assert holder_entered.wait(timeout=1.0)
+
+        started = time.monotonic()
+        with caplog.at_level(logging.WARNING):
+            engine.on_session_end("test-session", final_messages)
+        elapsed = time.monotonic() - started
+        holder.join(timeout=2.0)
+        assert not holder.is_alive()
+
+        # Must complete inline (no deferral) within the append-overlap budget.
+        assert elapsed < _APPEND_OVERLAP_BUDGET_SECONDS
+
+        assert engine._session_end_drain_done.wait(timeout=5.0)
+        persisted = engine._store.get_session_messages("test-session")
+        assert [m.get("content") for m in persisted] == ["append-hold final message"]
+        state = engine._lifecycle.get_by_conversation(engine._conversation_id)
+        assert state is not None
+        assert state.last_finalized_session_id == "test-session"
+        # The RED assertion: the production-shaped writer hold must not produce
+        # the bounded-flush deferral that failed the v5 acceptance campaign.
+        assert (
+            "LCM session-end ingest/finalize deferred after SQLite lock"
+            not in caplog.text
+        )
+
     def test_on_session_end_eventually_persists_after_long_same_process_writer_overlap(
         self,
         engine,
