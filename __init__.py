@@ -8,8 +8,37 @@ Based on the LCM paper by Ehrlich & Blackman (Voltropy PBC, Feb 2026).
 
 import logging
 import os
+import re
+import sqlite3
+import time
 
 logger = logging.getLogger(__name__)
+
+# Bounded retry policy for LCM engine construction inside register() when the
+# process-wide SQLite writer is temporarily held (startup FTS integrity scan).
+_ENGINE_CONSTRUCTION_MAX_ATTEMPTS = 3
+_ENGINE_CONSTRUCTION_RETRY_DELAY_S = 2.0
+
+# Lock-timeout signatures from the process-wide writer gate (see
+# process_sqlite_write_lock / db_bootstrap): sqlite3 "database is locked"
+# OperationalError and the gate's own "timed out waiting for process-wide
+# SQLite writer" wrapper text.
+_SQLITE_LOCK_TIMEOUT_RE = re.compile(
+    r"database is locked|database table is locked"
+    r"|timed out waiting for process-wide SQLite writer",
+    re.IGNORECASE,
+)
+
+
+def _is_sqlite_lock_timeout(exc: BaseException) -> bool:
+    """True only for SQLite lock/busy-timeout failure signatures."""
+    if isinstance(exc, sqlite3.OperationalError):
+        msg = str(exc).lower()
+        return "locked" in msg or "busy" in msg
+    if isinstance(exc, RuntimeError):
+        return bool(_SQLITE_LOCK_TIMEOUT_RE.search(str(exc)))
+    return False
+
 
 # ``PluginManager.discover_and_load(force=True)`` can invoke register() again
 # in the same process. Keep only the current process-root engine here so a
@@ -146,7 +175,30 @@ def register(ctx):
         import os
         hermes_home = os.environ.get("HERMES_HOME", os.path.expanduser("~/.hermes"))
 
-    engine = LCMEngine(config=config, hermes_home=hermes_home)
+    # Bounded retry for engine construction against a lock-timeout only.
+    # The engine's own startup background FTS integrity scan
+    # (_run_background_integrity_scan) can hold the process-wide SQLite writer
+    # for up to the full busy timeout while construction is still acquiring
+    # its own writer. That aborts plugin load with no host-side retry and
+    # permanently drops the context engine for the process lifetime
+    # (incident 2026-08-17 20:14:38Z). Retry a bounded number of times on
+    # lock-timeout signatures only; all other errors propagate immediately.
+    engine = None
+    for attempt in range(_ENGINE_CONSTRUCTION_MAX_ATTEMPTS):
+        try:
+            engine = LCMEngine(config=config, hermes_home=hermes_home)
+            break
+        except Exception as exc:
+            if attempt + 1 >= _ENGINE_CONSTRUCTION_MAX_ATTEMPTS or not _is_sqlite_lock_timeout(exc):
+                raise
+            logger.warning(
+                "LCM engine construction failed with a SQLite lock timeout "
+                "(attempt %d/%d); retrying: %s",
+                attempt + 1,
+                _ENGINE_CONSTRUCTION_MAX_ATTEMPTS,
+                exc,
+            )
+            time.sleep(_ENGINE_CONSTRUCTION_RETRY_DELAY_S)
 
     # Registration is transactional from the plugin's perspective: publish the
     # replacement first, then retire the superseded root. This prevents a
