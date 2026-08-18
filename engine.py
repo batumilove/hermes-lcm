@@ -147,6 +147,14 @@ logger = logging.getLogger(__name__)
 
 _SESSION_END_BUSY_TIMEOUT_MS = 50
 _SESSION_END_PROCESS_WRITE_TIMEOUT_MS = 200
+# Production telemetry (2026-08-17 v5 campaign) showed same-process
+# ``_append_protected_batch`` foreground writers holding the process-wide
+# writer for ~1.3s. That owner class is guaranteed to release (it is a
+# normal batch append), so the bounded session-end flush grants it extra
+# patience instead of failing into the deferred-drain path and emitting a
+# hard-marker lock event. Unknown or external owners keep the strict
+# process-write timeout.
+_SESSION_END_APPEND_OVERLAP_TIMEOUT_MS = 2500
 _SESSION_END_DEFERRED_RETRY_BUDGET_SECONDS = 30.0
 _SESSION_END_DEFERRED_RETRY_INTERVAL_SECONDS = 0.05
 _CODEX_GPT55_COMPACTION_THRESHOLD = 0.85
@@ -3639,14 +3647,29 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
             raise
         bounded_flush_started_at = time.monotonic()
         try:
+            process_write_lock = getattr(self._store, "_write_lock", None)
+            append_overlap = False
+            if process_write_lock is not None:
+                owner_snapshot = process_write_lock.owner_snapshot()
+                append_overlap = bool(
+                    owner_snapshot
+                    and owner_snapshot.get("operation")
+                    == "_append_protected_batch"
+                    and owner_snapshot.get("thread_id") is not None
+                )
+            process_write_timeout_ms = (
+                _SESSION_END_APPEND_OVERLAP_TIMEOUT_MS
+                if append_overlap
+                else _SESSION_END_PROCESS_WRITE_TIMEOUT_MS
+            )
             with _temporary_sqlite_busy_timeout(
                 [
                     getattr(self._store, "_conn", None),
                     getattr(self._lifecycle, "_conn", None),
                 ],
                 _SESSION_END_BUSY_TIMEOUT_MS,
-                write_lock=getattr(self._store, "_write_lock", None),
-                write_lock_timeout_ms=_SESSION_END_PROCESS_WRITE_TIMEOUT_MS,
+                write_lock=process_write_lock,
+                write_lock_timeout_ms=process_write_timeout_ms,
                 write_lock_operation="session_end_ingest_finalize",
             ):
                 raw_ingest_started_at = time.monotonic()
