@@ -102,10 +102,16 @@ def register(ctx):
     # supervisors — and unknown modern surfaces, which must fail closed — would
     # otherwise keep SQLite connections open for their whole process lifetime
     # and can block the gateway from loading LCM after a restart. Hosts predating
-    # runtime_role keep the established compatibility behavior.
+    # runtime_role keep the established compatibility behavior. An explicit
+    # can_claim_provider_telemetry_writer=False skip still applies to otherwise
+    # eligible CLI/gateway or legacy hosts so a later claiming rediscovery can
+    # take ownership.
     runtime_role = getattr(ctx, "runtime_role", None)
     normalized_role = str(runtime_role or "").strip().lower()
-    if runtime_role is not None and normalized_role not in {"cli", "gateway"}:
+    can_claim = getattr(ctx, "can_claim_provider_telemetry_writer", None)
+    if can_claim is False or (
+        runtime_role is not None and normalized_role not in {"cli", "gateway"}
+    ):
         logger.info(
             "LCM context-engine ownership skipped on passive surface: %s",
             normalized_role or "unknown",

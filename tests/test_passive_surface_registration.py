@@ -45,3 +45,72 @@ def test_unknown_modern_surface_fails_closed_without_constructing_engine(tmp_pat
     module.register(UnknownContext())
 
     assert not (tmp_path / ".hermes" / "lcm.db").exists()
+
+
+def test_non_claiming_gateway_surface_does_not_construct_or_register_engine(
+    tmp_path, monkeypatch, caplog
+):
+    caplog.set_level("INFO")
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / ".hermes"))
+    module = load_module("hermes_lcm_non_claiming_gateway_test")
+
+    class NonClaimingGateway:
+        runtime_role = "gateway"
+        can_claim_provider_telemetry_writer = False
+
+        def register_context_engine(self, engine):
+            raise AssertionError("non-claiming gateway must not register LCM")
+
+    module.register(NonClaimingGateway())
+
+    assert not (tmp_path / ".hermes" / "lcm.db").exists()
+    assert "passive surface" in caplog.text.lower()
+
+
+def test_non_claiming_legacy_surface_without_runtime_role_does_not_construct(
+    tmp_path, monkeypatch, caplog
+):
+    caplog.set_level("INFO")
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / ".hermes"))
+    module = load_module("hermes_lcm_non_claiming_legacy_test")
+
+    class LegacyNonClaiming:
+        can_claim_provider_telemetry_writer = False
+
+        def register_context_engine(self, engine):
+            raise AssertionError("non-claiming legacy surface must not register LCM")
+
+    module.register(LegacyNonClaiming())
+
+    assert not (tmp_path / ".hermes" / "lcm.db").exists()
+    assert "passive surface" in caplog.text.lower()
+
+
+def test_claiming_rediscovery_registers_after_non_claiming_skip(tmp_path, monkeypatch):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / ".hermes"))
+    module = load_module("hermes_lcm_claiming_rediscovery_test")
+
+    class NonClaimingGateway:
+        runtime_role = "gateway"
+        can_claim_provider_telemetry_writer = False
+
+        def register_context_engine(self, engine):
+            raise AssertionError("non-claiming discovery must not register LCM")
+
+    class ClaimingGateway:
+        runtime_role = "gateway"
+        can_claim_provider_telemetry_writer = True
+
+        def __init__(self):
+            self.engine = None
+
+        def register_context_engine(self, engine):
+            self.engine = engine
+
+    module.register(NonClaimingGateway())
+    gateway = ClaimingGateway()
+    module.register(gateway)
+
+    assert gateway.engine is not None
+    assert (tmp_path / ".hermes" / "lcm.db").exists()
+    gateway.engine.shutdown()
