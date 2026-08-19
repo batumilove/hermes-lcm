@@ -3091,18 +3091,22 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
                 error=exc,
             )
             raise
-        if int(intent.get("version") or 0) >= 2:
-            _log_session_end_deferred_event(
-                logging.INFO,
-                stage="drain",
-                outcome="settled",
-                operation="session_end_deferred_drain",
-                intent_sha256=intent_sha256,
-                receipt_id=intent_sha256,
-                session_id=session_id,
-                conversation_id=conversation_id,
-                wait_seconds=time.monotonic() - started_at,
-            )
+        _log_session_end_deferred_event(
+            # WARNING (not INFO): gateway journal capture drops plugin INFO
+            # records, which made drain settlement unverifiable and tripped
+            # the "scheduled deferred intent lacking settlement" acceptance
+            # rule even when the drain had completed. Settled intents —
+            # v1 and v2 alike — must be observable in the journal.
+            logging.WARNING,
+            stage="drain",
+            outcome="settled",
+            operation="session_end_deferred_drain",
+            intent_sha256=intent_sha256,
+            receipt_id=intent_sha256,
+            session_id=session_id,
+            conversation_id=conversation_id,
+            wait_seconds=time.monotonic() - started_at,
+        )
 
     def _drain_loaded_session_end_intent(
         self, path: Path, intent: Dict[str, Any]
@@ -3631,7 +3635,9 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
         if not session_end_flush_lock.acquire(blocking=False):
             pending_intent_path = self._persist_session_end_intent(session_id, messages)
             _log_session_end_deferred_event(
-                logging.INFO,
+                # WARNING (not INFO): must pair with the settled event in the
+                # journal; gateway capture drops plugin INFO records.
+                logging.WARNING,
                 stage="singleflight",
                 outcome="scheduled",
                 operation="session_end_singleflight_handoff",
