@@ -11,7 +11,6 @@ when the drain completed.
 
 import hashlib
 import logging
-import threading
 import time
 
 import pytest
