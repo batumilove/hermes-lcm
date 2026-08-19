@@ -835,6 +835,38 @@ class LifecycleStateStore:
         finally:
             conn.close()
 
+    def empty_session_candidate_count(
+        self,
+        *,
+        protected_session_ids: set[str] | list[str] | tuple[str, ...] | None = None,
+        max_age_hours: float | None = None,
+        limit: int | None = None,
+    ) -> int:
+        """Count eligible empty lifecycle rows on a read-only connection.
+
+        Bounded: when ``limit`` is given, discovery stops after that many
+        candidates (callers pass ``threshold + 1`` so the comparison remains
+        exact without scanning the full table).
+        """
+        if limit is None:
+            return len(
+                self._collect_empty_session_candidates(
+                    protected_session_ids=protected_session_ids,
+                    max_age_hours=max_age_hours,
+                    max_candidates=2**31 - 1,
+                )
+            )
+        bounded = max(0, int(limit))
+        if bounded == 0:
+            return 0
+        return len(
+            self._collect_empty_session_candidates(
+                protected_session_ids=protected_session_ids,
+                max_age_hours=max_age_hours,
+                max_candidates=bounded,
+            )
+        )
+
     def prune_empty_sessions(
         self,
         *,

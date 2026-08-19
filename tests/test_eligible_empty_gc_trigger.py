@@ -36,7 +36,8 @@ class TestEligibleCandidateCount:
             assert state.row_count() == 52
             assert state.empty_session_candidate_count(max_age_hours=None) == 2
         finally:
-            state.close(); messages.close()
+            state.close()
+            messages.close()
 
     def test_count_respects_limit_bound(self, tmp_path):
         db = tmp_path / "limit.db"
@@ -46,7 +47,8 @@ class TestEligibleCandidateCount:
                 max_age_hours=None, limit=6
             ) == 6
         finally:
-            state.close(); messages.close()
+            state.close()
+            messages.close()
 
     def test_count_respects_max_age(self, tmp_path):
         db = tmp_path / "age.db"
@@ -54,7 +56,8 @@ class TestEligibleCandidateCount:
         try:
             assert state.empty_session_candidate_count(max_age_hours=1.0) == 0
         finally:
-            state.close(); messages.close()
+            state.close()
+            messages.close()
 
     def test_count_excludes_protected_sessions(self, tmp_path):
         db = tmp_path / "prot.db"
@@ -65,7 +68,8 @@ class TestEligibleCandidateCount:
                 max_age_hours=None,
             ) == 1
         finally:
-            state.close(); messages.close()
+            state.close()
+            messages.close()
 
 
 class TestCoordinatorEligibleTrigger:
@@ -98,4 +102,5 @@ class TestCoordinatorEligibleTrigger:
                 "even though total rows (60) exceed it"
             )
         finally:
-            state.close(); messages.close()
+            state.close()
+            messages.close()

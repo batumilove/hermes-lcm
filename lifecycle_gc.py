@@ -133,7 +133,16 @@ class EmptyLifecycleGCCoordinator:
         store: LifecycleStateStore | None = None
         try:
             store = self._store_factory(key)
-            if store.row_count() <= threshold:
+            # Gate on ELIGIBLE empty candidates, not total lifecycle rows:
+            # a table dominated by healthy data-bearing sessions must not
+            # schedule pointless prune passes. Discovery is bounded
+            # (threshold + 1 rows) and runs on the store's read-only path.
+            eligible = store.empty_session_candidate_count(
+                protected_session_ids=self._protected_snapshot(key),
+                max_age_hours=max_age_hours,
+                limit=threshold + 1,
+            )
+            if eligible <= threshold:
                 return
             deleted = store.prune_empty_sessions(
                 protected_session_ids=self._protected_snapshot(key),
