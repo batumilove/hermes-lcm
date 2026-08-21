@@ -3662,7 +3662,10 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
                 append_overlap = bool(
                     owner_snapshot
                     and owner_snapshot.get("operation")
-                    == "_append_protected_batch"
+                    in {
+                        "_append_protected_batch",
+                        "session_end_deferred_drain",
+                    }
                     and owner_snapshot.get("thread_id") is not None
                 )
             process_write_timeout_ms = (
