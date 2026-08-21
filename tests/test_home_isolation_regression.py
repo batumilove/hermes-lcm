@@ -125,7 +125,8 @@ def test_child_import_isolates_inherited_operator_home(operator_home: Path):
     assert disposable, "HERMES_HOME must remain set"
     assert disposable != str(operator_home)
     assert operator_home not in Path(disposable).parents
-    assert Path(disposable).is_dir()
+    # The child owns and removes its disposable directory at interpreter exit;
+    # its in-process mode probe proves the directory existed restrictively.
     assert probe["disposable_mode"] != -1
     assert probe["disposable_mode"] & 0o077 == 0, (
         f"disposable home must be owner-restrictive, got {oct(probe['disposable_mode'])}"
@@ -151,26 +152,28 @@ def test_in_process_collection_time_isolation(operator_home: Path):
 
     The VM harness launches pytest with a sacrificial outer HERMES_HOME; the
     conftest guard (which ran before this module was imported) must have
-    captured it and swapped in a disposable home.
+    captured it and swapped in a disposable home.  Environment evidence is
+    used here because pytest may import conftest under a package-qualified
+    module name rather than the literal ``conftest`` name.
     """
-    import conftest  # the already-executed collection-time module
-
-    recorded_disposable = getattr(conftest, "DISPOSABLE_HERMES_HOME", None)
-    assert getattr(conftest, "HERMES_HOME_ISOLATED", False) is True
+    recorded_disposable = os.environ.get("HERMES_TEST_DISPOSABLE_HERMES_HOME")
+    assert os.environ.get("HERMES_TEST_HOME_ISOLATED") == "1"
     assert recorded_disposable, "conftest must record the disposable home"
     disposable = Path(recorded_disposable)
     assert disposable.is_dir()
     assert disposable.stat().st_mode & 0o077 == 0
     # The captured operator home (whatever pytest inherited) differs.
-    inherited = conftest.INHERITED_OPERATOR_HERMES_HOME
+    inherited = os.environ.get("HERMES_TEST_INHERITED_HERMES_HOME", "")
     assert str(disposable) != inherited
 
     # Default LCMConfig resolution inside this process points into the
     # disposable home, not the inherited operator home.
     sys.path.insert(0, str(TESTS_DIR.parent.parent.parent.parent))
+    import importlib.util
+
     cfg_spec = importlib.util.spec_from_file_location(
         "lcm_config_probe_inproc", str(PLUGIN_DIR / "config.py"))
-    import importlib.util
+    assert cfg_spec is not None and cfg_spec.loader is not None
     cfg = importlib.util.module_from_spec(cfg_spec)
     cfg_spec.loader.exec_module(cfg)
     resolved = cfg._hermes_config_path()
