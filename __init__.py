@@ -382,4 +382,4 @@ def register(ctx):
                 "LCM deferred FTS integrity scans failed to start", exc_info=True
             )
 
-    logger.info("LCM plugin loaded — lossless context management active")
+    logger.warning("LCM plugin loaded — lossless context management active")
