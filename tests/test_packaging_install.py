@@ -254,6 +254,39 @@ def test_lcm_grep_declares_opt_in_externalized_content_scope():
     assert properties["externalized_refs"]["maxItems"] == 256
 
 
+def test_plugin_entrypoint_emits_journal_visible_readiness_marker(tmp_path, monkeypatch, caplog):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    plugin_namespace = types.ModuleType("hermes_plugins")
+    plugin_namespace.__path__ = []
+    monkeypatch.setitem(sys.modules, "hermes_plugins", plugin_namespace)
+    module = _load_plugin_entrypoint_module("hermes_plugins.hermes_lcm_readiness")
+
+    class _Ctx:
+        def __init__(self):
+            self.engine = None
+
+        def register_context_engine(self, engine):
+            self.engine = engine
+
+    ctx = _Ctx()
+    with caplog.at_level(logging.WARNING, logger=module.__name__):
+        module.register(ctx)
+
+    try:
+        records = [
+            record
+            for record in caplog.records
+            if record.name == module.__name__
+            and record.getMessage()
+            == "LCM plugin loaded — lossless context management active"
+        ]
+        assert len(records) == 1
+        assert records[0].levelno == logging.WARNING
+    finally:
+        assert ctx.engine is not None
+        ctx.engine.shutdown()
+
+
 def test_plugin_entrypoint_registers_lcm_context_engine():
     engine = _register_plugin_engine("hermes_lcm_packaging_entrypoint")
 

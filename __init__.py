@@ -368,4 +368,4 @@ def register(ctx):
     except Exception as exc:
         logger.debug("LCM could not register post_llm_call hook: %s", exc)
 
-    logger.info("LCM plugin loaded — lossless context management active")
+    logger.warning("LCM plugin loaded — lossless context management active")
