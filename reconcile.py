@@ -774,6 +774,90 @@ class ReconcileMixin:
             and not self._matches_ignore_message_patterns(msg)
         ]
 
+    def _find_tool_anchored_replay_cursor(self, messages: List[Dict[str, Any]]) -> int | None:
+        """Find a replayed leading snapshot proven by an exact durable tool result.
+
+        Gateway resumes can replay an older compacted prefix that no longer
+        overlaps the durable tail. Ordinary repeated text remains ambiguous, but
+        a tool result's call id plus its full replay identity is a stable anchor:
+        the host must not execute a new tool call with an old call id. Only a
+        contiguous leading visible sequence containing such an anchor is
+        skipped; the first unmatched row and everything after it remain a delta.
+        """
+        visible_messages = [
+            (raw_index, msg)
+            for raw_index, msg in enumerate(messages)
+            if not self._is_replayed_context_scaffold_message(msg)
+            and not self._matches_ignore_message_patterns(msg)
+        ]
+        if not any(
+            str(msg.get("role") or "") == "tool"
+            and bool(str(msg.get("tool_call_id") or ""))
+            for _raw_index, msg in visible_messages
+        ):
+            return None
+
+        stored_rows: list[Dict[str, Any]] = []
+        after_store_id = 0
+        while True:
+            page = self._store.get_session_messages_after(
+                self._session_id,
+                after_store_id=after_store_id,
+            )
+            if not page:
+                break
+            stored_rows.extend(
+                row
+                for row in page
+                if not self._matches_ignore_message_patterns(row, stored_row=True)
+            )
+            after_store_id = page[-1]["store_id"]
+        if not stored_rows or not visible_messages:
+            return None
+
+        incoming_identities = [
+            self._message_replay_identity(msg)
+            for _raw_index, msg in visible_messages
+        ]
+        stored_identities = [
+            self._message_replay_identity(row, stored_row=True)
+            for row in stored_rows
+        ]
+
+        def identities_match(
+            incoming_identity: tuple[str, str, str, str],
+            stored_identity: tuple[str, str, str, str],
+        ) -> bool:
+            if incoming_identity == stored_identity:
+                return True
+            return self._active_cleanup_replay_identity(stored_identity) == incoming_identity
+
+        best_visible_count = 0
+        for stored_start, stored_identity in enumerate(stored_identities):
+            if not identities_match(incoming_identities[0], stored_identity):
+                continue
+            matched_tool_anchor = False
+            visible_count = 0
+            for incoming_offset, incoming_identity in enumerate(incoming_identities):
+                stored_offset = stored_start + incoming_offset
+                if stored_offset >= len(stored_identities):
+                    break
+                if not identities_match(incoming_identity, stored_identities[stored_offset]):
+                    break
+                _raw_index, incoming_message = visible_messages[incoming_offset]
+                if (
+                    str(incoming_message.get("role") or "") == "tool"
+                    and bool(str(incoming_message.get("tool_call_id") or ""))
+                ):
+                    matched_tool_anchor = True
+                visible_count += 1
+            if matched_tool_anchor and visible_count > best_visible_count:
+                best_visible_count = visible_count
+
+        if best_visible_count <= 0:
+            return None
+        return visible_messages[best_visible_count - 1][0] + 1
+
     def _is_suspicious_stale_no_overlap_snapshot(
         self,
         incoming_identities: list[tuple[str, str, str, str]],
@@ -854,6 +938,11 @@ class ReconcileMixin:
             self._message_replay_identity(row, stored_row=True)
             for row in stored_tail_rows
         ]
+        incoming_has_raw_persisted_marker = any(
+            str(msg.get("role") or "") == "tool"
+            and _is_hermes_persisted_output_marker(normalize_content_value(msg.get("content")) or "")
+            for msg in messages
+        )
         cursor = self._find_reconciled_cursor_for_store_tail(
             messages,
             stored_tail,
@@ -868,6 +957,11 @@ class ReconcileMixin:
                 if not self._effective_replay_identities(messages[:cursor])
                 else "replayed durable tail"
             )
+            if reason == "skipped scaffold-only prefix" and not incoming_has_raw_persisted_marker:
+                tool_anchored_cursor = self._find_tool_anchored_replay_cursor(messages)
+                if tool_anchored_cursor is not None and tool_anchored_cursor > cursor:
+                    cursor = tool_anchored_cursor
+                    reason = "replayed durable tool-anchored prefix"
             self._record_ingest_reconciliation(
                 action="advanced cursor",
                 reason=reason,
@@ -889,6 +983,30 @@ class ReconcileMixin:
             return cursor
 
         incoming_identities = self._effective_replay_identities(messages)
+        tool_anchored_cursor = (
+            None
+            if incoming_has_raw_persisted_marker
+            else self._find_tool_anchored_replay_cursor(messages)
+        )
+        if tool_anchored_cursor is not None and tool_anchored_cursor > 0:
+            self._record_ingest_reconciliation(
+                action="advanced cursor",
+                reason="replayed durable tool-anchored prefix",
+                cursor=tool_anchored_cursor,
+                incoming=len(messages),
+                session_count=session_count,
+                stored_tail_count=len(stored_tail),
+                effective_incoming=len(incoming_identities),
+            )
+            logger.info(
+                "LCM reconciled tool-anchored replay prefix: session=%s cursor=%d incoming=%d session_count=%d",
+                self._session_id,
+                tool_anchored_cursor,
+                len(messages),
+                session_count,
+            )
+            return tool_anchored_cursor
+
         stored_head_rows = self._store.get_session_messages(
             self._session_id,
             limit=tail_limit,
