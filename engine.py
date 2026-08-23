@@ -3705,10 +3705,6 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
         except BaseException:
             session_end_flush_lock.release()
             raise
-        bounded_flush_started_at = time.monotonic()
-        bounded_flush_deadline = bounded_flush_started_at + (
-            _SESSION_END_APPEND_OVERLAP_TIMEOUT_MS / 1000.0
-        )
         try:
             process_write_lock = getattr(self._store, "_write_lock", None)
             append_overlap = False
@@ -3727,6 +3723,10 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
                 _SESSION_END_APPEND_OVERLAP_TIMEOUT_MS
                 if append_overlap
                 else _SESSION_END_PROCESS_WRITE_TIMEOUT_MS
+            )
+            bounded_flush_started_at = time.monotonic()
+            bounded_flush_deadline = bounded_flush_started_at + (
+                process_write_timeout_ms / 1000.0
             )
             with _temporary_sqlite_busy_timeout(
                 [
