@@ -3,9 +3,36 @@
 Patches the plugin modules so they can be imported both as a package
 (relative imports during plugin loading) and directly during testing.
 """
-import sys
+import atexit
 import importlib
+import os
+import shutil
+import sys
+import tempfile
 from pathlib import Path
+
+# Collection-time safety boundary: tests that instantiate LCMConfig() with its
+# defaults must never inherit an operator's live Hermes state.  This must run
+# before any plugin module is imported because config/path constants can bind
+# during collection, before pytest fixtures execute.
+INHERITED_OPERATOR_HERMES_HOME = os.environ.get("HERMES_HOME", "")
+DISPOSABLE_HERMES_HOME = tempfile.mkdtemp(prefix="hermes-lcm-tests-")
+os.chmod(DISPOSABLE_HERMES_HOME, 0o700)
+os.environ["HERMES_HOME"] = DISPOSABLE_HERMES_HOME
+# Engine fallback paths use Path.home()/.hermes when no explicit hermes_home is
+# supplied, so isolate HOME as well as HERMES_HOME.
+os.environ["HOME"] = DISPOSABLE_HERMES_HOME
+os.environ["HERMES_TEST_INHERITED_HERMES_HOME"] = INHERITED_OPERATOR_HERMES_HOME
+os.environ["HERMES_TEST_DISPOSABLE_HERMES_HOME"] = DISPOSABLE_HERMES_HOME
+os.environ["HERMES_TEST_HOME_ISOLATED"] = "1"
+HERMES_HOME_ISOLATED = True
+
+
+def _cleanup_disposable_hermes_home() -> None:
+    shutil.rmtree(DISPOSABLE_HERMES_HOME, ignore_errors=True)
+
+
+atexit.register(_cleanup_disposable_hermes_home)
 
 # Make the repo root importable (for agent.context_engine etc.)
 repo_root = str(Path(__file__).resolve().parent.parent.parent.parent)

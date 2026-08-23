@@ -93,3 +93,52 @@ def test_session_end_acquire_waits_out_append_batch_hold():
     assert result["elapsed"] >= 0.55, (
         f"contender did not actually wait out the hold: {result}"
     )
+
+
+def test_session_end_waits_out_active_deferred_drain_writer(tmp_path, caplog):
+    """A bounded session-end flush must not manufacture a lock marker while its
+    own durable deferred-drain worker briefly owns the shared coordinator.
+    """
+    from hermes_lcm.config import LCMConfig
+    from hermes_lcm.engine import LCMEngine
+
+    engine = LCMEngine(config=LCMConfig(database_path=str(tmp_path / "drain-overlap.db")))
+    engine.on_session_start("drain-overlap", platform="telegram")
+    lock = engine._store._write_lock
+    holder_entered = threading.Event()
+    release_holder = threading.Event()
+
+    def hold_deferred_drain():
+        with lock.attributed("session_end_deferred_drain"):
+            holder_entered.set()
+            assert release_holder.wait(timeout=3.0)
+
+    holder = threading.Thread(target=hold_deferred_drain, name="deferred-drain-holder")
+    holder.start()
+    assert holder_entered.wait(timeout=1.0)
+    threading.Timer(0.35, release_holder.set).start()
+
+    try:
+        with caplog.at_level("WARNING", logger="hermes_lcm.engine"):
+            engine.on_session_end(
+                "drain-overlap",
+                [{"role": "user", "content": "must flush without a lock marker"}],
+            )
+
+        assert [
+            message.get("content")
+            for message in engine._store.get_session_messages("drain-overlap")
+        ] == ["must flush without a lock marker"]
+        assert not any(
+            "database is locked" in record.getMessage().lower()
+            or "timed out waiting for process-wide sqlite writer"
+            in record.getMessage().lower()
+            for record in caplog.records
+        )
+    finally:
+        release_holder.set()
+        holder.join(timeout=3.0)
+        engine._session_end_drain_done.wait(timeout=3.0)
+        engine.shutdown()
+
+    assert not holder.is_alive()

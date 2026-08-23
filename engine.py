@@ -3654,6 +3654,9 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
             session_end_flush_lock.release()
             raise
         bounded_flush_started_at = time.monotonic()
+        bounded_flush_deadline = bounded_flush_started_at + (
+            _SESSION_END_APPEND_OVERLAP_TIMEOUT_MS / 1000.0
+        )
         try:
             process_write_lock = getattr(self._store, "_write_lock", None)
             append_overlap = False
@@ -3662,7 +3665,10 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
                 append_overlap = bool(
                     owner_snapshot
                     and owner_snapshot.get("operation")
-                    == "_append_protected_batch"
+                    in {
+                        "_append_protected_batch",
+                        "session_end_deferred_drain",
+                    }
                     and owner_snapshot.get("thread_id") is not None
                 )
             process_write_timeout_ms = (
@@ -3682,21 +3688,34 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
             ):
                 raw_ingest_started_at = time.monotonic()
                 try:
-                    # Best-effort final flush. Keep this path bounded because
-                    # host gateways call session-end hooks from lifecycle paths
-                    # that must not wait through SQLite's normal busy timeout.
-                    pending_intent = load_session_end_intent(pending_intent_path)
-                    intent_sha256 = str(pending_intent["intent_sha256"])
-                    with self._store._write_lock.attributed_phase(
-                        "session_end_raw_message_ingest"
-                    ):
-                        self._ingest_messages(
-                            messages,
-                            session_end_intent_sha256=intent_sha256,
-                            session_end_message_fingerprints=list(
-                                pending_intent["message_fingerprints"]
-                            ),
-                        )
+                    while True:
+                        try:
+                            # Best-effort final flush. Keep this path bounded because
+                            # host gateways call session-end hooks from lifecycle paths
+                            # that must not wait through SQLite's normal busy timeout.
+                            pending_intent = load_session_end_intent(pending_intent_path)
+                            intent_sha256 = str(pending_intent["intent_sha256"])
+                            with self._store._write_lock.attributed_phase(
+                                "session_end_raw_message_ingest"
+                            ):
+                                self._ingest_messages(
+                                    messages,
+                                    session_end_intent_sha256=intent_sha256,
+                                    session_end_message_fingerprints=list(
+                                        pending_intent["message_fingerprints"]
+                                    ),
+                                )
+                            break
+                        except Exception as exc:
+                            remaining = bounded_flush_deadline - time.monotonic()
+                            if not _is_sqlite_locked_error(exc) or remaining <= 0:
+                                raise
+                            time.sleep(
+                                min(
+                                    _SESSION_END_DEFERRED_RETRY_INTERVAL_SECONDS,
+                                    remaining,
+                                )
+                            )
                 except KeyboardInterrupt:
                     logger.warning(
                         "LCM session-end raw-message ingest interrupted; "
@@ -3728,14 +3747,27 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
 
                 lifecycle_finalize_started_at = time.monotonic()
                 try:
-                    with self._store._write_lock.attributed_phase(
-                        "session_end_lifecycle_finalize"
-                    ):
-                        self._lifecycle.finalize_session(
-                            self._conversation_id,
-                            session_id,
-                            frontier_store_id=self._last_compacted_store_id,
-                        )
+                    while True:
+                        try:
+                            with self._store._write_lock.attributed_phase(
+                                "session_end_lifecycle_finalize"
+                            ):
+                                self._lifecycle.finalize_session(
+                                    self._conversation_id,
+                                    session_id,
+                                    frontier_store_id=self._last_compacted_store_id,
+                                )
+                            break
+                        except Exception as exc:
+                            remaining = bounded_flush_deadline - time.monotonic()
+                            if not _is_sqlite_locked_error(exc) or remaining <= 0:
+                                raise
+                            time.sleep(
+                                min(
+                                    _SESSION_END_DEFERRED_RETRY_INTERVAL_SECONDS,
+                                    remaining,
+                                )
+                            )
                     remove_session_end_intent(pending_intent_path)
                 except KeyboardInterrupt:
                     logger.warning(
