@@ -4418,6 +4418,192 @@ class TestEngineABC:
         assert rows[0]["content"] == "tail before restart"
         assert after_restart._ingest_cursor == len(active_context)
 
+    def test_existing_session_restart_skips_tool_anchored_replay_outside_durable_tail(self, tmp_path):
+        db_path = tmp_path / "restart-tool-anchored-replay.db"
+        config = LCMConfig(database_path=str(db_path))
+        before_restart = LCMEngine(config=config)
+        before_restart.on_session_start(
+            "tool-anchored-replay-session",
+            platform="telegram",
+            conversation_id="tool-anchored-replay-conversation",
+            context_length=200000,
+        )
+        replayed_prefix = [
+            {"role": "user", "content": "old request"},
+            {
+                "role": "assistant",
+                "content": "",
+                "tool_calls": [
+                    {
+                        "id": "call_replayed",
+                        "type": "function",
+                        "function": {"name": "inspect", "arguments": "{}"},
+                    }
+                ],
+            },
+            {
+                "role": "tool",
+                "tool_call_id": "call_replayed",
+                "tool_name": "inspect",
+                "content": "old tool result",
+            },
+            {"role": "assistant", "content": "old final answer"},
+        ]
+        persisted_messages = list(replayed_prefix)
+        persisted_messages.extend(
+            {"role": "user", "content": f"later durable message {idx}"}
+            for idx in range(80)
+        )
+        before_restart._ingest_messages(persisted_messages)
+        before_restart.shutdown()
+
+        after_restart = LCMEngine(config=config)
+        after_restart.on_session_start(
+            "tool-anchored-replay-session",
+            platform="telegram",
+            conversation_id="tool-anchored-replay-conversation",
+            context_length=200000,
+        )
+        active_context = [
+            {
+                "role": "system",
+                "content": "[Note: This conversation uses Lossless Context Management (LCM). Earlier turns have been compacted into hierarchical summaries below.]",
+            },
+            {
+                "role": "assistant",
+                "content": "[Recent Summary (d0, node 12)]\nEarlier details.\n[Expand for details: hint-12]",
+            },
+            *replayed_prefix,
+            {"role": "user", "content": "new follow-up after resume"},
+        ]
+
+        after_restart._ingest_messages(active_context)
+
+        rows = after_restart._store.get_session_messages("tool-anchored-replay-session")
+        assert len(rows) == len(persisted_messages) + 1
+        assert [row["tool_call_id"] for row in rows].count("call_replayed") == 1
+        assert [row["content"] for row in rows].count("old request") == 1
+        assert rows[-1]["content"] == "new follow-up after resume"
+        reconciliation = after_restart.get_status()["ingest_reconciliation"]
+        assert reconciliation["action"] == "advanced cursor"
+        assert reconciliation["reason"] == "replayed durable tool-anchored prefix"
+
+    def test_existing_session_restart_tool_anchor_reuses_externalized_payload(self, tmp_path):
+        db_path = tmp_path / "restart-tool-anchor-payload.db"
+        payload_dir = tmp_path / "payloads"
+        config = LCMConfig(
+            database_path=str(db_path),
+            large_output_externalization_enabled=True,
+            large_output_externalization_threshold_chars=200,
+            large_output_externalization_path=str(payload_dir),
+        )
+        before_restart = LCMEngine(config=config, hermes_home=str(tmp_path / "hermes"))
+        before_restart.on_session_start(
+            "tool-anchor-payload-session",
+            platform="telegram",
+            conversation_id="tool-anchor-payload-conversation",
+            context_length=200000,
+        )
+        large_result = "stable large tool result " * 100
+        replayed_prefix = [
+            {"role": "user", "content": "inspect large result"},
+            {
+                "role": "assistant",
+                "content": "",
+                "tool_calls": [
+                    {
+                        "id": "call_large_replayed",
+                        "type": "function",
+                        "function": {"name": "inspect", "arguments": "{}"},
+                    }
+                ],
+            },
+            {
+                "role": "tool",
+                "tool_call_id": "call_large_replayed",
+                "tool_name": "inspect",
+                "content": large_result,
+            },
+        ]
+        persisted_messages = [*replayed_prefix]
+        persisted_messages.extend(
+            {"role": "user", "content": f"later durable payload message {idx}"}
+            for idx in range(80)
+        )
+        before_restart._ingest_messages(persisted_messages)
+        assert len(list(payload_dir.glob("*.json"))) == 1
+        before_restart.shutdown()
+
+        after_restart = LCMEngine(config=config, hermes_home=str(tmp_path / "hermes"))
+        after_restart.on_session_start(
+            "tool-anchor-payload-session",
+            platform="telegram",
+            conversation_id="tool-anchor-payload-conversation",
+            context_length=200000,
+        )
+        after_restart._ingest_messages([
+            {
+                "role": "system",
+                "content": "[Note: This conversation uses Lossless Context Management (LCM). Earlier turns have been compacted into hierarchical summaries below.]",
+            },
+            *replayed_prefix,
+            {"role": "user", "content": "new payload follow-up"},
+        ])
+
+        rows = after_restart._store.get_session_messages("tool-anchor-payload-session")
+        assert len(rows) == len(persisted_messages) + 1
+        assert [row["tool_call_id"] for row in rows].count("call_large_replayed") == 1
+        assert rows[-1]["content"] == "new payload follow-up"
+        assert len(list(payload_dir.glob("*.json"))) == 1
+
+    def test_existing_session_restart_keeps_unmatched_prefix_even_with_reused_tool_call_id(self, tmp_path):
+        db_path = tmp_path / "restart-unmatched-tool-prefix.db"
+        config = LCMConfig(database_path=str(db_path))
+        before_restart = LCMEngine(config=config)
+        before_restart.on_session_start(
+            "unmatched-tool-prefix-session",
+            platform="telegram",
+            conversation_id="unmatched-tool-prefix-conversation",
+            context_length=200000,
+        )
+        before_restart._ingest_messages([
+            {"role": "user", "content": "old request"},
+            {
+                "role": "assistant",
+                "content": "",
+                "tool_calls": [{"id": "call_old", "type": "function"}],
+            },
+            {"role": "tool", "tool_call_id": "call_old", "content": "old result"},
+        ])
+        before_restart.shutdown()
+
+        after_restart = LCMEngine(config=config)
+        after_restart.on_session_start(
+            "unmatched-tool-prefix-session",
+            platform="telegram",
+            conversation_id="unmatched-tool-prefix-conversation",
+            context_length=200000,
+        )
+        fresh_delta = [
+            {"role": "user", "content": "genuinely new request"},
+            {
+                "role": "assistant",
+                "content": "",
+                "tool_calls": [{"id": "call_old", "type": "function"}],
+            },
+            {"role": "tool", "tool_call_id": "call_old", "content": "different new result"},
+        ]
+        after_restart._ingest_messages(fresh_delta)
+
+        rows = after_restart._store.get_session_messages("unmatched-tool-prefix-session")
+        assert len(rows) == 6
+        assert [row["content"] for row in rows[-3:]] == [
+            "genuinely new request",
+            "",
+            "different new result",
+        ]
+        assert after_restart.get_status()["ingest_reconciliation"]["reason"] == "persisted ambiguous delta"
+
     def test_existing_session_restart_skips_stale_short_no_overlap_snapshot(self, tmp_path, caplog):
         db_path = tmp_path / "restart-stale-short-no-overlap.db"
         config = LCMConfig(database_path=str(db_path))
