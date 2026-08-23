@@ -20,13 +20,49 @@ _INTENT_VERSION = 2
 _SUPPORTED_INTENT_VERSIONS = (1, 2)
 
 
+# Upper bound for any single durability fsync on the session-end path.
+# The sidecar intent file is a best-effort pre-SQLite durability boundary:
+# losing one merely defers session-end processing to SQLite. A storage-level
+# stall (e.g. a multi-GB state.db WAL checkpoint storm observed 2026-08-23)
+# must never block the memory-provider shutdown path past the gateway
+# loop-liveness watchdog horizon, so every fsync here is time-bounded.
+_FSYNC_BUDGET_S = 10.0
+
+
+def _bounded_fsync(fd: int) -> None:
+    """fsync with a hard time budget; raises TimeoutError past the budget.
+
+    fsync on a file descriptor cannot be interrupted portably, so run it in a
+    daemon helper thread and wait at most _FSYNC_BUDGET_S. A hung kernel-side
+    flush keeps the helper thread (daemon: process exit is not blocked), while
+    the caller surfaces TimeoutError and abandons the sidecar durability.
+    """
+    import threading
+
+    done = threading.Event()
+
+    def _run() -> None:
+        try:
+            os.fsync(fd)
+        finally:
+            done.set()
+
+    helper = threading.Thread(target=_run, daemon=True, name="lcm-bounded-fsync")
+    helper.start()
+    if not done.wait(timeout=_FSYNC_BUDGET_S):
+        raise TimeoutError(
+            f"fsync exceeded {_FSYNC_BUDGET_S}s budget; abandoning session-end "
+            "sidecar durability (SQLite remains the durable boundary)"
+        )
+
+
 def _fsync_directory(path: Path) -> None:
     flags = os.O_RDONLY
     if hasattr(os, "O_DIRECTORY"):
         flags |= os.O_DIRECTORY
     fd = os.open(path, flags)
     try:
-        os.fsync(fd)
+        _bounded_fsync(fd)
     finally:
         os.close(fd)
 
@@ -107,7 +143,7 @@ def persist_session_end_intent(db_path: str | Path, intent: Dict[str, Any]) -> P
             fd = -1
             handle.write(data)
             handle.flush()
-            os.fsync(handle.fileno())
+            _bounded_fsync(handle.fileno())
         os.replace(temporary, destination)
         _fsync_directory(directory)
     finally:
