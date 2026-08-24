@@ -14,8 +14,9 @@ import time
 
 logger = logging.getLogger(__name__)
 
-# Bounded retry policy for LCM engine construction inside register() when the
-# process-wide SQLite writer is temporarily held (startup FTS integrity scan).
+# Bounded retry policy for unrelated/external SQLite writer contention during
+# engine construction. The plugin's own deep FTS scans are deferred until after
+# publication and run against private snapshots; retries are only a fallback.
 _ENGINE_CONSTRUCTION_MAX_ATTEMPTS = 3
 _ENGINE_CONSTRUCTION_RETRY_DELAY_S = 2.0
 
@@ -175,14 +176,12 @@ def register(ctx):
         import os
         hermes_home = os.environ.get("HERMES_HOME", os.path.expanduser("~/.hermes"))
 
-    # Bounded retry for engine construction against a lock-timeout only.
-    # The engine's own startup background FTS integrity scan
-    # (_run_background_integrity_scan) can hold the process-wide SQLite writer
-    # for up to the full busy timeout while construction is still acquiring
-    # its own writer. That aborts plugin load with no host-side retry and
-    # permanently drops the context engine for the process lifetime
-    # (incident 2026-08-17 20:14:38Z). Retry a bounded number of times on
-    # lock-timeout signatures only; all other errors propagate immediately.
+    # Bounded retry for engine construction against an unrelated pre-existing
+    # lock-timeout only. Deep startup FTS scans are now deferred until after
+    # publication and execute against snapshots, so this retry is no longer the
+    # mechanism that makes those scans safe. Retain it as defense against other
+    # transient SQLite writers; only lock-timeout signatures are retryable and
+    # all other errors still propagate immediately.
     engine = None
     for attempt in range(_ENGINE_CONSTRUCTION_MAX_ATTEMPTS):
         try:
@@ -223,6 +222,7 @@ def register(ctx):
                 "LCM superseded root engine shutdown failed during plugin rediscovery",
                 exc_info=True,
             )
+
 
     # Subscribe to the host's explicit subagent lifecycle events when available.
     # These carry the child_session_id/parent_session_id linkage directly, so LCM
@@ -367,5 +367,19 @@ def register(ctx):
         logger.debug("LCM registered post_llm_call hook for per-turn ingest")
     except Exception as exc:
         logger.debug("LCM could not register post_llm_call hook: %s", exc)
+
+    # Deep FTS integrity scans discovered during engine storage binding are
+    # queued (not dispatched) so construction cannot be starved by an
+    # O(index-size) scan. Start them only after the engine, hooks, tools, and
+    # commands have completed plugin registration; a scan is worthless if
+    # publication failed and this engine is being torn down. The deep check
+    # itself runs against a snapshot, outside the process-wide SQLite writer.
+    if engine is not None:
+        try:
+            engine.start_deferred_integrity_scans()
+        except Exception:
+            logger.warning(
+                "LCM deferred FTS integrity scans failed to start", exc_info=True
+            )
 
     logger.info("LCM plugin loaded — lossless context management active")

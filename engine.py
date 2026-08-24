@@ -343,6 +343,8 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
                  _shared_storage: _SharedStorageOwner | None = None):
         self._config = config or LCMConfig.from_env()
         self._hermes_home = hermes_home
+        self._integrity_scans_activated = False
+        self._deferred_integrity_scans = []
 
         db_path = self._resolve_db_path(hermes_home)
         self._storage_released = False
@@ -632,18 +634,48 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
         return Path.home() / ".hermes" / "lcm.db"
 
     def _bind_storage(self, db_path: str | Path, hermes_home: str = "") -> None:
-        """Bind store/DAG/lifecycle helpers to one SQLite database."""
-        self._store = MessageStore(
-            db_path,
-            ingest_protection_config=self._config,
-            hermes_home=hermes_home,
+        """Bind store/DAG/lifecycle helpers to one SQLite database.
+
+        A deep FTS integrity scan discovered as due by any helper constructor
+        would — dispatched immediately — hold the process-wide SQLite writer
+        for O(index-size) while the REMAINING constructors still need to write,
+        aborting engine construction on a lock timeout. Binding therefore runs
+        inside a thread-local deferral scope: due scans are only queued here,
+        then started explicitly via :meth:`start_deferred_integrity_scans`
+        once the engine has been safely published/registered. When the engine
+        was ALREADY registered (profile/home rebind), a queued scan is just as
+        dangerous for live traffic, so it is started immediately after the
+        rebind completes.
+        """
+        from .db_bootstrap import (
+            deferred_background_integrity_scans,
+            start_deferred_background_integrity_scans,
+            take_deferred_background_integrity_scans,
         )
-        self._dag = SummaryDAG(db_path)
-        if self._config.temporal_rollups_enabled:
-            # Install the transaction-coupled summary mutation triggers before
-            # this engine can publish or delete a DAG node.
-            initialize_rollup_invalidation_outbox(self._dag)
-        self._lifecycle = LifecycleStateStore(db_path)
+
+        with deferred_background_integrity_scans():
+            self._store = MessageStore(
+                db_path,
+                ingest_protection_config=self._config,
+                hermes_home=hermes_home,
+            )
+            self._dag = SummaryDAG(db_path)
+            if self._config.temporal_rollups_enabled:
+                # Install the transaction-coupled summary mutation triggers before
+                # this engine can publish or delete a DAG node.
+                initialize_rollup_invalidation_outbox(self._dag)
+            self._lifecycle = LifecycleStateStore(db_path)
+            deferred_scans = take_deferred_background_integrity_scans()
+
+        self._deferred_integrity_scans = list(deferred_scans)
+        if self._deferred_integrity_scans and self._integrity_scans_activated:
+            # Rebind of an already-published engine: starting past the full
+            # rebind is exactly the safety the deferral provides; live traffic
+            # resumes with the scans running concurrently (the deep check runs
+            # against a snapshot and cannot starve live writes).
+            start_deferred_background_integrity_scans(self._deferred_integrity_scans)
+            self._deferred_integrity_scans = []
+
         self._storage_owner = _SharedStorageOwner(
             self._store,
             self._dag,
@@ -654,8 +686,28 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
         from .lifecycle_metrics import record_storage_bind
         record_storage_bind()
 
+    def start_deferred_integrity_scans(self) -> None:
+        """Start deep FTS integrity scans queued during storage binding.
+
+        Idempotent: queued records are consumed on first call, and the
+        underlying dispatch claim semantics (in-flight thread / fresh
+        cross-process ``fts_integrity_scan_started_at`` stamp) make repeat
+        starts no-ops.
+        """
+        from .db_bootstrap import start_deferred_background_integrity_scans
+
+        self._integrity_scans_activated = True
+        scans = getattr(self, "_deferred_integrity_scans", None)
+        if not scans:
+            return
+        self._deferred_integrity_scans = []
+        start_deferred_background_integrity_scans(scans)
+
     def _adopt_storage(self, owner: _SharedStorageOwner) -> None:
         """Acquire an existing helper stack without sharing engine runtime state."""
+        # Shared-storage clones are created only from an already-published root;
+        # any later profile rebind must dispatch its own queued maintenance.
+        self._integrity_scans_activated = True
         self._storage_owner = owner.acquire()
         self._storage_released = False
         self._store = owner.store
