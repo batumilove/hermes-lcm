@@ -74,7 +74,10 @@ def test_engine_construction_finishes_before_due_background_scan_starts(
 
     engine = None
     try:
-        engine = LCMEngine(config=config)
+        engine = LCMEngine(
+            config=config,
+            _defer_integrity_scans_until_activation=True,
+        )
         assert not started_tables
         connection = sqlite3.connect(db_path)
         try:
@@ -86,6 +89,50 @@ def test_engine_construction_finishes_before_due_background_scan_starts(
             connection.close()
 
         engine.start_deferred_integrity_scans()
+        assert all_scans_started.wait(timeout=2)
+        assert started_tables == {"messages_fts", "nodes_fts"}
+    finally:
+        release_scan.set()
+        db_bootstrap.join_background_integrity_scans(timeout=5)
+        if engine is not None:
+            engine.shutdown()
+
+
+def test_standalone_engine_starts_due_background_scans_after_binding(
+    tmp_path, monkeypatch
+):
+    """Direct construction preserves the historical maintenance behavior."""
+
+    db_path = tmp_path / "standalone-lcm.db"
+    config = LCMConfig(database_path=str(db_path))
+    monkeypatch.setattr(db_bootstrap, "_check_disk_space", lambda _path: True)
+    monkeypatch.setenv("LCM_FTS_INTEGRITY_BACKGROUND", "false")
+    seed = LCMEngine(config=config)
+    seed.shutdown()
+    _delete_integrity_markers(db_path)
+    monkeypatch.setenv("LCM_FTS_INTEGRITY_BACKGROUND", "true")
+
+    all_scans_started = threading.Event()
+    release_scan = threading.Event()
+    started_tables = set()
+    started_lock = threading.Lock()
+    real_check = db_bootstrap.check_external_content_fts_integrity
+
+    def slow_check(connection, spec):
+        with started_lock:
+            started_tables.add(spec.table_name)
+            if started_tables == {"messages_fts", "nodes_fts"}:
+                all_scans_started.set()
+        assert release_scan.wait(timeout=5)
+        return real_check(connection, spec)
+
+    monkeypatch.setattr(
+        db_bootstrap, "check_external_content_fts_integrity", slow_check
+    )
+
+    engine = None
+    try:
+        engine = LCMEngine(config=config)
         assert all_scans_started.wait(timeout=2)
         assert started_tables == {"messages_fts", "nodes_fts"}
     finally:

@@ -185,7 +185,11 @@ def register(ctx):
     engine = None
     for attempt in range(_ENGINE_CONSTRUCTION_MAX_ATTEMPTS):
         try:
-            engine = LCMEngine(config=config, hermes_home=hermes_home)
+            engine = LCMEngine(
+                config=config,
+                hermes_home=hermes_home,
+                _defer_integrity_scans_until_activation=True,
+            )
             break
         except Exception as exc:
             if attempt + 1 >= _ENGINE_CONSTRUCTION_MAX_ATTEMPTS or not _is_sqlite_lock_timeout(exc):
