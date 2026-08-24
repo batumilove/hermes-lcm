@@ -3719,9 +3719,20 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
                     }
                     and owner_snapshot.get("thread_id") is not None
                 )
+
+            def same_process_dag_transaction_active() -> bool:
+                connection = getattr(getattr(self, "_dag", None), "connection", None)
+                if connection is None:
+                    return False
+                try:
+                    return bool(connection.in_transaction)
+                except Exception:
+                    return False
+
+            internal_connection_overlap = same_process_dag_transaction_active()
             process_write_timeout_ms = (
                 _SESSION_END_APPEND_OVERLAP_TIMEOUT_MS
-                if append_overlap
+                if append_overlap or internal_connection_overlap
                 else _SESSION_END_PROCESS_WRITE_TIMEOUT_MS
             )
             bounded_flush_started_at = time.monotonic()
@@ -3732,6 +3743,7 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
                 [
                     getattr(self._store, "_conn", None),
                     getattr(self._lifecycle, "_conn", None),
+                    getattr(getattr(self, "_dag", None), "connection", None),
                 ],
                 _SESSION_END_BUSY_TIMEOUT_MS,
                 write_lock=process_write_lock,
@@ -3796,6 +3808,17 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
                         self._schedule_session_end_drain()
                         return
                     raise
+
+                if (
+                    not internal_connection_overlap
+                    and same_process_dag_transaction_active()
+                ):
+                    internal_connection_overlap = True
+                    bounded_flush_deadline = max(
+                        bounded_flush_deadline,
+                        bounded_flush_started_at
+                        + (_SESSION_END_APPEND_OVERLAP_TIMEOUT_MS / 1000.0),
+                    )
 
                 lifecycle_finalize_started_at = time.monotonic()
                 try:

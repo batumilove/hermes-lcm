@@ -12,26 +12,10 @@ when construction fails with a database-locked/timeout error, and does NOT
 retry on unrelated errors.
 """
 
-import importlib.util
-import sys
 import types
-from pathlib import Path
 
+import hermes_lcm as lcm_plugin
 import hermes_lcm.engine as engine_mod  # noqa: F401  (conftest path shim)
-
-# conftest registers submodules but never executes the plugin __init__. Exec
-# it as the canonical "hermes_lcm" package (same name conftest registered) so
-# register()'s lazy `from .engine import LCMEngine` resolves to the exact
-# module object tests monkeypatch.
-_plugin_dir = Path(engine_mod.__file__).resolve().parent
-_spec = importlib.util.spec_from_file_location(
-    "hermes_lcm", str(_plugin_dir / "__init__.py"),
-    submodule_search_locations=[str(_plugin_dir)],
-)
-lcm_plugin = importlib.util.module_from_spec(_spec)
-lcm_plugin.__package__ = "hermes_lcm"
-sys.modules["hermes_lcm"] = lcm_plugin
-_spec.loader.exec_module(lcm_plugin)
 
 
 class _FakeCtx:
