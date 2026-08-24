@@ -12440,6 +12440,10 @@ class TestSessionRollover:
 
     def test_on_session_end_returns_quickly_under_real_sqlite_writer_lock(self, engine, caplog):
         engine.on_session_start("test-session", platform="discord")
+        # Keep the timed assertion scoped to SQLite lock handling. The tokenizer
+        # lazily initializes its encoder on first use and can otherwise dominate
+        # this sub-300 ms lock-bound contract on a cold test process.
+        count_message_tokens({"role": "user", "content": "warm-up"})
         engine._store._conn.execute("PRAGMA busy_timeout=750")
         engine._lifecycle._conn.execute("PRAGMA busy_timeout=750")
 

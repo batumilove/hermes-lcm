@@ -53,24 +53,9 @@ if pkg_name not in sys.modules:
     mod.__path__ = [str(plugin_dir)]
     mod.__package__ = pkg_name
     sys.modules[pkg_name] = mod
-    # Don't exec the module (it tries to register with ctx)
-    # Just make submodules importable
-
-    # Register each submodule
-    for py_file in plugin_dir.glob("*.py"):
-        if py_file.name == "__init__.py":
-            continue
-        sub_name = f"{pkg_name}.{py_file.stem}"
-        if sub_name not in sys.modules:
-            sub_spec = importlib.util.spec_from_file_location(
-                sub_name, str(py_file),
-                submodule_search_locations=[],
-            )
-            sub_mod = importlib.util.module_from_spec(sub_spec)
-            sub_mod.__package__ = pkg_name
-            sys.modules[sub_name] = sub_mod
-            setattr(mod, py_file.stem, sub_mod)
-            try:
-                sub_spec.loader.exec_module(sub_mod)
-            except Exception:
-                pass  # some modules may fail (e.g. engine needs agent)
+    # Execute only the package initializer. It defines register() but does not
+    # invoke it, so this is side-effect safe. Let Python import submodules on
+    # demand instead of eagerly creating every module and swallowing import
+    # failures: a half-initialized entry left in sys.modules breaks dotted
+    # monkeypatch targets such as ``hermes_lcm.engine.<name>``.
+    spec.loader.exec_module(mod)
