@@ -13,9 +13,13 @@ import os
 import re
 import shutil
 import sqlite3
+import tempfile
 import threading
 import time
-from typing import Iterable, Sequence
+import uuid
+from collections.abc import Iterator
+from contextlib import contextmanager
+from typing import Iterable, NamedTuple, Sequence
 
 from .sqlite_util import process_sqlite_write_lock
 
@@ -1889,6 +1893,128 @@ def _background_integrity_enabled() -> bool:
     return raw.strip().lower() not in ("0", "false", "no", "off")
 
 
+# --- Deferred deep-scan dispatch (engine construction) -----------------------
+#
+# ``_dispatch_background_integrity_scan`` normally starts the deep-scan daemon
+# thread immediately. When engine storage binding (MessageStore / SummaryDAG /
+# LifecycleStateStore constructors) discovers a due scan, an immediately
+# started scan can hold the process-wide SQLite writer while the REMAINING
+# helper constructors still need it, aborting plugin load on a lock timeout.
+# Binding code therefore opens a thread-local deferral scope: dispatch inside
+# the scope only queues immutable work (db path / spec — never the
+# caller's connection) and reports the dispatch as accepted; the scope owner
+# starts the scans explicitly once it is safe (after the engine is published).
+
+
+class _DeferredIntegrityScan(NamedTuple):
+    """One deep integrity scan whose dispatch was deferred by binding code."""
+
+    db_path: str
+    spec: ExternalContentFtsSpec
+
+
+# Thread-local stack of queues enabling nested, exception-safe deferral
+# scopes. Only ``_dispatch_background_integrity_scan`` consults it, so every
+# non-deferred call site keeps its exact current dispatch semantics.
+_deferred_dispatch_state = threading.local()
+
+
+def _current_deferred_scan_queue() -> list | None:
+    stack = getattr(_deferred_dispatch_state, "stack", None)
+    if not stack:
+        return None
+    return stack[-1]
+
+
+@contextmanager
+def deferred_background_integrity_scans() -> Iterator[list]:
+    """Defer background integrity dispatches made inside this scope.
+
+    Deep scans discovered while this context is active (on this thread) are
+    queued instead of dispatched; ``take_deferred_background_integrity_scans``
+    drains the innermost scope's queue. Nested scopes each drain their own
+    queue, and an exception inside the scope simply discards whatever was
+    still queued.
+    """
+    marker: list = []
+    stack = getattr(_deferred_dispatch_state, "stack", None)
+    if stack is None:
+        stack = []
+        _deferred_dispatch_state.stack = stack
+    stack.append(marker)
+    try:
+        yield marker
+    finally:
+        if stack and stack[-1] is marker:
+            stack.pop()
+        else:  # defensive: never corrupt an outer scope
+            try:
+                stack.remove(marker)
+            except ValueError:
+                pass
+
+
+def take_deferred_background_integrity_scans() -> list[_DeferredIntegrityScan]:
+    """Atomically drain the innermost deferral scope's queued scans."""
+    queue = _current_deferred_scan_queue()
+    if queue is None:
+        return []
+    scans = [
+        _DeferredIntegrityScan(db_path, spec)
+        for db_path, spec in queue
+    ]
+    queue.clear()
+    return scans
+
+
+def _dispatch_deferred_integrity_scan(scan: _DeferredIntegrityScan) -> bool:
+    """Dispatch one deferred scan using the captured immutable work record.
+
+    Re-opens the database, re-checks whether the scan is still due, then uses
+    the normal dispatcher. No claim is written while work is merely queued:
+    failed engine registration must not leave a fresh claim with no live scan.
+    """
+    conn: sqlite3.Connection | None = None
+    try:
+        conn = sqlite3.connect(
+            scan.db_path,
+            timeout=SQLITE_BUSY_TIMEOUT_MS / 1000.0,
+            check_same_thread=False,
+        )
+        conn.execute(f"PRAGMA busy_timeout={SQLITE_BUSY_TIMEOUT_MS}")
+    except sqlite3.DatabaseError:
+        logger.warning(
+            "Deferred FTS integrity scan for '%s' could not re-open %s",
+            scan.spec.table_name,
+            scan.db_path,
+            exc_info=True,
+        )
+        return False
+
+    try:
+        current = time.time()
+        if not _should_run_integrity_check(conn, scan.spec, now=current):
+            return True
+        return _dispatch_background_integrity_scan(
+            conn, scan.spec, now=current
+        )
+    finally:
+        conn.close()
+
+
+def start_deferred_background_integrity_scans(
+    scans: Iterable[_DeferredIntegrityScan],
+) -> None:
+    """Start deferred deep integrity scans that were queued during binding.
+
+    Safe to call multiple times with the same records: the underlying dispatch
+    claim semantics (in-flight thread / fresh cross-process stamp) make repeat
+    starts no-ops.
+    """
+    for scan in scans:
+        _dispatch_deferred_integrity_scan(scan)
+
+
 def _integrity_failed_key(spec: ExternalContentFtsSpec) -> str:
     return f"fts_integrity_failed:{spec.table_name}"
 
@@ -1995,29 +2121,59 @@ def _clear_scan_started(
 def _run_background_integrity_scan(
     db_path: str, spec: ExternalContentFtsSpec, started_at: float
 ) -> None:
-    """Daemon-thread body: deep-check ``spec`` on a private connection.
+    """Daemon-thread body: deep-check ``spec`` against a private snapshot.
 
-    Opens its own read/write connection for the scan (the FTS5 integrity-check is
-    issued as an INSERT command that rolls back inside a savepoint, so it never
-    mutates data, but it does require a writable handle) and a separate brief
-    connection to stamp the result. On corruption it flags rather than rebuilds.
+    The FTS5 integrity-check is O(index-size) and runs as an INSERT command
+    (inside a savepoint). Executed on the live database it would hold the
+    SQLite writer — and under this plugin's process-wide write coordinator,
+    starve every live MessageStore write for the whole scan. Instead the scan
+    copies the database to a consistent temporary snapshot via SQLite's backup
+    API and checks THAT: the expensive INSERT never touches the live DB or the
+    coordinator at all. Only the brief metadata operations (durable
+    scan-started claim and the result stamps) run against the live DB under
+    the coordinator. On corruption it flags rather than rebuilds.
     """
     key = (db_path, spec.table_name)
     timeout = SQLITE_BUSY_TIMEOUT_MS / 1000.0
     process_write_lock = process_sqlite_write_lock(db_path)
+    result: dict[str, str] | None = None
     try:
+        # 1) Claim the scan cross-process (brief coordinated write).
         with process_write_lock:
-            scan_conn = sqlite3.connect(db_path, timeout=timeout, check_same_thread=False)
+            claim_conn = sqlite3.connect(
+                db_path, timeout=timeout, check_same_thread=False
+            )
             try:
-                scan_conn.execute(f"PRAGMA busy_timeout={SQLITE_BUSY_TIMEOUT_MS}")
-                # Persist the scan-started stamp on this DB so a crash mid-scan is
-                # detectable cross-process via the staleness window above.
-                _record_scan_started(scan_conn, spec, now=started_at)
-                scan_conn.commit()
+                claim_conn.execute(f"PRAGMA busy_timeout={SQLITE_BUSY_TIMEOUT_MS}")
+                _record_scan_started(claim_conn, spec, now=started_at)
+                claim_conn.commit()
+            finally:
+                claim_conn.close()
+
+        # 2) Snapshot the live DB consistently (backup API reads under SQLite's
+        #    own concurrency; no process-wide writer is held) and run the deep
+        #    check against the snapshot only.
+        with tempfile.TemporaryDirectory(prefix="lcm-fts-scan-") as tmp_dir:
+            snapshot_path = os.path.join(
+                tmp_dir, f"scan-{uuid.uuid4().hex}-{spec.table_name}.db"
+            )
+            src = sqlite3.connect(db_path, timeout=timeout, check_same_thread=False)
+            try:
+                src.execute(f"PRAGMA busy_timeout={SQLITE_BUSY_TIMEOUT_MS}")
+                dst = sqlite3.connect(snapshot_path, check_same_thread=False)
+                try:
+                    src.backup(dst)
+                finally:
+                    dst.close()
+            finally:
+                src.close()
+            scan_conn = sqlite3.connect(snapshot_path, check_same_thread=False)
+            try:
                 result = check_external_content_fts_integrity(scan_conn, spec)
             finally:
                 scan_conn.close()
 
+        # 3) Stamp the result on the live DB (brief coordinated write).
         with process_write_lock:
             meta_conn = sqlite3.connect(db_path, timeout=timeout, check_same_thread=False)
             try:
@@ -2076,6 +2232,32 @@ def _dispatch_background_integrity_scan(
     db_path = _database_path_for_connection(conn)
     if not db_path or db_path == ":memory:":
         return False
+    # Binding code (engine ``_bind_storage``) may have opened a thread-local
+    # deferral scope: an immediately started deep scan could hold the DB writer
+    # while the remaining helper constructors still need it. Queue immutable
+    # work instead — the scope owner starts the scans once construction is
+    # safely past that window. Do not stamp a cross-process claim until the
+    # queued scan is actually dispatched after successful registration.
+    deferred_queue = _current_deferred_scan_queue()
+    if deferred_queue is not None:
+        current = time.time() if now is None else now
+        with _integrity_scan_lock:
+            existing = _integrity_scan_threads.get((db_path, spec.table_name))
+            if existing is not None and existing.is_alive():
+                return True
+            if any(
+                queued_db_path == db_path
+                and queued_spec.table_name == spec.table_name
+                for queued_db_path, queued_spec in deferred_queue
+            ):
+                return True
+            started = _load_scan_started_at(conn, spec)
+            if started is not None and (current - started) < INTEGRITY_SCAN_STALE_SECONDS:
+                # A recent scan (this or another process, live or queued) owns
+                # this table already; nothing new to defer.
+                return True
+        deferred_queue.append((db_path, spec))
+        return True
     current = time.time() if now is None else now
     key = (db_path, spec.table_name)
     with _integrity_scan_lock:

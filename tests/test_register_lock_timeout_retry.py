@@ -94,3 +94,66 @@ def test_register_does_not_retry_unrelated_errors(monkeypatch):
     except ValueError:
         pass
     assert attempts["n"] == 1, "unrelated errors must not be retried"
+
+
+def test_register_starts_deferred_integrity_scans_after_publication(monkeypatch):
+    events = []
+
+    class FakeEngine:
+        def shutdown(self):
+            events.append("shutdown")
+
+        def start_deferred_integrity_scans(self):
+            events.append("scans-started")
+
+    class OrderedCtx(_FakeCtx):
+        context_engine_tool_handlers_receive_messages = True
+
+        def register_context_engine(self, engine):
+            events.append("registered")
+            super().register_context_engine(engine)
+
+        def register_hook(self, name, handler):
+            events.append(f"hook:{name}")
+
+        def register_tool(self, **kwargs):
+            events.append(f"tool:{kwargs['name']}")
+
+    monkeypatch.setattr(engine_mod, "LCMEngine", lambda *args, **kwargs: FakeEngine())
+
+    lcm_plugin.register(OrderedCtx())
+
+    assert events[0] == "registered"
+    assert events[-1] == "scans-started"
+    assert {event for event in events if event.startswith("hook:")} == {
+        "hook:subagent_start",
+        "hook:subagent_stop",
+    }
+    assert len([event for event in events if event.startswith("tool:")]) == 10
+
+
+def test_failed_registration_never_starts_deferred_integrity_scans(monkeypatch):
+    events = []
+
+    class FakeEngine:
+        def shutdown(self):
+            events.append("shutdown")
+
+        def start_deferred_integrity_scans(self):
+            events.append("scans-started")
+
+    class FailingCtx(_FakeCtx):
+        def register_context_engine(self, engine):
+            events.append("registration-failed")
+            raise RuntimeError("host rejected engine")
+
+    monkeypatch.setattr(engine_mod, "LCMEngine", lambda *args, **kwargs: FakeEngine())
+
+    try:
+        lcm_plugin.register(FailingCtx())
+    except RuntimeError as exc:
+        assert str(exc) == "host rejected engine"
+    else:
+        raise AssertionError("registration failure must propagate")
+
+    assert events == ["registration-failed", "shutdown"]

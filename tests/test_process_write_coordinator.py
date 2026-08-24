@@ -666,7 +666,7 @@ def _fts_spec():
     )
 
 
-def test_background_fts_scan_writes_hold_database_coordinator(tmp_path, monkeypatch):
+def test_background_fts_scan_only_holds_coordinator_for_metadata(tmp_path, monkeypatch):
     db_path = tmp_path / "lcm.db"
     store = MessageStore(db_path)
     store.close()
@@ -692,8 +692,57 @@ def test_background_fts_scan_writes_hold_database_coordinator(tmp_path, monkeypa
 
     db_bootstrap._run_background_integrity_scan(str(db_path), _fts_spec(), time.time())
 
-    assert observations
-    assert all(owned for _, owned in observations), observations
+    by_name = dict(observations)
+    assert by_name["integrity-check"] is False
+    for metadata_operation in (
+        "scan-started",
+        "checked",
+        "clear-failed",
+        "clear-started",
+    ):
+        if metadata_operation in by_name:
+            assert by_name[metadata_operation] is True, observations
+
+
+def test_background_fts_deep_scan_does_not_starve_live_writes(tmp_path, monkeypatch):
+    db_path = tmp_path / "lcm.db"
+    store = MessageStore(db_path)
+    scan_started = threading.Event()
+    release_scan = threading.Event()
+    scan_database_paths = []
+
+    def slow_integrity_check(connection, spec):
+        scan_database_paths.append(
+            connection.execute("PRAGMA database_list").fetchone()[2]
+        )
+        scan_started.set()
+        assert release_scan.wait(timeout=5)
+        return {"status": "pass", "detail": ""}
+
+    monkeypatch.setattr(
+        db_bootstrap,
+        "check_external_content_fts_integrity",
+        slow_integrity_check,
+    )
+    monkeypatch.setattr(
+        sqlite_util,
+        "_PROCESS_SQLITE_WRITE_LOCK_TIMEOUT_SECONDS",
+        0.1,
+    )
+
+    try:
+        assert db_bootstrap._dispatch_background_integrity_scan(
+            store._conn, _fts_spec()
+        ) is True
+        assert scan_started.wait(timeout=2)
+        assert scan_database_paths
+        assert scan_database_paths[0] != str(db_path)
+
+        store.append("live-session", {"role": "user", "content": "not starved"})
+    finally:
+        release_scan.set()
+        db_bootstrap.join_background_integrity_scans(timeout=5)
+        store.close()
 
 
 def test_background_fts_dispatch_claim_holds_database_coordinator(tmp_path, monkeypatch):
