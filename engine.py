@@ -340,11 +340,15 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
 
     def __init__(self, config: LCMConfig | None = None,
                  hermes_home: str = "", *,
-                 _shared_storage: _SharedStorageOwner | None = None):
+                 _shared_storage: _SharedStorageOwner | None = None,
+                 _defer_integrity_scans_until_activation: bool = False):
         self._config = config or LCMConfig.from_env()
         self._hermes_home = hermes_home
         self._integrity_scans_activated = False
         self._deferred_integrity_scans = []
+        self._defer_integrity_scans_until_activation = (
+            _defer_integrity_scans_until_activation
+        )
 
         db_path = self._resolve_db_path(hermes_home)
         self._storage_released = False
@@ -563,6 +567,12 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
         register_engine_created(self)
         if tuple(iter_session_end_intents(self._store.db_path)):
             self._schedule_session_end_drain()
+        if not self._defer_integrity_scans_until_activation:
+            # Direct construction has no host publication transaction. Preserve
+            # the historical maintenance behavior, but only after the complete
+            # engine initialization succeeds so a partially built engine cannot
+            # leave a fresh scan claim with no durable owner.
+            self.start_deferred_integrity_scans()
 
     def clone_for_agent(self) -> "LCMEngine":
         """Return a fresh runtime engine for one AIAgent instance.
