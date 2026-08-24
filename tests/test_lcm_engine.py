@@ -4488,6 +4488,322 @@ class TestEngineABC:
         assert reconciliation["action"] == "advanced cursor"
         assert reconciliation["reason"] == "replayed durable tool-anchored prefix"
 
+    def test_active_session_filters_tool_anchored_replay_after_unmatched_prefix(self, tmp_path):
+        db_path = tmp_path / "active-tool-anchored-segment.db"
+        config = LCMConfig(database_path=str(db_path))
+        engine = LCMEngine(config=config)
+        engine.on_session_start(
+            "active-tool-anchored-segment-session",
+            platform="telegram",
+            conversation_id="active-tool-anchored-segment-conversation",
+            context_length=200000,
+        )
+        replayed_segment = [
+            {"role": "user", "content": "inspect the old state"},
+            {
+                "role": "assistant",
+                "content": "",
+                "tool_calls": [
+                    {
+                        "id": "call_active_replayed",
+                        "type": "function",
+                        "function": {"name": "inspect", "arguments": "{}"},
+                    }
+                ],
+            },
+            {
+                "role": "tool",
+                "tool_call_id": "call_active_replayed",
+                "tool_name": "inspect",
+                "content": "old active tool result",
+            },
+            {"role": "assistant", "content": "old active final answer"},
+        ]
+        engine._ingest_messages(replayed_segment)
+
+        unmatched_prefix = [
+            {"role": "system", "content": "new runtime policy"},
+            {"role": "user", "content": "new preface before replay"},
+            {"role": "assistant", "content": "new preface answer"},
+            {"role": "user", "content": "another new preface"},
+            {"role": "assistant", "content": "another new preface answer"},
+        ]
+        active_context = [
+            *unmatched_prefix,
+            *replayed_segment,
+            {"role": "user", "content": "new follow-up after replay"},
+        ]
+
+        engine._ingest_messages(active_context)
+
+        rows = engine._store.get_session_messages("active-tool-anchored-segment-session")
+        assert [row["tool_call_id"] for row in rows].count("call_active_replayed") == 1
+        assert sum(
+            "call_active_replayed" in json.dumps(row.get("tool_calls") or [])
+            for row in rows
+        ) == 1
+        # Plain neighboring turns are ambiguous and must not be text-deduplicated.
+        assert [row["content"] for row in rows].count("inspect the old state") == 2
+        assert [row["content"] for row in rows].count("old active final answer") == 2
+        for message in unmatched_prefix:
+            assert [row["content"] for row in rows].count(message["content"]) == 1
+        assert rows[-1]["content"] == "new follow-up after replay"
+        assert engine._ingest_cursor == len(active_context)
+        reconciliation = engine.get_status()["ingest_reconciliation"]
+        assert reconciliation["action"] == "filtered replay"
+        assert reconciliation["reason"] == "replayed durable tool-anchored segment"
+
+    def test_active_session_preserves_identical_fresh_turn_adjacent_to_replayed_tool(self, tmp_path):
+        db_path = tmp_path / "active-tool-replay-identical-adjacent.db"
+        config = LCMConfig(database_path=str(db_path))
+        engine = LCMEngine(config=config)
+        engine.on_session_start(
+            "active-tool-replay-identical-adjacent-session",
+            platform="telegram",
+            conversation_id="active-tool-replay-identical-adjacent-conversation",
+            context_length=200000,
+        )
+        replayed_tool = [
+            {"role": "user", "content": "inspect once"},
+            {
+                "role": "assistant",
+                "content": "",
+                "tool_calls": [
+                    {
+                        "id": "call_identical_adjacent",
+                        "type": "function",
+                        "function": {"name": "inspect", "arguments": "{}"},
+                    }
+                ],
+            },
+            {
+                "role": "tool",
+                "tool_call_id": "call_identical_adjacent",
+                "tool_name": "inspect",
+                "content": "stable adjacent result",
+            },
+        ]
+        engine._ingest_messages([
+            *replayed_tool,
+            {"role": "user", "content": "continue"},
+        ])
+
+        active_context = [
+            {"role": "system", "content": "new active policy"},
+            {"role": "user", "content": "new unmatched preface"},
+            {"role": "assistant", "content": "new unmatched answer"},
+            {"role": "user", "content": "second unmatched preface"},
+            {"role": "assistant", "content": "second unmatched answer"},
+            *replayed_tool,
+            {"role": "user", "content": "continue"},
+        ]
+
+        engine._ingest_messages(active_context)
+
+        rows = engine._store.get_session_messages(
+            "active-tool-replay-identical-adjacent-session"
+        )
+        assert [row["tool_call_id"] for row in rows].count("call_identical_adjacent") == 1
+        assert [row["content"] for row in rows].count("continue") == 2
+        assert rows[-1]["content"] == "continue"
+
+    def test_active_session_repeated_stored_tool_anchors_do_not_overfilter(self, tmp_path):
+        db_path = tmp_path / "active-repeated-tool-anchors.db"
+        config = LCMConfig(database_path=str(db_path))
+        engine = LCMEngine(config=config)
+        engine.on_session_start(
+            "active-repeated-tool-anchors-session",
+            platform="telegram",
+            conversation_id="active-repeated-tool-anchors-conversation",
+            context_length=200000,
+        )
+        assistant_call = {
+            "role": "assistant",
+            "content": "",
+            "tool_calls": [{"id": "call_repeated_anchor", "type": "function"}],
+        }
+        tool_result = {
+            "role": "tool",
+            "tool_call_id": "call_repeated_anchor",
+            "content": "same durable result",
+        }
+        engine._ingest_messages([
+            assistant_call,
+            tool_result,
+            {"role": "user", "content": "continue"},
+        ])
+        engine._store.append_batch(
+            "active-repeated-tool-anchors-session",
+            [assistant_call, tool_result],
+            conversation_id="active-repeated-tool-anchors-conversation",
+        )
+
+        engine._ingest_messages([
+            {"role": "system", "content": "new unmatched policy"},
+            *(
+                {"role": "user", "content": f"new unmatched request {idx}"}
+                for idx in range(8)
+            ),
+            {"role": "assistant", "content": "new unmatched response"},
+            assistant_call,
+            tool_result,
+            {"role": "user", "content": "continue"},
+        ])
+
+        rows = engine._store.get_session_messages("active-repeated-tool-anchors-session")
+        assert [row["tool_call_id"] for row in rows].count("call_repeated_anchor") == 2
+        assert [row["content"] for row in rows].count("continue") == 2
+        assert rows[-1]["content"] == "continue"
+
+    def test_active_session_filters_externalized_tool_anchor_without_plain_text_dedup(self, tmp_path):
+        db_path = tmp_path / "active-externalized-tool-anchor.db"
+        payload_dir = tmp_path / "payloads"
+        config = LCMConfig(
+            database_path=str(db_path),
+            large_output_externalization_enabled=True,
+            large_output_externalization_threshold_chars=200,
+            large_output_externalization_path=str(payload_dir),
+        )
+        engine = LCMEngine(config=config, hermes_home=str(tmp_path / "hermes"))
+        engine.on_session_start(
+            "active-externalized-tool-anchor-session",
+            platform="telegram",
+            conversation_id="active-externalized-tool-anchor-conversation",
+            context_length=200000,
+        )
+        large_result = "externalized stable result " * 100
+        assistant_call = {
+            "role": "assistant",
+            "content": "",
+            "tool_calls": [{"id": "call_externalized_active", "type": "function"}],
+        }
+        tool_result = {
+            "role": "tool",
+            "tool_call_id": "call_externalized_active",
+            "content": large_result,
+        }
+        engine._ingest_messages([
+            {"role": "user", "content": "inspect externalized result"},
+            assistant_call,
+            tool_result,
+            {"role": "user", "content": "continue"},
+        ])
+        assert len(list(payload_dir.glob("*.json"))) == 1
+
+        engine._ingest_messages([
+            {"role": "system", "content": "new unmatched externalized policy"},
+            {"role": "user", "content": "new unmatched externalized request"},
+            {"role": "assistant", "content": "new unmatched externalized answer"},
+            assistant_call,
+            tool_result,
+            {"role": "user", "content": "continue"},
+        ])
+
+        rows = engine._store.get_session_messages(
+            "active-externalized-tool-anchor-session"
+        )
+        assert [row["tool_call_id"] for row in rows].count("call_externalized_active") == 1
+        assert [row["content"] for row in rows].count("continue") == 2
+        assert rows[-1]["content"] == "continue"
+        assert len(list(payload_dir.glob("*.json"))) == 1
+
+    def test_active_tool_replay_store_scan_is_capped(self, tmp_path, monkeypatch):
+        db_path = tmp_path / "active-tool-replay-scan-cap.db"
+        config = LCMConfig(database_path=str(db_path))
+        engine = LCMEngine(config=config)
+        engine.on_session_start(
+            "active-tool-replay-scan-cap-session",
+            platform="telegram",
+            conversation_id="active-tool-replay-scan-cap-conversation",
+            context_length=200000,
+        )
+        assistant_call = {
+            "role": "assistant",
+            "content": "",
+            "tool_calls": [{"id": "call_scan_cap", "type": "function"}],
+        }
+        tool_result = {
+            "role": "tool",
+            "tool_call_id": "call_scan_cap",
+            "content": "bounded scan result",
+        }
+        engine._ingest_messages([assistant_call, tool_result])
+        observed_limits = []
+        original_get_session_tail = engine._store.get_session_tail
+
+        def observed_get_session_tail(session_id, limit=1000):
+            observed_limits.append(limit)
+            return original_get_session_tail(session_id, limit=limit)
+
+        monkeypatch.setattr(engine._store, "get_session_tail", observed_get_session_tail)
+        indexes, scanned = engine._find_tool_anchored_replay_indexes([
+            *(
+                {"role": "user", "content": f"unmatched message {idx}"}
+                for idx in range(1100)
+            ),
+            assistant_call,
+            tool_result,
+        ])
+
+        assert observed_limits == [4096]
+        assert scanned == 2
+        assert indexes == {1100, 1101}
+
+    def test_active_tool_replay_reports_raw_tail_scan_count(self, tmp_path, monkeypatch):
+        db_path = tmp_path / "active-tool-replay-raw-scan-count.db"
+        config = LCMConfig(database_path=str(db_path))
+        engine = LCMEngine(config=config)
+        engine.on_session_start(
+            "active-tool-replay-raw-scan-count-session",
+            platform="telegram",
+            conversation_id="active-tool-replay-raw-scan-count-conversation",
+            context_length=200000,
+        )
+        assistant_call = {
+            "role": "assistant",
+            "content": "",
+            "tool_calls": [{"id": "call_raw_scan_count", "type": "function"}],
+        }
+        tool_result = {
+            "role": "tool",
+            "tool_call_id": "call_raw_scan_count",
+            "content": "raw scan count result",
+        }
+        ignored_row = {"role": "user", "content": "ignored durable row"}
+
+        monkeypatch.setattr(
+            engine,
+            "_matches_ignore_message_patterns",
+            lambda message, stored_row=False: (
+                stored_row and message.get("content") == "ignored durable row"
+            ),
+        )
+        monkeypatch.setattr(
+            engine._store,
+            "get_session_tail",
+            lambda session_id, limit=1000: [assistant_call, tool_result, ignored_row],
+        )
+
+        indexes, scanned = engine._find_tool_anchored_replay_indexes(
+            [assistant_call, tool_result]
+        )
+
+        assert indexes == {0, 1}
+        assert scanned == 3
+
+        monkeypatch.setattr(
+            engine._store,
+            "get_session_tail",
+            lambda session_id, limit=1000: [ignored_row],
+        )
+
+        indexes, scanned = engine._find_tool_anchored_replay_indexes(
+            [assistant_call, tool_result]
+        )
+
+        assert indexes == set()
+        assert scanned == 1
+
     def test_existing_session_restart_tool_anchor_reuses_externalized_payload(self, tmp_path):
         db_path = tmp_path / "restart-tool-anchor-payload.db"
         payload_dir = tmp_path / "payloads"
