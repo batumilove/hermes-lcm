@@ -858,6 +858,130 @@ class ReconcileMixin:
             return None
         return visible_messages[best_visible_count - 1][0] + 1
 
+    def _find_tool_anchored_replay_indexes(
+        self,
+        messages: List[Dict[str, Any]],
+    ) -> tuple[set[int], int]:
+        """Find stable tool rows replayed after a changed active-context prefix.
+
+        A cursor cannot represent a mixed batch with unmatched rows before a
+        replayed durable tool result.  Exact tool-result identities are safe to
+        filter because the host must not execute a new call with an old call ID.
+        The immediately preceding assistant tool-call row is also safe when both
+        durable and incoming rows carry that same call ID.  Plain neighboring
+        user/assistant rows remain ambiguous and are deliberately preserved.
+        """
+        visible_messages = [
+            (raw_index, msg)
+            for raw_index, msg in enumerate(messages)
+            if not self._is_replayed_context_scaffold_message(msg)
+            and not self._matches_ignore_message_patterns(msg)
+        ]
+        incoming_tool_offsets = [
+            offset
+            for offset, (_raw_index, msg) in enumerate(visible_messages)
+            if str(msg.get("role") or "") == "tool"
+            and bool(str(msg.get("tool_call_id") or ""))
+        ]
+        if not incoming_tool_offsets:
+            return set(), 0
+
+        scan_limit = min(max(len(visible_messages) * 4, 256), 4096)
+        stored_rows = [
+            row
+            for row in self._store.get_session_tail(self._session_id, limit=scan_limit)
+            if not self._matches_ignore_message_patterns(row, stored_row=True)
+        ]
+        if not stored_rows:
+            return set(), 0
+
+        incoming_identities = [
+            self._message_replay_identity(msg)
+            for _raw_index, msg in visible_messages
+        ]
+        stored_identities = [
+            self._message_replay_identity(row, stored_row=True)
+            for row in stored_rows
+        ]
+
+        def identities_match(
+            incoming_identity: tuple[str, str, str, str],
+            stored_identity: tuple[str, str, str, str],
+        ) -> bool:
+            if incoming_identity == stored_identity:
+                return True
+            incoming_clean = self._active_cleanup_replay_identity(incoming_identity)
+            stored_clean = self._active_cleanup_replay_identity(stored_identity)
+            return (
+                incoming_clean is not None
+                and stored_clean is not None
+                and incoming_clean == stored_clean
+            )
+
+        def assistant_tool_call_ids(msg: Dict[str, Any]) -> set[str]:
+            tool_calls = msg.get("tool_calls") or []
+            if isinstance(tool_calls, str):
+                try:
+                    tool_calls = json.loads(tool_calls)
+                except (TypeError, ValueError, json.JSONDecodeError):
+                    return set()
+            if isinstance(tool_calls, dict):
+                tool_calls = [tool_calls]
+            if not isinstance(tool_calls, list):
+                return set()
+            call_ids: set[str] = set()
+            for tool_call in tool_calls:
+                if not isinstance(tool_call, dict):
+                    continue
+                value = tool_call.get("id") or tool_call.get("tool_call_id")
+                if value:
+                    call_ids.add(str(value).strip())
+            return call_ids
+
+        stored_tool_anchors: dict[tuple[str, str, str, str], list[int]] = {}
+        for stored_offset, (stored_row, stored_identity) in enumerate(
+            zip(stored_rows, stored_identities)
+        ):
+            if (
+                str(stored_row.get("role") or "") != "tool"
+                or not bool(str(stored_row.get("tool_call_id") or ""))
+            ):
+                continue
+            keys = {stored_identity}
+            cleaned_identity = self._active_cleanup_replay_identity(stored_identity)
+            if cleaned_identity is not None:
+                keys.add(cleaned_identity)
+            for key in keys:
+                stored_tool_anchors.setdefault(key, []).append(stored_offset)
+
+        replayed_raw_indexes: set[int] = set()
+        for incoming_anchor in incoming_tool_offsets:
+            incoming_raw_index, incoming_tool = visible_messages[incoming_anchor]
+            incoming_identity = incoming_identities[incoming_anchor]
+            candidates = stored_tool_anchors.get(incoming_identity, [])
+            for stored_anchor in candidates:
+                if not identities_match(incoming_identity, stored_identities[stored_anchor]):
+                    continue
+                replayed_raw_indexes.add(incoming_raw_index)
+                call_id = str(incoming_tool.get("tool_call_id") or "").strip()
+                if incoming_anchor <= 0 or stored_anchor <= 0 or not call_id:
+                    continue
+                incoming_previous_raw, incoming_previous = visible_messages[incoming_anchor - 1]
+                stored_previous = stored_rows[stored_anchor - 1]
+                if (
+                    str(incoming_previous.get("role") or "") == "assistant"
+                    and str(stored_previous.get("role") or "") == "assistant"
+                    and call_id in assistant_tool_call_ids(incoming_previous)
+                    and call_id in assistant_tool_call_ids(stored_previous)
+                    and identities_match(
+                        incoming_identities[incoming_anchor - 1],
+                        stored_identities[stored_anchor - 1],
+                    )
+                ):
+                    replayed_raw_indexes.add(incoming_previous_raw)
+
+        return replayed_raw_indexes, len(stored_rows)
+
     def _is_suspicious_stale_no_overlap_snapshot(
         self,
         incoming_identities: list[tuple[str, str, str, str]],
