@@ -4749,6 +4749,61 @@ class TestEngineABC:
         assert scanned == 2
         assert indexes == {1100, 1101}
 
+    def test_active_tool_replay_reports_raw_tail_scan_count(self, tmp_path, monkeypatch):
+        db_path = tmp_path / "active-tool-replay-raw-scan-count.db"
+        config = LCMConfig(database_path=str(db_path))
+        engine = LCMEngine(config=config)
+        engine.on_session_start(
+            "active-tool-replay-raw-scan-count-session",
+            platform="telegram",
+            conversation_id="active-tool-replay-raw-scan-count-conversation",
+            context_length=200000,
+        )
+        assistant_call = {
+            "role": "assistant",
+            "content": "",
+            "tool_calls": [{"id": "call_raw_scan_count", "type": "function"}],
+        }
+        tool_result = {
+            "role": "tool",
+            "tool_call_id": "call_raw_scan_count",
+            "content": "raw scan count result",
+        }
+        ignored_row = {"role": "user", "content": "ignored durable row"}
+
+        monkeypatch.setattr(
+            engine,
+            "_matches_ignore_message_patterns",
+            lambda message, stored_row=False: (
+                stored_row and message.get("content") == "ignored durable row"
+            ),
+        )
+        monkeypatch.setattr(
+            engine._store,
+            "get_session_tail",
+            lambda session_id, limit=1000: [assistant_call, tool_result, ignored_row],
+        )
+
+        indexes, scanned = engine._find_tool_anchored_replay_indexes(
+            [assistant_call, tool_result]
+        )
+
+        assert indexes == {0, 1}
+        assert scanned == 3
+
+        monkeypatch.setattr(
+            engine._store,
+            "get_session_tail",
+            lambda session_id, limit=1000: [ignored_row],
+        )
+
+        indexes, scanned = engine._find_tool_anchored_replay_indexes(
+            [assistant_call, tool_result]
+        )
+
+        assert indexes == set()
+        assert scanned == 1
+
     def test_existing_session_restart_tool_anchor_reuses_externalized_payload(self, tmp_path):
         db_path = tmp_path / "restart-tool-anchor-payload.db"
         payload_dir = tmp_path / "payloads"

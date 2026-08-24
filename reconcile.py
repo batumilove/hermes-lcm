@@ -887,13 +887,18 @@ class ReconcileMixin:
             return set(), 0
 
         scan_limit = min(max(len(visible_messages) * 4, 256), 4096)
+        scanned_rows = self._store.get_session_tail(
+            self._session_id,
+            limit=scan_limit,
+        )
+        scanned_row_count = len(scanned_rows)
         stored_rows = [
             row
-            for row in self._store.get_session_tail(self._session_id, limit=scan_limit)
+            for row in scanned_rows
             if not self._matches_ignore_message_patterns(row, stored_row=True)
         ]
         if not stored_rows:
-            return set(), 0
+            return set(), scanned_row_count
 
         incoming_identities = [
             self._message_replay_identity(msg)
@@ -980,7 +985,7 @@ class ReconcileMixin:
                 ):
                     replayed_raw_indexes.add(incoming_previous_raw)
 
-        return replayed_raw_indexes, len(stored_rows)
+        return replayed_raw_indexes, scanned_row_count
 
     def _is_suspicious_stale_no_overlap_snapshot(
         self,
