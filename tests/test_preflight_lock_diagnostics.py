@@ -138,3 +138,89 @@ def test_preflight_lock_warning_identifies_uncoordinated_same_process_writer(
         holder.rollback()
         holder.close()
         engine.shutdown()
+
+
+def test_preflight_transient_sqlite_lock_retries_ingest_once_without_loss_or_failure_counters(
+    tmp_path, monkeypatch
+):
+    """A transient preflight ingest lock must retry once and lose nothing.
+
+    The first ``_ingest_messages`` call raises the lock error; the second call
+    must run through the real implementation so durability, cursor advance and
+    zeroed failure counters are exercised against actual store behavior.
+    """
+
+    database_path = tmp_path / "preflight-transient-lock.db"
+    engine = LCMEngine(config=LCMConfig(database_path=str(database_path)))
+    engine.on_session_start(
+        "preflight-transient-lock-session", platform="telegram", context_length=1000
+    )
+    real_ingest = engine._ingest_messages
+    attempts = 0
+
+    def transient_lock_then_real_ingest(messages, **kwargs):
+        nonlocal attempts
+        attempts += 1
+        if attempts == 1:
+            raise sqlite3.OperationalError("database is locked")
+        return real_ingest(messages, **kwargs)
+
+    monkeypatch.setattr(engine, "_ingest_messages", transient_lock_then_real_ingest)
+    try:
+        messages = [{"role": "user", "content": "preflight retry persists exactly once"}]
+        assert engine.should_compress_preflight(messages) is False
+
+        assert attempts == 2
+        assert engine._ingest_cursor == len(messages)
+        assert (
+            engine._store.get_session_count("preflight-transient-lock-session") == 1
+        )
+        rows = engine._store._conn.execute(
+            "SELECT content FROM messages WHERE session_id = ? AND role = 'user'",
+            ("preflight-transient-lock-session",),
+        ).fetchall()
+        assert [row[0] for row in rows] == [
+            "preflight retry persists exactly once",
+        ]
+        assert engine._ingest_failure_count == 0
+        assert engine._consecutive_ingest_failures == 0
+    finally:
+        engine.shutdown()
+
+
+def test_preflight_persistent_sqlite_lock_bounds_ingest_retry_to_two_attempts_and_records_single_failure(
+    tmp_path, monkeypatch
+):
+    """An unrelenting preflight ingest lock must stay bounded.
+
+    Exactly two ingest attempts are permitted; after both fail no cursor or
+    store advance happens and exactly one ingest failure / consecutive failure
+    is recorded (not one per attempt).
+    """
+
+    database_path = tmp_path / "preflight-persistent-lock.db"
+    engine = LCMEngine(config=LCMConfig(database_path=str(database_path)))
+    engine.on_session_start(
+        "preflight-persistent-lock-session", platform="telegram", context_length=1000
+    )
+    attempts = 0
+
+    def always_locked(messages, **kwargs):
+        nonlocal attempts
+        attempts += 1
+        raise sqlite3.OperationalError("database is locked")
+
+    monkeypatch.setattr(engine, "_ingest_messages", always_locked)
+    try:
+        messages = [{"role": "user", "content": "must not be persisted"}]
+        assert engine.should_compress_preflight(messages) is False
+
+        assert attempts == 2
+        assert engine._ingest_cursor == 0
+        assert (
+            engine._store.get_session_count("preflight-persistent-lock-session") == 0
+        )
+        assert engine._ingest_failure_count == 1
+        assert engine._consecutive_ingest_failures == 1
+    finally:
+        engine.shutdown()
