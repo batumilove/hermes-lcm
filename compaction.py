@@ -29,6 +29,9 @@ logger = logging.getLogger(__name__)
 
 _THRESHOLD_FULL_SWEEP_MAX_PASSES = 12
 _THRESHOLD_FULL_SWEEP_MAX_SECONDS = 120.0
+# Bounded back-off before the single retry of a transiently locked preflight
+# SQLite ingest (locked / busy writer on the other side of the seam).
+_PREFLIGHT_LOCK_RETRY_DELAY_SECONDS = 0.05
 
 
 class CompactionMixin:
@@ -102,20 +105,28 @@ class CompactionMixin:
             pre_ingest_noop_reason = reason
         replay_messages = None
         if self._session_id and messages:
-            try:
-                replay_messages = self._ingest_messages(messages)
-                self._record_ingest_success()
-            except Exception as e:
-                # Fail closed for NORMAL threshold compaction: the store did not
-                # accept this turn, so do not compact against a store missing the
-                # latest messages - that could rebuild active context without
-                # them. But still honor emergency overflow recovery, whose whole
-                # job is to keep the prompt under the provider limit; it converges
-                # via deterministic L3 truncation without needing the store write.
-                self._record_ingest_failure("preflight", e)
-                if self._should_force_overflow_recovery(observed_tokens=rough):
-                    return True
-                return False
+            for attempt in range(2):
+                try:
+                    replay_messages = self._ingest_messages(messages)
+                    self._record_ingest_success()
+                    break
+                except Exception as exc:
+                    if attempt == 0 and _is_sqlite_locked_error(exc):
+                        logger.info(
+                            "LCM preflight ingest retrying once after transient SQLite contention"
+                        )
+                        time.sleep(_PREFLIGHT_LOCK_RETRY_DELAY_SECONDS)
+                        continue
+                    # Fail closed for NORMAL threshold compaction: the store did not
+                    # accept this turn, so do not compact against a store missing the
+                    # latest messages - that could rebuild active context without
+                    # them. But still honor emergency overflow recovery, whose whole
+                    # job is to keep the prompt under the provider limit; it converges
+                    # via deterministic L3 truncation without needing the store write.
+                    self._record_ingest_failure("preflight", exc)
+                    if self._should_force_overflow_recovery(observed_tokens=rough):
+                        return True
+                    return False
         if replay_messages is not None and replay_messages != messages:
             replay_rough = count_messages_tokens(replay_messages)
             cleanup_requested = self._replay_diff_requests_ingest_cleanup(
