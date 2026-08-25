@@ -36,6 +36,9 @@ def test_preflight_lock_warning_identifies_external_writer(tmp_path, caplog):
     database_path = tmp_path / "lcm.db"
     engine = LCMEngine(config=LCMConfig(database_path=str(database_path)))
     engine.on_session_start("preflight-lock-session", platform="telegram")
+    # Keep the lock held across both bounded retry attempts without making the
+    # regression depend on the external holder's 60-second safety timeout.
+    engine._store._conn.execute("PRAGMA busy_timeout = 100")
     expected_busy_timeout_ms = engine._store._conn.execute(
         "PRAGMA busy_timeout"
     ).fetchone()[0]
