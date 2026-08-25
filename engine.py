@@ -4912,8 +4912,16 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
             self._ingest_cursor_needs_reconcile = False
         cursor = min(max(self._ingest_cursor, 0), n)
         tool_anchored_replay_indexes: set[int] = set()
+        incoming_has_raw_persisted_marker = any(
+            str(msg.get("role") or "") == "tool"
+            and _is_hermes_persisted_output_marker(
+                normalize_content_value(msg.get("content")) or ""
+            )
+            for msg in messages
+        )
         scan_tool_anchored_replay = (
             reconciled_ingest_cursor
+            and not incoming_has_raw_persisted_marker
             and not self._effective_replay_identities(replay_messages[:cursor])
         )
         if cursor > 0:
@@ -4936,7 +4944,7 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
                         + replay_messages[cursor:]
                     )
                 else:
-                    scan_tool_anchored_replay = True
+                    scan_tool_anchored_replay = not incoming_has_raw_persisted_marker
         if scan_tool_anchored_replay:
             (
                 tool_anchored_replay_indexes,
