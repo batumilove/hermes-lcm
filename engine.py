@@ -159,6 +159,7 @@ _SESSION_END_PROCESS_WRITE_TIMEOUT_MS = 200
 _SESSION_END_APPEND_OVERLAP_TIMEOUT_MS = 2500
 _SESSION_END_DEFERRED_RETRY_BUDGET_SECONDS = 30.0
 _SESSION_END_DEFERRED_RETRY_INTERVAL_SECONDS = 0.05
+_PER_TURN_INGEST_LOCK_RETRY_DELAY_SECONDS = 0.05
 _CODEX_GPT55_COMPACTION_THRESHOLD = 0.85
 
 
@@ -1527,21 +1528,30 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
             self._remember_lcm_bypass_message_prefix(self._bypass_lcm_session_id(), messages)
             return
         if self._session_id and messages:
-            try:
-                self._remember_lcm_normal_message_prefix(
-                    self._session_id,
-                    messages,
-                    conversation_id=self._conversation_id,
-                )
-                self._ingest_messages(messages)
-                self._record_ingest_success()
-                self._clear_foreground_rebind_candidate_if_bound_session_confirmed()
-                logger.debug(
-                    "Per-turn ingest OK: session=%s msgs=%d cursor=%d",
-                    self._session_id, len(messages), self._ingest_cursor,
-                )
-            except Exception as e:
-                self._record_ingest_failure("per-turn ingest()", e)
+            for attempt in range(2):
+                try:
+                    self._remember_lcm_normal_message_prefix(
+                        self._session_id,
+                        messages,
+                        conversation_id=self._conversation_id,
+                    )
+                    self._ingest_messages(messages)
+                    self._record_ingest_success()
+                    self._clear_foreground_rebind_candidate_if_bound_session_confirmed()
+                    logger.debug(
+                        "Per-turn ingest OK: session=%s msgs=%d cursor=%d",
+                        self._session_id, len(messages), self._ingest_cursor,
+                    )
+                    return
+                except Exception as exc:
+                    if attempt == 0 and _is_sqlite_locked_error(exc):
+                        logger.info(
+                            "LCM per-turn ingest retrying once after transient SQLite contention"
+                        )
+                        time.sleep(_PER_TURN_INGEST_LOCK_RETRY_DELAY_SECONDS)
+                        continue
+                    self._record_ingest_failure("per-turn ingest()", exc)
+                    return
 
     def _is_retry_worthy_leaf_summary_error(self, exc: Exception) -> bool:
         if isinstance(exc, TimeoutError):
@@ -4878,6 +4888,7 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
             scan_start=scan_start,
             ignored_messages=ignored_original_messages,
         )
+        reconciled_ingest_cursor = self._ingest_cursor_needs_reconcile
         if self._ingest_cursor_needs_reconcile:
             reconcile_messages = [
                 original_msg
@@ -4901,6 +4912,18 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
             self._ingest_cursor_needs_reconcile = False
         cursor = min(max(self._ingest_cursor, 0), n)
         tool_anchored_replay_indexes: set[int] = set()
+        incoming_has_raw_persisted_marker = any(
+            str(msg.get("role") or "") == "tool"
+            and _is_hermes_persisted_output_marker(
+                normalize_content_value(msg.get("content")) or ""
+            )
+            for msg in messages
+        )
+        scan_tool_anchored_replay = (
+            reconciled_ingest_cursor
+            and not incoming_has_raw_persisted_marker
+            and not self._effective_replay_identities(replay_messages[:cursor])
+        )
         if cursor > 0:
             cached_source_identities = getattr(self, "_last_active_replay_source_identities", None)
             cached_active_replay_messages = getattr(self, "_last_active_replay_messages", None)
@@ -4921,23 +4944,25 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
                         + replay_messages[cursor:]
                     )
                 else:
-                    (
-                        tool_anchored_replay_indexes,
-                        replay_scan_count,
-                    ) = self._find_tool_anchored_replay_indexes(replay_messages)
-                    if tool_anchored_replay_indexes:
-                        cursor = 0
-                        self._ingest_cursor = 0
-                        session_count = self._store.get_session_count(self._session_id)
-                        self._record_ingest_reconciliation(
-                            action="filtered replay",
-                            reason="replayed durable tool-anchored segment",
-                            cursor=cursor,
-                            incoming=n,
-                            session_count=session_count,
-                            stored_tail_count=replay_scan_count,
-                            effective_incoming=n - len(tool_anchored_replay_indexes),
-                        )
+                    scan_tool_anchored_replay = not incoming_has_raw_persisted_marker
+        if scan_tool_anchored_replay:
+            (
+                tool_anchored_replay_indexes,
+                replay_scan_count,
+            ) = self._find_tool_anchored_replay_indexes(replay_messages)
+            if tool_anchored_replay_indexes:
+                cursor = 0
+                self._ingest_cursor = 0
+                session_count = self._store.get_session_count(self._session_id)
+                self._record_ingest_reconciliation(
+                    action="filtered replay",
+                    reason="replayed durable tool-anchored segment",
+                    cursor=cursor,
+                    incoming=n,
+                    session_count=session_count,
+                    stored_tail_count=replay_scan_count,
+                    effective_incoming=n - len(tool_anchored_replay_indexes),
+                )
         logger.debug(
             "Ingest: session=%s cursor=%d incoming=%d",
             self._session_id, cursor, n,
