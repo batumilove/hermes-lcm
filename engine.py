@@ -4888,6 +4888,7 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
             scan_start=scan_start,
             ignored_messages=ignored_original_messages,
         )
+        reconciled_ingest_cursor = self._ingest_cursor_needs_reconcile
         if self._ingest_cursor_needs_reconcile:
             reconcile_messages = [
                 original_msg
@@ -4911,6 +4912,10 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
             self._ingest_cursor_needs_reconcile = False
         cursor = min(max(self._ingest_cursor, 0), n)
         tool_anchored_replay_indexes: set[int] = set()
+        scan_tool_anchored_replay = (
+            reconciled_ingest_cursor
+            and not self._effective_replay_identities(replay_messages[:cursor])
+        )
         if cursor > 0:
             cached_source_identities = getattr(self, "_last_active_replay_source_identities", None)
             cached_active_replay_messages = getattr(self, "_last_active_replay_messages", None)
@@ -4931,23 +4936,25 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
                         + replay_messages[cursor:]
                     )
                 else:
-                    (
-                        tool_anchored_replay_indexes,
-                        replay_scan_count,
-                    ) = self._find_tool_anchored_replay_indexes(replay_messages)
-                    if tool_anchored_replay_indexes:
-                        cursor = 0
-                        self._ingest_cursor = 0
-                        session_count = self._store.get_session_count(self._session_id)
-                        self._record_ingest_reconciliation(
-                            action="filtered replay",
-                            reason="replayed durable tool-anchored segment",
-                            cursor=cursor,
-                            incoming=n,
-                            session_count=session_count,
-                            stored_tail_count=replay_scan_count,
-                            effective_incoming=n - len(tool_anchored_replay_indexes),
-                        )
+                    scan_tool_anchored_replay = True
+        if scan_tool_anchored_replay:
+            (
+                tool_anchored_replay_indexes,
+                replay_scan_count,
+            ) = self._find_tool_anchored_replay_indexes(replay_messages)
+            if tool_anchored_replay_indexes:
+                cursor = 0
+                self._ingest_cursor = 0
+                session_count = self._store.get_session_count(self._session_id)
+                self._record_ingest_reconciliation(
+                    action="filtered replay",
+                    reason="replayed durable tool-anchored segment",
+                    cursor=cursor,
+                    incoming=n,
+                    session_count=session_count,
+                    stored_tail_count=replay_scan_count,
+                    effective_incoming=n - len(tool_anchored_replay_indexes),
+                )
         logger.debug(
             "Ingest: session=%s cursor=%d incoming=%d",
             self._session_id, cursor, n,

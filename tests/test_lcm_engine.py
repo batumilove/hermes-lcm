@@ -4488,6 +4488,92 @@ class TestEngineABC:
         assert reconciliation["action"] == "advanced cursor"
         assert reconciliation["reason"] == "replayed durable tool-anchored prefix"
 
+    def test_existing_session_restart_filters_tool_anchored_segment_after_unmatched_prefix(
+        self, tmp_path
+    ):
+        db_path = tmp_path / "restart-tool-anchored-segment.db"
+        config = LCMConfig(database_path=str(db_path))
+        before_restart = LCMEngine(config=config)
+        before_restart.on_session_start(
+            "restart-tool-anchored-segment-session",
+            platform="telegram",
+            conversation_id="restart-tool-anchored-segment-conversation",
+            context_length=200000,
+        )
+        replayed_segment = [
+            {"role": "user", "content": "inspect before restart"},
+            {
+                "role": "assistant",
+                "content": "",
+                "tool_calls": [
+                    {
+                        "id": "call_restart_segment",
+                        "type": "function",
+                        "function": {"name": "inspect", "arguments": "{}"},
+                    }
+                ],
+            },
+            {
+                "role": "tool",
+                "tool_call_id": "call_restart_segment",
+                "tool_name": "inspect",
+                "content": "durable result before restart",
+            },
+            {"role": "assistant", "content": "durable final answer"},
+        ]
+        persisted_messages = [
+            *replayed_segment,
+            *(
+                {"role": "user", "content": f"later durable message {idx}"}
+                for idx in range(80)
+            ),
+        ]
+        before_restart._ingest_messages(persisted_messages)
+        before_restart.shutdown()
+
+        after_restart = LCMEngine(config=config)
+        after_restart.on_session_start(
+            "restart-tool-anchored-segment-session",
+            platform="telegram",
+            conversation_id="restart-tool-anchored-segment-conversation",
+            context_length=200000,
+        )
+        unmatched_prefix = [
+            {"role": "user", "content": "new unmatched prefix after restart"},
+            {"role": "assistant", "content": "new unmatched prefix answer"},
+        ]
+        active_context = [
+            {
+                "role": "system",
+                "content": "[Note: This conversation uses Lossless Context Management (LCM). Earlier turns have been compacted into hierarchical summaries below.]",
+            },
+            {
+                "role": "assistant",
+                "content": "[Recent Summary (d0, node 12)]\nEarlier details.\n[Expand for details: hint-12]",
+            },
+            *unmatched_prefix,
+            *replayed_segment,
+            {"role": "user", "content": "new follow-up after segmented replay"},
+        ]
+
+        after_restart._ingest_messages(active_context)
+
+        rows = after_restart._store.get_session_messages(
+            "restart-tool-anchored-segment-session"
+        )
+        assert [row["tool_call_id"] for row in rows].count("call_restart_segment") == 1
+        assert sum(
+            "call_restart_segment" in json.dumps(row.get("tool_calls") or [])
+            for row in rows
+        ) == 1
+        for message in unmatched_prefix:
+            assert [row["content"] for row in rows].count(message["content"]) == 1
+        assert rows[-1]["content"] == "new follow-up after segmented replay"
+        reconciliation = after_restart.get_status()["ingest_reconciliation"]
+        assert reconciliation["action"] == "filtered replay"
+        assert reconciliation["reason"] == "replayed durable tool-anchored segment"
+        after_restart.shutdown()
+
     def test_active_session_filters_tool_anchored_replay_after_unmatched_prefix(self, tmp_path):
         db_path = tmp_path / "active-tool-anchored-segment.db"
         config = LCMConfig(database_path=str(db_path))
