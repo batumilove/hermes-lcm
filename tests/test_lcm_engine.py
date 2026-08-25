@@ -10263,6 +10263,61 @@ class TestEngineIngest:
 class TestPerTurnIngest:
     """Regression: per-turn ingest via post_llm_call hook."""
 
+    def test_transient_sqlite_lock_retries_without_loss_or_duplication(
+        self, tmp_path, monkeypatch
+    ):
+        """A transient lock must not discard the current turn's durable rows."""
+        config = LCMConfig(database_path=str(tmp_path / "transient-lock.db"))
+        eng = LCMEngine(config=config)
+        eng.on_session_start("transient-lock", platform="telegram", context_length=1000)
+        messages = [{"role": "user", "content": "persist exactly once"}]
+        real_append = eng._store._append_protected_batch
+        attempts = 0
+
+        def transient_then_append(*args, **kwargs):
+            nonlocal attempts
+            attempts += 1
+            if attempts == 1:
+                raise sqlite3.OperationalError("database is locked")
+            return real_append(*args, **kwargs)
+
+        monkeypatch.setattr(eng._store, "_append_protected_batch", transient_then_append)
+        try:
+            eng.ingest(messages)
+            assert attempts == 2
+            assert eng._ingest_cursor == len(messages)
+            assert eng._store.get_session_count("transient-lock") == 1
+            assert eng._ingest_failure_count == 0
+            assert eng._consecutive_ingest_failures == 0
+        finally:
+            eng.shutdown()
+
+    def test_persistent_sqlite_lock_retries_once_then_records_one_failure(
+        self, tmp_path, monkeypatch
+    ):
+        """Persistent contention remains bounded and counts as one failed turn."""
+        config = LCMConfig(database_path=str(tmp_path / "persistent-lock.db"))
+        eng = LCMEngine(config=config)
+        eng.on_session_start("persistent-lock", platform="telegram", context_length=1000)
+        messages = [{"role": "user", "content": "do not advance"}]
+        attempts = 0
+
+        def always_locked(*args, **kwargs):
+            nonlocal attempts
+            attempts += 1
+            raise sqlite3.OperationalError("database is locked")
+
+        monkeypatch.setattr(eng._store, "_append_protected_batch", always_locked)
+        try:
+            eng.ingest(messages)
+            assert attempts == 2
+            assert eng._ingest_cursor == 0
+            assert eng._store.get_session_count("persistent-lock") == 0
+            assert eng._ingest_failure_count == 1
+            assert eng._consecutive_ingest_failures == 1
+        finally:
+            eng.shutdown()
+
     def test_below_threshold_turn_persists_without_compression(self, tmp_path):
         """A short conversation that never hits the compression threshold
         must still be persisted to the store when ingest() is called."""

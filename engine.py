@@ -159,6 +159,7 @@ _SESSION_END_PROCESS_WRITE_TIMEOUT_MS = 200
 _SESSION_END_APPEND_OVERLAP_TIMEOUT_MS = 2500
 _SESSION_END_DEFERRED_RETRY_BUDGET_SECONDS = 30.0
 _SESSION_END_DEFERRED_RETRY_INTERVAL_SECONDS = 0.05
+_PER_TURN_INGEST_LOCK_RETRY_DELAY_SECONDS = 0.05
 _CODEX_GPT55_COMPACTION_THRESHOLD = 0.85
 
 
@@ -1527,21 +1528,30 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
             self._remember_lcm_bypass_message_prefix(self._bypass_lcm_session_id(), messages)
             return
         if self._session_id and messages:
-            try:
-                self._remember_lcm_normal_message_prefix(
-                    self._session_id,
-                    messages,
-                    conversation_id=self._conversation_id,
-                )
-                self._ingest_messages(messages)
-                self._record_ingest_success()
-                self._clear_foreground_rebind_candidate_if_bound_session_confirmed()
-                logger.debug(
-                    "Per-turn ingest OK: session=%s msgs=%d cursor=%d",
-                    self._session_id, len(messages), self._ingest_cursor,
-                )
-            except Exception as e:
-                self._record_ingest_failure("per-turn ingest()", e)
+            for attempt in range(2):
+                try:
+                    self._remember_lcm_normal_message_prefix(
+                        self._session_id,
+                        messages,
+                        conversation_id=self._conversation_id,
+                    )
+                    self._ingest_messages(messages)
+                    self._record_ingest_success()
+                    self._clear_foreground_rebind_candidate_if_bound_session_confirmed()
+                    logger.debug(
+                        "Per-turn ingest OK: session=%s msgs=%d cursor=%d",
+                        self._session_id, len(messages), self._ingest_cursor,
+                    )
+                    return
+                except Exception as exc:
+                    if attempt == 0 and _is_sqlite_locked_error(exc):
+                        logger.info(
+                            "LCM per-turn ingest retrying once after transient SQLite contention"
+                        )
+                        time.sleep(_PER_TURN_INGEST_LOCK_RETRY_DELAY_SECONDS)
+                        continue
+                    self._record_ingest_failure("per-turn ingest()", exc)
+                    return
 
     def _is_retry_worthy_leaf_summary_error(self, exc: Exception) -> bool:
         if isinstance(exc, TimeoutError):
