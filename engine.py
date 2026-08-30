@@ -160,6 +160,7 @@ _SESSION_END_APPEND_OVERLAP_TIMEOUT_MS = 2500
 _SESSION_END_DEFERRED_RETRY_BUDGET_SECONDS = 30.0
 _SESSION_END_DEFERRED_RETRY_INTERVAL_SECONDS = 0.05
 _PER_TURN_INGEST_LOCK_RETRY_DELAY_SECONDS = 0.05
+_PER_TURN_INGEST_LOCK_RETRY_BUDGET_SECONDS = 2.5
 _CODEX_GPT55_COMPACTION_THRESHOLD = 0.85
 
 
@@ -1528,7 +1529,11 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
             self._remember_lcm_bypass_message_prefix(self._bypass_lcm_session_id(), messages)
             return
         if self._session_id and messages:
-            for attempt in range(2):
+            retry_deadline = (
+                time.monotonic() + _PER_TURN_INGEST_LOCK_RETRY_BUDGET_SECONDS
+            )
+            lock_retry_count = 0
+            while True:
                 try:
                     self._remember_lcm_normal_message_prefix(
                         self._session_id,
@@ -1544,12 +1549,23 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
                     )
                     return
                 except Exception as exc:
-                    if attempt == 0 and _is_sqlite_locked_error(exc):
-                        logger.info(
-                            "LCM per-turn ingest retrying once after transient SQLite contention"
-                        )
-                        time.sleep(_PER_TURN_INGEST_LOCK_RETRY_DELAY_SECONDS)
-                        continue
+                    if _is_sqlite_locked_error(exc):
+                        remaining = retry_deadline - time.monotonic()
+                        if remaining > 0:
+                            lock_retry_count += 1
+                            if lock_retry_count == 1:
+                                logger.info(
+                                    "LCM per-turn ingest retrying within bounded %.3fs "
+                                    "SQLite contention budget",
+                                    _PER_TURN_INGEST_LOCK_RETRY_BUDGET_SECONDS,
+                                )
+                            time.sleep(
+                                min(
+                                    _PER_TURN_INGEST_LOCK_RETRY_DELAY_SECONDS,
+                                    remaining,
+                                )
+                            )
+                            continue
                     self._record_ingest_failure("per-turn ingest()", exc)
                     return
 
