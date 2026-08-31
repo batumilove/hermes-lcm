@@ -3196,6 +3196,63 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
             wait_seconds=time.monotonic() - started_at,
         )
 
+    def _ingest_loaded_session_end_messages(self, intent: Dict[str, Any]) -> None:
+        """Persist the proven suffix of one v2 session-end intent exactly once.
+
+        Session-end callbacks receive the host's full transcript, while the
+        process cursor may index a shorter active context after compaction or
+        overflow recovery. Durable fingerprints therefore outrank that cursor
+        when deciding which prefix is already stored.
+        """
+        session_id = str(intent["session_id"])
+        conversation_id = str(intent["conversation_id"])
+        messages = list(intent["messages"])
+        intent_sha256 = str(intent["intent_sha256"])
+        message_fingerprints = list(intent["message_fingerprints"])
+        current_session = (
+            session_id == self._session_id
+            and conversation_id == self._conversation_id
+        )
+        if not self._store.has_session_end_ingest_receipt(intent_sha256):
+            receipt_prefix_count = self._store.session_end_ingested_prefix_count(
+                session_id=session_id,
+                conversation_id=conversation_id,
+                message_fingerprints=message_fingerprints,
+            )
+            store_prefix_count = self._session_end_store_prefix_count(
+                session_id,
+                messages,
+                conversation_id=conversation_id,
+                raise_on_error=True,
+            )
+            ingest_cursor = max(
+                int(intent["ingest_cursor"]),
+                receipt_prefix_count,
+                store_prefix_count if store_prefix_count is not None else 0,
+            )
+            if current_session:
+                ingest_cursor = max(ingest_cursor, self._ingest_cursor)
+            ingest_cursor = min(ingest_cursor, len(messages))
+            suffix = messages[ingest_cursor:]
+            if suffix:
+                self._append_off_current_session_end_suffix(
+                    session_id,
+                    suffix,
+                    source=str(intent.get("source") or ""),
+                    conversation_id=conversation_id,
+                    session_end_intent_sha256=intent_sha256,
+                    session_end_message_fingerprints=message_fingerprints,
+                )
+            else:
+                self._store.record_session_end_ingest_receipt(
+                    intent_sha256,
+                    session_id=session_id,
+                    conversation_id=conversation_id,
+                    message_fingerprints=message_fingerprints,
+                )
+        if current_session:
+            self._ingest_cursor = max(self._ingest_cursor, len(messages))
+
     def _drain_loaded_session_end_intent(
         self, path: Path, intent: Dict[str, Any]
     ) -> None:
@@ -3203,53 +3260,7 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
         conversation_id = str(intent["conversation_id"])
         messages = list(intent["messages"])
         if int(intent.get("version") or 0) >= 2:
-            intent_sha256 = str(intent["intent_sha256"])
-            message_fingerprints = list(intent["message_fingerprints"])
-            if not self._store.has_session_end_ingest_receipt(intent_sha256):
-                ingest_cursor = max(
-                    int(intent["ingest_cursor"]),
-                    self._store.session_end_ingested_prefix_count(
-                        session_id=session_id,
-                        conversation_id=conversation_id,
-                        message_fingerprints=message_fingerprints,
-                    ),
-                )
-                if (
-                    session_id == self._session_id
-                    and conversation_id == self._conversation_id
-                ):
-                    ingest_cursor = max(ingest_cursor, self._ingest_cursor)
-                durable_prefix = self._session_end_store_prefix_count(
-                    session_id,
-                    messages,
-                    conversation_id=conversation_id,
-                    raise_on_error=True,
-                )
-                if durable_prefix is not None:
-                    ingest_cursor = max(ingest_cursor, durable_prefix)
-                ingest_cursor = min(ingest_cursor, len(messages))
-                suffix = messages[ingest_cursor:]
-                if suffix:
-                    self._append_off_current_session_end_suffix(
-                        session_id,
-                        suffix,
-                        source=str(intent.get("source") or ""),
-                        conversation_id=conversation_id,
-                        session_end_intent_sha256=intent_sha256,
-                        session_end_message_fingerprints=message_fingerprints,
-                    )
-                else:
-                    self._store.record_session_end_ingest_receipt(
-                        intent_sha256,
-                        session_id=session_id,
-                        conversation_id=conversation_id,
-                        message_fingerprints=message_fingerprints,
-                    )
-            if (
-                session_id == self._session_id
-                and conversation_id == self._conversation_id
-            ):
-                self._ingest_cursor = max(self._ingest_cursor, len(messages))
+            self._ingest_loaded_session_end_messages(intent)
             self._lifecycle.finalize_session(
                 conversation_id,
                 session_id,
@@ -4876,6 +4887,24 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
             return self._redact_active_replay_messages(messages)
 
         n = len(messages)
+        if session_end_intent_sha256:
+            message_fingerprints = session_end_message_fingerprints or []
+            receipt_prefix_count = self._store.session_end_ingested_prefix_count(
+                session_id=self._session_id,
+                conversation_id=self._conversation_id,
+                message_fingerprints=message_fingerprints,
+            )
+            store_prefix_count = self._session_end_store_prefix_count(
+                self._session_id,
+                messages,
+                conversation_id=self._conversation_id,
+                raise_on_error=True,
+            )
+            self._ingest_cursor = max(
+                self._ingest_cursor,
+                receipt_prefix_count,
+                store_prefix_count if store_prefix_count is not None else 0,
+            )
         cursor = min(max(self._ingest_cursor, 0), n)
         scan_start = 0 if self._ingest_cursor_needs_reconcile else cursor
         ignored_original_messages = [False] * n
