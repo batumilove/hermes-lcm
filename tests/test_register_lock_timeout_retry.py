@@ -107,8 +107,7 @@ def test_register_starts_deferred_integrity_scans_after_publication(monkeypatch)
 
     lcm_plugin.register(OrderedCtx())
 
-    assert events[0] == "registered"
-    assert events[-1] == "scans-started"
+    assert events[:2] == ["registered", "scans-started"]
     assert {event for event in events if event.startswith("hook:")} == {
         "hook:subagent_start",
         "hook:subagent_stop",
