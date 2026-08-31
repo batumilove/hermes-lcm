@@ -10436,15 +10436,26 @@ class TestPerTurnIngest:
             raise sqlite3.OperationalError("database is locked")
 
         monkeypatch.setattr(eng._store, "_append_protected_batch", always_locked)
+        fake_now = 0.0
+
+        def fake_monotonic():
+            return fake_now
+
+        def fake_sleep(seconds):
+            nonlocal fake_now
+            fake_now += seconds
+
+        monkeypatch.setattr(lcm_engine.time, "monotonic", fake_monotonic)
+        monkeypatch.setattr(lcm_engine.time, "sleep", fake_sleep)
         monkeypatch.setattr(
-            lcm_engine, "_PER_TURN_INGEST_LOCK_RETRY_BUDGET_SECONDS", 0.01
+            lcm_engine, "_PER_TURN_INGEST_LOCK_RETRY_BUDGET_SECONDS", 1.0
         )
         monkeypatch.setattr(
-            lcm_engine, "_PER_TURN_INGEST_LOCK_RETRY_DELAY_SECONDS", 0.001
+            lcm_engine, "_PER_TURN_INGEST_LOCK_RETRY_DELAY_SECONDS", 0.4
         )
         try:
             eng.ingest(messages)
-            assert attempts >= 2
+            assert attempts == 4
             assert eng._ingest_cursor == 0
             assert eng._store.get_session_count("persistent-lock") == 0
             assert eng._ingest_failure_count == 1
