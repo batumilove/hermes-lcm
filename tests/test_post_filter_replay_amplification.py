@@ -24,11 +24,17 @@ and reappends old tool IDs before recording the receipt. Expected behavior: ever
 previously stored tool_call_id remains exactly once and only the genuine suffix
 persists.
 """
+import pytest
+
 from hermes_lcm.config import LCMConfig
 from hermes_lcm.engine import LCMEngine
 
 
-def test_full_snapshot_after_filtered_replay_does_not_reappend_durable_tool_ids(tmp_path):
+@pytest.mark.parametrize("delivery_path", ["direct", "deferred"])
+def test_full_snapshot_after_filtered_replay_does_not_reappend_durable_tool_ids(
+    tmp_path,
+    delivery_path,
+):
     db_path = tmp_path / "post-filter-replay-amplification.db"
     config = LCMConfig(database_path=str(db_path))
 
@@ -115,7 +121,15 @@ def test_full_snapshot_after_filtered_replay_does_not_reappend_durable_tool_ids(
         {"role": "user", "content": "phase one new tail"},
         {"role": "user", "content": "phase two genuinely new follow-up"},
     ]
-    after.on_session_end("post-filter-replay-session", phase2)
+    if delivery_path == "direct":
+        after.on_session_end("post-filter-replay-session", phase2)
+    else:
+        pending = after._persist_session_end_intent(
+            "post-filter-replay-session",
+            phase2,
+            ingest_cursor=after._ingest_cursor,
+        )
+        after._drain_one_session_end_intent(pending)
 
     rows = after._store.get_session_messages("post-filter-replay-session")
     contents = [row["content"] for row in rows]
