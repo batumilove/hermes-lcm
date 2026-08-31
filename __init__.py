@@ -227,6 +227,20 @@ def register(ctx):
                 exc_info=True,
             )
 
+    # Deep FTS integrity scans discovered during engine storage binding are
+    # queued (not dispatched) so construction cannot be starved by an
+    # O(index-size) scan. Once the host has accepted and published this engine,
+    # give those scans a durable owner before any optional hook, tool, or command
+    # registration can fail. The deep check itself runs against a snapshot,
+    # outside the process-wide SQLite writer.
+    if engine is not None:
+        try:
+            engine.start_deferred_integrity_scans()
+        except Exception:
+            logger.warning(
+                "LCM deferred FTS integrity scans failed to start", exc_info=True
+            )
+
 
     # Subscribe to the host's explicit subagent lifecycle events when available.
     # These carry the child_session_id/parent_session_id linkage directly, so LCM
@@ -371,19 +385,5 @@ def register(ctx):
         logger.debug("LCM registered post_llm_call hook for per-turn ingest")
     except Exception as exc:
         logger.debug("LCM could not register post_llm_call hook: %s", exc)
-
-    # Deep FTS integrity scans discovered during engine storage binding are
-    # queued (not dispatched) so construction cannot be starved by an
-    # O(index-size) scan. Start them only after the engine, hooks, tools, and
-    # commands have completed plugin registration; a scan is worthless if
-    # publication failed and this engine is being torn down. The deep check
-    # itself runs against a snapshot, outside the process-wide SQLite writer.
-    if engine is not None:
-        try:
-            engine.start_deferred_integrity_scans()
-        except Exception:
-            logger.warning(
-                "LCM deferred FTS integrity scans failed to start", exc_info=True
-            )
 
     logger.warning("LCM plugin loaded — lossless context management active")
