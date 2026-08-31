@@ -4956,16 +4956,21 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
                     # the entire batch.
                     scan_tool_anchored_replay = True
         if scan_tool_anchored_replay:
+            replay_scan_start = cursor if reconciled_ingest_cursor else 0
             (
-                tool_anchored_replay_indexes,
+                scanned_replay_indexes,
                 replay_scan_count,
             ) = self._find_tool_anchored_replay_indexes(
-                replay_messages,
+                replay_messages[replay_scan_start:],
                 suppress_tool_less_duplicates=bool(reconciled_ingest_cursor),
             )
+            tool_anchored_replay_indexes = {
+                replay_scan_start + idx for idx in scanned_replay_indexes
+            }
             if tool_anchored_replay_indexes:
-                cursor = 0
-                self._ingest_cursor = 0
+                if not reconciled_ingest_cursor:
+                    cursor = 0
+                    self._ingest_cursor = 0
                 session_count = self._store.get_session_count(self._session_id)
                 self._record_ingest_reconciliation(
                     action="filtered replay",
@@ -4974,7 +4979,7 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
                     incoming=n,
                     session_count=session_count,
                     stored_tail_count=replay_scan_count,
-                    effective_incoming=n - len(tool_anchored_replay_indexes),
+                    effective_incoming=n - cursor - len(tool_anchored_replay_indexes),
                 )
         logger.debug(
             "Ingest: session=%s cursor=%d incoming=%d",
