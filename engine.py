@@ -160,6 +160,7 @@ _SESSION_END_APPEND_OVERLAP_TIMEOUT_MS = 2500
 _SESSION_END_DEFERRED_RETRY_BUDGET_SECONDS = 30.0
 _SESSION_END_DEFERRED_RETRY_INTERVAL_SECONDS = 0.05
 _PER_TURN_INGEST_LOCK_RETRY_DELAY_SECONDS = 0.05
+_PER_TURN_INGEST_LOCK_RETRY_BUDGET_SECONDS = 2.5
 _CODEX_GPT55_COMPACTION_THRESHOLD = 0.85
 
 
@@ -1528,7 +1529,11 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
             self._remember_lcm_bypass_message_prefix(self._bypass_lcm_session_id(), messages)
             return
         if self._session_id and messages:
-            for attempt in range(2):
+            retry_deadline = (
+                time.monotonic() + _PER_TURN_INGEST_LOCK_RETRY_BUDGET_SECONDS
+            )
+            lock_retry_count = 0
+            while True:
                 try:
                     self._remember_lcm_normal_message_prefix(
                         self._session_id,
@@ -1544,12 +1549,23 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
                     )
                     return
                 except Exception as exc:
-                    if attempt == 0 and _is_sqlite_locked_error(exc):
-                        logger.info(
-                            "LCM per-turn ingest retrying once after transient SQLite contention"
-                        )
-                        time.sleep(_PER_TURN_INGEST_LOCK_RETRY_DELAY_SECONDS)
-                        continue
+                    if _is_sqlite_locked_error(exc):
+                        remaining = retry_deadline - time.monotonic()
+                        if remaining > 0:
+                            lock_retry_count += 1
+                            if lock_retry_count == 1:
+                                logger.info(
+                                    "LCM per-turn ingest retrying within bounded %.3fs "
+                                    "SQLite contention budget",
+                                    _PER_TURN_INGEST_LOCK_RETRY_BUDGET_SECONDS,
+                                )
+                            time.sleep(
+                                min(
+                                    _PER_TURN_INGEST_LOCK_RETRY_DELAY_SECONDS,
+                                    remaining,
+                                )
+                            )
+                            continue
                     self._record_ingest_failure("per-turn ingest()", exc)
                     return
 
@@ -4912,18 +4928,7 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
             self._ingest_cursor_needs_reconcile = False
         cursor = min(max(self._ingest_cursor, 0), n)
         tool_anchored_replay_indexes: set[int] = set()
-        incoming_has_raw_persisted_marker = any(
-            str(msg.get("role") or "") == "tool"
-            and _is_hermes_persisted_output_marker(
-                normalize_content_value(msg.get("content")) or ""
-            )
-            for msg in messages
-        )
-        scan_tool_anchored_replay = (
-            reconciled_ingest_cursor
-            and not incoming_has_raw_persisted_marker
-            and not self._effective_replay_identities(replay_messages[:cursor])
-        )
+        scan_tool_anchored_replay = bool(reconciled_ingest_cursor)
         if cursor > 0:
             cached_source_identities = getattr(self, "_last_active_replay_source_identities", None)
             cached_active_replay_messages = getattr(self, "_last_active_replay_messages", None)
@@ -4944,15 +4949,28 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
                         + replay_messages[cursor:]
                     )
                 else:
-                    scan_tool_anchored_replay = not incoming_has_raw_persisted_marker
+                    # A changed active prefix can contain a mixed replay even
+                    # when one or more raw persisted-output source files have
+                    # expired. The scanner handles those markers per row; one
+                    # unprovable marker must not disable replay filtering for
+                    # the entire batch.
+                    scan_tool_anchored_replay = True
         if scan_tool_anchored_replay:
+            replay_scan_start = cursor if reconciled_ingest_cursor else 0
             (
-                tool_anchored_replay_indexes,
+                scanned_replay_indexes,
                 replay_scan_count,
-            ) = self._find_tool_anchored_replay_indexes(replay_messages)
+            ) = self._find_tool_anchored_replay_indexes(
+                replay_messages[replay_scan_start:],
+                suppress_tool_less_duplicates=bool(reconciled_ingest_cursor),
+            )
+            tool_anchored_replay_indexes = {
+                replay_scan_start + idx for idx in scanned_replay_indexes
+            }
             if tool_anchored_replay_indexes:
-                cursor = 0
-                self._ingest_cursor = 0
+                if not reconciled_ingest_cursor:
+                    cursor = 0
+                    self._ingest_cursor = 0
                 session_count = self._store.get_session_count(self._session_id)
                 self._record_ingest_reconciliation(
                     action="filtered replay",
@@ -4961,7 +4979,7 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
                     incoming=n,
                     session_count=session_count,
                     stored_tail_count=replay_scan_count,
-                    effective_incoming=n - len(tool_anchored_replay_indexes),
+                    effective_incoming=n - cursor - len(tool_anchored_replay_indexes),
                 )
         logger.debug(
             "Ingest: session=%s cursor=%d incoming=%d",

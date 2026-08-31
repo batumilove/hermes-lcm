@@ -345,7 +345,9 @@ class MessageStore:
         tool_calls = msg.get("tool_calls")
         tc_json = json.dumps(tool_calls) if tool_calls else None
 
-        with self._write_lock:
+        # The connection context commits on success and rolls back on any
+        # statement/commit failure before the process writer gate is released.
+        with self._write_lock, self._conn:
             cur = self._conn.execute(
                 """INSERT INTO messages
                    (session_id, source, conversation_id, role, content, tool_call_id, tool_calls,
@@ -365,7 +367,6 @@ class MessageStore:
                     0,
                 ),
             )
-            self._conn.commit()
             return cur.lastrowid
 
     def append_batch(self, session_id: str,
@@ -531,22 +532,20 @@ class MessageStore:
         """Move all persisted messages from one session_id to another."""
         if not old_session_id or not new_session_id or old_session_id == new_session_id:
             return 0
-        with self._write_lock:
+        with self._write_lock, self._conn:
             cur = self._conn.execute(
                 "UPDATE messages SET session_id = ? WHERE session_id = ?",
                 (new_session_id, old_session_id),
             )
-            self._conn.commit()
             return cur.rowcount if cur.rowcount is not None else 0
 
     def delete_session_messages(self, session_id: str) -> int:
         """Delete all messages for a session. Returns count deleted."""
-        with self._write_lock:
+        with self._write_lock, self._conn:
             cur = self._conn.execute(
                 "DELETE FROM messages WHERE session_id = ?",
                 (session_id,),
             )
-            self._conn.commit()
             deleted = cur.rowcount if cur.rowcount is not None else 0
             return deleted
 
@@ -566,7 +565,7 @@ class MessageStore:
         later batch archive would slice the new (short) content at the old chunk
         offsets, returning a garbled fragment (F2).
         """
-        with self._write_lock:
+        with self._write_lock, self._conn:
             row = self._conn.execute(
                 "SELECT role, pinned, content, tool_call_id FROM messages WHERE store_id = ?",
                 (store_id,),
@@ -589,24 +588,21 @@ class MessageStore:
             )
             if before_commit is not None:
                 before_commit(self._conn, store_id)
-            self._conn.commit()
             return True
 
     def pin(self, store_id: int) -> None:
 
         """Mark a message as pinned (protected from pruning)."""
-        with self._write_lock:
+        with self._write_lock, self._conn:
             self._conn.execute(
                 "UPDATE messages SET pinned = 1 WHERE store_id = ?", (store_id,)
             )
-            self._conn.commit()
 
     def unpin(self, store_id: int) -> None:
-        with self._write_lock:
+        with self._write_lock, self._conn:
             self._conn.execute(
                 "UPDATE messages SET pinned = 0 WHERE store_id = ?", (store_id,)
             )
-            self._conn.commit()
 
     # -- Read operations ----------------------------------------------------
 
@@ -993,7 +989,9 @@ class MessageStore:
         if conn is None:
             return False
         wrote = False
-        with self._write_lock:
+        # The connection context guarantees rollback on a statement or commit
+        # failure before the process-wide writer gate is released.
+        with self._write_lock, conn:
             for key in keys:
                 if skip_unchanged:
                     existing = conn.execute(
@@ -1010,8 +1008,6 @@ class MessageStore:
                     (key, serialized),
                 )
                 wrote = True
-            if wrote:
-                conn.commit()
         return wrote
 
     # -- Compaction telemetry ------------------------------------------------

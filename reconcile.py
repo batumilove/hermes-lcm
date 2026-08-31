@@ -861,6 +861,8 @@ class ReconcileMixin:
     def _find_tool_anchored_replay_indexes(
         self,
         messages: List[Dict[str, Any]],
+        *,
+        suppress_tool_less_duplicates: bool = False,
     ) -> tuple[set[int], int]:
         """Find stable tool rows replayed after a changed active-context prefix.
 
@@ -870,6 +872,12 @@ class ReconcileMixin:
         The immediately preceding assistant tool-call row is also safe when both
         durable and incoming rows carry that same call ID.  Plain neighboring
         user/assistant rows remain ambiguous and are deliberately preserved.
+
+        ``suppress_tool_less_duplicates`` extends suppression to tool-less rows
+        byte-matching durable rows once the batch is tool-anchor-proven.  It is
+        only warranted on the restart/rebind path, where the batch is a
+        redelivered context snapshot; in a live session the same bytes can be a
+        legitimate repeated turn and stay preserved.
         """
         visible_messages = [
             (raw_index, msg)
@@ -963,6 +971,12 @@ class ReconcileMixin:
         for incoming_anchor in incoming_tool_offsets:
             incoming_raw_index, incoming_tool = visible_messages[incoming_anchor]
             incoming_identity = incoming_identities[incoming_anchor]
+            # Missing persisted-output source files do not make an exact stored
+            # marker identity new. Re-appending the same
+            # (session_id, tool_call_id, content) pointer cannot recover its
+            # vanished payload; it only creates a duplicate row. The durable
+            # identity lookup below still preserves changed markers and markers
+            # whose call id/content have never been stored.
             candidates = stored_tool_anchors.get(incoming_identity, [])
             for stored_anchor in candidates:
                 if not identities_match(incoming_identity, stored_identities[stored_anchor]):
@@ -984,6 +998,30 @@ class ReconcileMixin:
                     )
                 ):
                     replayed_raw_indexes.add(incoming_previous_raw)
+
+        if replayed_raw_indexes and suppress_tool_less_duplicates:
+            # Interleaved snapshot replay: once a batch is proven to replay
+            # durable tool results, tool-less rows whose full identity
+            # byte-matches a durable row are part of the same replayed
+            # snapshot, not legitimate repetition.  Suppress them too.  A
+            # batch with no tool anchor keeps the conservative behavior:
+            # ambiguous tool-less duplicates stay preserved.
+            stored_identity_keys: set[tuple[str, str, str, str]] = set()
+            for stored_row, stored_identity in zip(stored_rows, stored_identities):
+                stored_identity_keys.add(stored_identity)
+                cleaned = self._active_cleanup_replay_identity(stored_identity)
+                if cleaned is not None:
+                    stored_identity_keys.add(cleaned)
+            for offset, (raw_index, msg) in enumerate(visible_messages):
+                if raw_index in replayed_raw_indexes:
+                    continue
+                if str(msg.get("role") or "") == "tool" and bool(
+                    str(msg.get("tool_call_id") or "")
+                ):
+                    continue
+                identity = incoming_identities[offset]
+                if identity in stored_identity_keys:
+                    replayed_raw_indexes.add(raw_index)
 
         return replayed_raw_indexes, scanned_row_count
 

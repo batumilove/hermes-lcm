@@ -4843,7 +4843,9 @@ class TestIngestExternalization:
         replay_after_cleanup._session_id = "ingest-session"
         replay_after_cleanup._ingest_cursor_needs_reconcile = True
         replay_after_cleanup._ingest_messages(original_messages + retry_messages)
-        assert replay_after_cleanup._store.get_session_count("ingest-session") == 8
+        stored_after_cleanup = replay_after_cleanup._store.get_session_messages("ingest-session")
+        assert len(stored_after_cleanup) == 5
+        assert stored_after_cleanup[-1]["content"] == new_marker
 
     def test_replay_reuses_same_content_persisted_output_payload_across_marker_paths(self, tmp_path, monkeypatch):
         import tempfile
@@ -4932,7 +4934,9 @@ class TestIngestExternalization:
         replay_after_cleanup._session_id = "ingest-session"
         replay_after_cleanup._ingest_cursor_needs_reconcile = True
         replay_after_cleanup._ingest_messages(original_messages + retry_messages)
-        assert replay_after_cleanup._store.get_session_count("ingest-session") == 8
+        stored_after_cleanup = replay_after_cleanup._store.get_session_messages("ingest-session")
+        assert len(stored_after_cleanup) == 5
+        assert stored_after_cleanup[-1]["content"] == second_marker
 
     def test_replay_does_not_reuse_durable_payload_for_stale_retry_marker_with_same_preview_but_different_path(self, tmp_path, monkeypatch):
         import tempfile
@@ -5191,7 +5195,7 @@ class TestIngestExternalization:
 
         assert recover_hermes_persisted_output_with_file_stat(marker) is None
 
-    def test_replay_appends_missing_file_marker_with_generation_text_inside_raw_preview(self, tmp_path):
+    def test_replay_suppresses_exact_missing_file_marker_with_generation_text_inside_raw_preview(self, tmp_path):
         from hermes_lcm.engine import LCMEngine
 
         engine, _output_dir = self._engine(tmp_path, large_output_externalization_threshold_chars=10)
@@ -5219,7 +5223,7 @@ class TestIngestExternalization:
         replay._ingest_cursor_needs_reconcile = True
         replay._ingest_messages(messages)
 
-        assert replay._store.get_session_count("ingest-session") == 4
+        assert replay._store.get_session_count("ingest-session") == 2
 
     def test_replay_appends_missing_file_retry_with_forged_identity_as_final_preview_line(self, tmp_path, monkeypatch):
         import hashlib
@@ -5391,7 +5395,7 @@ class TestIngestExternalization:
 
         assert replay._store.get_session_count("ingest-session") == 4
 
-    def test_replay_appends_unrecoverable_raw_persisted_marker_even_when_exact_tail_matches(self, tmp_path):
+    def test_replay_suppresses_unrecoverable_raw_persisted_marker_when_exact_identity_matches(self, tmp_path):
         from hermes_lcm.engine import LCMEngine
 
         engine, _output_dir = self._engine(tmp_path)
@@ -5418,9 +5422,11 @@ class TestIngestExternalization:
         replay._ingest_cursor_needs_reconcile = True
         replay._ingest_messages(messages)
 
-        assert replay._store.get_session_count("ingest-session") == 4
+        stored = replay._store.get_session_messages("ingest-session")
+        assert len(stored) == 2
+        assert stored[-1]["content"] == marker
 
-    def test_replay_appends_mixed_persisted_suffix_when_any_marker_lacks_file_proof(self, tmp_path, monkeypatch):
+    def test_replay_suppresses_exact_mixed_persisted_suffix_without_file_proof(self, tmp_path, monkeypatch):
         import tempfile
         from hermes_lcm.engine import LCMEngine
 
@@ -5458,7 +5464,7 @@ class TestIngestExternalization:
         replay._ingest_cursor_needs_reconcile = True
         replay._ingest_messages(messages)
 
-        assert replay._store.get_session_count("ingest-session") == 4
+        assert replay._store.get_session_count("ingest-session") == 2
 
     def test_replay_appends_stale_lossy_persisted_retry_when_redaction_config_disabled(self, tmp_path, monkeypatch):
         import os
@@ -5687,7 +5693,7 @@ class TestIngestExternalization:
         replay_enabled_with_file._ingest_cursor_needs_reconcile = True
         replay_enabled_with_file._ingest_messages(messages)
 
-        assert replay_enabled_with_file._store.get_session_count("ingest-session") == 3
+        assert replay_enabled_with_file._store.get_session_count("ingest-session") == 2
 
         persisted_path.unlink()
         replay = LCMEngine(config=engine._config, hermes_home=str(tmp_path / "hermes"))
@@ -5695,7 +5701,12 @@ class TestIngestExternalization:
         replay._ingest_cursor_needs_reconcile = True
         replay._ingest_messages(messages)
 
-        assert replay._store.get_session_count("ingest-session") == 4
+        stored_after_unlink = replay._store.get_session_messages("ingest-session")
+        assert len(stored_after_unlink) == 3
+        assert stored_after_unlink[-1]["content"].startswith(
+            marker.removesuffix("</persisted-output>")
+        )
+        assert "[LCM persisted-output marker identity:" in stored_after_unlink[-1]["content"]
 
     def test_replay_reconciles_redacted_inline_persisted_marker_when_externalization_disabled(self, tmp_path, monkeypatch):
         import tempfile

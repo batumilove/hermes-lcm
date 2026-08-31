@@ -4890,6 +4890,48 @@ class TestEngineABC:
         assert indexes == set()
         assert scanned == 1
 
+    def test_tool_less_replay_suppression_uses_raw_indexes_after_scaffold(
+        self, tmp_path, monkeypatch
+    ):
+        db_path = tmp_path / "tool-replay-raw-index-after-scaffold.db"
+        engine = LCMEngine(config=LCMConfig(database_path=str(db_path)))
+        engine.on_session_start(
+            "tool-replay-raw-index-after-scaffold-session",
+            platform="telegram",
+            context_length=200000,
+        )
+        assistant_call = {
+            "role": "assistant",
+            "content": "",
+            "tool_calls": [{"id": "call_raw_index", "type": "function"}],
+        }
+        tool_result = {
+            "role": "tool",
+            "tool_call_id": "call_raw_index",
+            "content": "raw-index result",
+        }
+        repeated_user = {"role": "user", "content": "durable repeated request"}
+        scaffold = {
+            "role": "system",
+            "content": (
+                "[Note: This conversation uses Lossless Context Management (LCM). "
+                "Earlier turns have been compacted into hierarchical summaries below.]"
+            ),
+        }
+        monkeypatch.setattr(
+            engine._store,
+            "get_session_tail",
+            lambda session_id, limit=1000: [assistant_call, tool_result, repeated_user],
+        )
+
+        indexes, scanned = engine._find_tool_anchored_replay_indexes(
+            [scaffold, assistant_call, tool_result, repeated_user],
+            suppress_tool_less_duplicates=True,
+        )
+
+        assert scanned == 3
+        assert indexes == {1, 2, 3}
+
     def test_existing_session_restart_tool_anchor_reuses_externalized_payload(self, tmp_path):
         db_path = tmp_path / "restart-tool-anchor-payload.db"
         payload_dir = tmp_path / "payloads"
@@ -10378,7 +10420,7 @@ class TestPerTurnIngest:
         finally:
             eng.shutdown()
 
-    def test_persistent_sqlite_lock_retries_once_then_records_one_failure(
+    def test_persistent_sqlite_lock_exhausts_budget_then_records_one_failure(
         self, tmp_path, monkeypatch
     ):
         """Persistent contention remains bounded and counts as one failed turn."""
@@ -10394,9 +10436,26 @@ class TestPerTurnIngest:
             raise sqlite3.OperationalError("database is locked")
 
         monkeypatch.setattr(eng._store, "_append_protected_batch", always_locked)
+        fake_now = 0.0
+
+        def fake_monotonic():
+            return fake_now
+
+        def fake_sleep(seconds):
+            nonlocal fake_now
+            fake_now += seconds
+
+        monkeypatch.setattr(lcm_engine.time, "monotonic", fake_monotonic)
+        monkeypatch.setattr(lcm_engine.time, "sleep", fake_sleep)
+        monkeypatch.setattr(
+            lcm_engine, "_PER_TURN_INGEST_LOCK_RETRY_BUDGET_SECONDS", 1.0
+        )
+        monkeypatch.setattr(
+            lcm_engine, "_PER_TURN_INGEST_LOCK_RETRY_DELAY_SECONDS", 0.4
+        )
         try:
             eng.ingest(messages)
-            assert attempts == 2
+            assert attempts == 4
             assert eng._ingest_cursor == 0
             assert eng._store.get_session_count("persistent-lock") == 0
             assert eng._ingest_failure_count == 1
