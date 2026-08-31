@@ -1012,8 +1012,8 @@ class ReconcileMixin:
                 cleaned = self._active_cleanup_replay_identity(stored_identity)
                 if cleaned is not None:
                     stored_identity_keys.add(cleaned)
-            for offset, (_raw_index, msg) in enumerate(visible_messages):
-                if offset in replayed_raw_indexes:
+            for offset, (raw_index, msg) in enumerate(visible_messages):
+                if raw_index in replayed_raw_indexes:
                     continue
                 if str(msg.get("role") or "") == "tool" and bool(
                     str(msg.get("tool_call_id") or "")
@@ -1021,7 +1021,7 @@ class ReconcileMixin:
                     continue
                 identity = incoming_identities[offset]
                 if identity in stored_identity_keys:
-                    replayed_raw_indexes.add(visible_messages[offset][0])
+                    replayed_raw_indexes.add(raw_index)
 
         return replayed_raw_indexes, scanned_row_count
 
