@@ -4890,6 +4890,48 @@ class TestEngineABC:
         assert indexes == set()
         assert scanned == 1
 
+    def test_tool_less_replay_suppression_uses_raw_indexes_after_scaffold(
+        self, tmp_path, monkeypatch
+    ):
+        db_path = tmp_path / "tool-replay-raw-index-after-scaffold.db"
+        engine = LCMEngine(config=LCMConfig(database_path=str(db_path)))
+        engine.on_session_start(
+            "tool-replay-raw-index-after-scaffold-session",
+            platform="telegram",
+            context_length=200000,
+        )
+        assistant_call = {
+            "role": "assistant",
+            "content": "",
+            "tool_calls": [{"id": "call_raw_index", "type": "function"}],
+        }
+        tool_result = {
+            "role": "tool",
+            "tool_call_id": "call_raw_index",
+            "content": "raw-index result",
+        }
+        repeated_user = {"role": "user", "content": "durable repeated request"}
+        scaffold = {
+            "role": "system",
+            "content": (
+                "[Note: This conversation uses Lossless Context Management (LCM). "
+                "Earlier turns have been compacted into hierarchical summaries below.]"
+            ),
+        }
+        monkeypatch.setattr(
+            engine._store,
+            "get_session_tail",
+            lambda session_id, limit=1000: [assistant_call, tool_result, repeated_user],
+        )
+
+        indexes, scanned = engine._find_tool_anchored_replay_indexes(
+            [scaffold, assistant_call, tool_result, repeated_user],
+            suppress_tool_less_duplicates=True,
+        )
+
+        assert scanned == 3
+        assert indexes == {1, 2, 3}
+
     def test_existing_session_restart_tool_anchor_reuses_externalized_payload(self, tmp_path):
         db_path = tmp_path / "restart-tool-anchor-payload.db"
         payload_dir = tmp_path / "payloads"
