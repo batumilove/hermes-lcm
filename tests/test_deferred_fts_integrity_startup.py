@@ -6,6 +6,9 @@ import sqlite3
 import threading
 import time
 
+import pytest
+
+import hermes_lcm
 from hermes_lcm import db_bootstrap, engine as engine_mod, sqlite_util
 from hermes_lcm.config import LCMConfig
 from hermes_lcm.engine import LCMEngine
@@ -140,3 +143,68 @@ def test_standalone_engine_starts_due_background_scans_after_binding(
         db_bootstrap.join_background_integrity_scans(timeout=5)
         if engine is not None:
             engine.shutdown()
+
+
+def test_published_engine_starts_due_scans_before_optional_registration_failure(
+    tmp_path, monkeypatch
+):
+    """A later optional registration failure cannot strand published scans."""
+
+    hermes_home = tmp_path / "hermes-home"
+    db_path = hermes_home / "lcm.db"
+    monkeypatch.setenv("HERMES_HOME", str(hermes_home))
+    monkeypatch.setattr(db_bootstrap, "_check_disk_space", lambda _path: True)
+    monkeypatch.setenv("LCM_FTS_INTEGRITY_BACKGROUND", "false")
+    seed = LCMEngine(config=LCMConfig(), hermes_home=str(hermes_home))
+    seed.shutdown()
+    _delete_integrity_markers(db_path)
+    monkeypatch.setenv("LCM_FTS_INTEGRITY_BACKGROUND", "true")
+    monkeypatch.setenv("LCM_ENABLE_SLASH_COMMAND", "1")
+
+    all_scans_started = threading.Event()
+    release_scan = threading.Event()
+    started_tables = set()
+    started_lock = threading.Lock()
+    real_check = db_bootstrap.check_external_content_fts_integrity
+
+    def slow_check(connection, spec):
+        with started_lock:
+            started_tables.add(spec.table_name)
+            if started_tables == {"messages_fts", "nodes_fts"}:
+                all_scans_started.set()
+        assert release_scan.wait(timeout=5)
+        return real_check(connection, spec)
+
+    monkeypatch.setattr(
+        db_bootstrap, "check_external_content_fts_integrity", slow_check
+    )
+
+    module = hermes_lcm
+    monkeypatch.setattr(module, "_registered_root_engine", None)
+
+    scans_started_before_command = []
+
+    class _Ctx:
+        def __init__(self):
+            self.engine = None
+
+        def register_context_engine(self, engine):
+            self.engine = engine
+
+        def register_command(self, *_args, **_kwargs):
+            scans_started_before_command.append(all_scans_started.wait(timeout=2))
+            raise RuntimeError("forced command registration failure")
+
+    ctx = _Ctx()
+    try:
+        with pytest.raises(RuntimeError, match="forced command registration failure"):
+            module.register(ctx)
+
+        assert ctx.engine is not None
+        assert scans_started_before_command == [True]
+        assert started_tables == {"messages_fts", "nodes_fts"}
+    finally:
+        release_scan.set()
+        db_bootstrap.join_background_integrity_scans(timeout=5)
+        if ctx.engine is not None:
+            ctx.engine.shutdown()
