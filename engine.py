@@ -3219,6 +3219,14 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
                     and conversation_id == self._conversation_id
                 ):
                     ingest_cursor = max(ingest_cursor, self._ingest_cursor)
+                durable_prefix = self._session_end_store_prefix_count(
+                    session_id,
+                    messages,
+                    conversation_id=conversation_id,
+                    raise_on_error=True,
+                )
+                if durable_prefix is not None:
+                    ingest_cursor = max(ingest_cursor, durable_prefix)
                 ingest_cursor = min(ingest_cursor, len(messages))
                 suffix = messages[ingest_cursor:]
                 if suffix:

@@ -239,6 +239,80 @@ def test_deferred_recovery_replays_only_uningested_cursor_suffix(tmp_path):
         engine.shutdown()
 
 
+def test_deferred_recovery_does_not_replay_durable_prefix_past_stale_cursor(tmp_path):
+    engine = _engine(tmp_path, "stale-cursor-durable-prefix")
+    session_id = engine._session_id
+    conversation_id = engine._conversation_id
+    messages = [
+        {"role": "user", "content": "already durable one"},
+        {"role": "assistant", "content": "already durable two"},
+        {"role": "user", "content": "already durable three"},
+    ]
+    try:
+        engine._store.append_batch(
+            session_id,
+            messages,
+            source="telegram",
+            conversation_id=conversation_id,
+        )
+        path = engine._persist_session_end_intent(
+            session_id,
+            messages,
+            ingest_cursor=1,
+        )
+        digest = load_session_end_intent(path)["intent_sha256"]
+
+        engine._drain_one_session_end_intent(path)
+
+        persisted = engine._store.get_session_messages(session_id)
+        assert [message.get("content") for message in persisted] == [
+            "already durable one",
+            "already durable two",
+            "already durable three",
+        ]
+        assert engine._store.has_session_end_ingest_receipt(digest)
+        assert not path.exists()
+    finally:
+        engine.shutdown()
+
+
+def test_deferred_recovery_appends_only_tail_after_durable_prefix_past_stale_cursor(
+    tmp_path,
+):
+    engine = _engine(tmp_path, "stale-cursor-partial-prefix")
+    session_id = engine._session_id
+    conversation_id = engine._conversation_id
+    messages = [
+        {"role": "user", "content": "already durable one"},
+        {"role": "assistant", "content": "already durable two"},
+        {"role": "user", "content": "unpersisted tail"},
+    ]
+    try:
+        engine._store.append_batch(
+            session_id,
+            messages[:2],
+            source="telegram",
+            conversation_id=conversation_id,
+        )
+        path = engine._persist_session_end_intent(
+            session_id,
+            messages,
+            ingest_cursor=1,
+        )
+
+        engine._drain_one_session_end_intent(path)
+
+        persisted = engine._store.get_session_messages(session_id)
+        assert [message.get("content") for message in persisted] == [
+            "already durable one",
+            "already durable two",
+            "unpersisted tail",
+        ]
+        assert not path.exists()
+    finally:
+        engine.shutdown()
+
+
 def test_filtered_deferred_suffix_records_receipt_before_lifecycle_failure(
     tmp_path,
     monkeypatch,
