@@ -971,15 +971,12 @@ class ReconcileMixin:
         for incoming_anchor in incoming_tool_offsets:
             incoming_raw_index, incoming_tool = visible_messages[incoming_anchor]
             incoming_identity = incoming_identities[incoming_anchor]
-            # An unprovable raw persisted-output marker must not be suppressed:
-            # its referenced file is gone, so the row is a durability-carrying
-            # retry that has to be re-persisted even when bytes match.
-            if _is_hermes_persisted_output_marker(
-                normalize_content_value(incoming_tool.get("content")) or ""
-            ) and recover_hermes_persisted_output_with_file_stat(
-                normalize_content_value(incoming_tool.get("content")) or ""
-            ) is None:
-                continue
+            # Missing persisted-output source files do not make an exact stored
+            # marker identity new. Re-appending the same
+            # (session_id, tool_call_id, content) pointer cannot recover its
+            # vanished payload; it only creates a duplicate row. The durable
+            # identity lookup below still preserves changed markers and markers
+            # whose call id/content have never been stored.
             candidates = stored_tool_anchors.get(incoming_identity, [])
             for stored_anchor in candidates:
                 if not identities_match(incoming_identity, stored_identities[stored_anchor]):

@@ -4928,35 +4928,7 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
             self._ingest_cursor_needs_reconcile = False
         cursor = min(max(self._ingest_cursor, 0), n)
         tool_anchored_replay_indexes: set[int] = set()
-        incoming_has_raw_persisted_marker = any(
-            str(msg.get("role") or "") == "tool"
-            and _is_hermes_persisted_output_marker(
-                normalize_content_value(msg.get("content")) or ""
-            )
-            for msg in messages
-        )
-        scan_tool_anchored_replay = bool(reconciled_ingest_cursor) and not (
-            self._effective_replay_identities(replay_messages[:cursor])
-        )
-        if (
-            scan_tool_anchored_replay
-            and incoming_has_raw_persisted_marker
-        ):
-            # Raw persisted-output markers alone must not disable the
-            # non-contiguous replay scan: interleaved snapshot replays carry
-            # them, and skipping the scan persisted whole replayed batches.
-            # Scan only when every marker is provably backed by a durable
-            # externalized payload; any unprovable marker (deleted or missing
-            # source file) still disables it — those rows are
-            # durability-carrying retries that must be re-persisted.
-            scan_tool_anchored_replay = all(
-                self._has_any_durable_persisted_output_payload_for_marker(msg)
-                for msg in messages
-                if str(msg.get("role") or "") == "tool"
-                and _is_hermes_persisted_output_marker(
-                    normalize_content_value(msg.get("content")) or ""
-                )
-            )
+        scan_tool_anchored_replay = bool(reconciled_ingest_cursor)
         if cursor > 0:
             cached_source_identities = getattr(self, "_last_active_replay_source_identities", None)
             cached_active_replay_messages = getattr(self, "_last_active_replay_messages", None)
@@ -4977,16 +4949,12 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
                         + replay_messages[cursor:]
                     )
                 else:
-                    scan_tool_anchored_replay = not (
-                        incoming_has_raw_persisted_marker
-                    ) or all(
-                        self._has_any_durable_persisted_output_payload_for_marker(msg)
-                        for msg in messages
-                        if str(msg.get("role") or "") == "tool"
-                        and _is_hermes_persisted_output_marker(
-                            normalize_content_value(msg.get("content")) or ""
-                        )
-                    )
+                    # A changed active prefix can contain a mixed replay even
+                    # when one or more raw persisted-output source files have
+                    # expired. The scanner handles those markers per row; one
+                    # unprovable marker must not disable replay filtering for
+                    # the entire batch.
+                    scan_tool_anchored_replay = True
         if scan_tool_anchored_replay:
             (
                 tool_anchored_replay_indexes,
