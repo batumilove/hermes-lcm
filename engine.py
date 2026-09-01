@@ -110,6 +110,7 @@ from .session_end_pending import (
     persist_session_end_intent,
     quarantine_session_end_intent,
     remove_session_end_intent,
+    session_end_message_fingerprints,
 )
 from .message_analysis import (
     _is_synthetic_assistant_noise,
@@ -413,6 +414,7 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
         # next ingest.
         self._ingest_cursor: int = 0
         self._ingest_cursor_needs_reconcile = False
+        self._session_end_represented_prefix_fingerprints: list[str] = []
         self._last_ingest_reconciliation: Dict[str, Any] = {
             "action": "none",
             "reason": "not run",
@@ -3127,6 +3129,14 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
             session_end_message_fingerprints=session_end_message_fingerprints,
         )
 
+    def _record_session_end_represented_prefix(
+        self, messages: List[Dict[str, Any]]
+    ) -> None:
+        """Bind the process cursor to the exact active context returned to the host."""
+        self._session_end_represented_prefix_fingerprints = (
+            session_end_message_fingerprints(messages)
+        )
+
     def _persist_session_end_intent(
         self,
         session_id: str,
@@ -3134,19 +3144,33 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
         *,
         ingest_cursor: int | None = None,
     ) -> Path:
+        cursor = min(
+            max(
+                self._ingest_cursor if ingest_cursor is None else ingest_cursor,
+                0,
+            ),
+            len(messages),
+        )
+        represented_prefix_fingerprints: list[str] = []
+        process_represented_fingerprints = getattr(
+            self, "_session_end_represented_prefix_fingerprints", []
+        )
+        candidate_prefix_fingerprints = session_end_message_fingerprints(messages[:cursor])
+        if (
+            cursor > 0
+            and len(process_represented_fingerprints) >= cursor
+            and candidate_prefix_fingerprints
+            == process_represented_fingerprints[:cursor]
+        ):
+            represented_prefix_fingerprints = candidate_prefix_fingerprints
         intent = build_session_end_intent(
             session_id=session_id,
             conversation_id=self._conversation_id,
             source=self._session_platform,
             frontier_store_id=self._last_compacted_store_id,
             messages=copy.deepcopy(messages),
-            ingest_cursor=min(
-                max(
-                    self._ingest_cursor if ingest_cursor is None else ingest_cursor,
-                    0,
-                ),
-                len(messages),
-            ),
+            ingest_cursor=cursor,
+            represented_prefix_fingerprints=represented_prefix_fingerprints,
         )
         return persist_session_end_intent(self._store.db_path, intent)
 
@@ -3225,9 +3249,15 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
                 conversation_id=conversation_id,
                 raise_on_error=True,
             )
+            represented_prefix_count = (
+                len(intent.get("represented_prefix_fingerprints") or [])
+                if int(intent.get("version") or 0) >= 3
+                else 0
+            )
             ingest_cursor = max(
                 receipt_prefix_count,
                 store_prefix_count if store_prefix_count is not None else 0,
+                represented_prefix_count,
             )
             ingest_cursor = min(ingest_cursor, len(messages))
             suffix = messages[ingest_cursor:]
@@ -3819,6 +3849,12 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
                                     session_end_intent_sha256=intent_sha256,
                                     session_end_message_fingerprints=list(
                                         pending_intent["message_fingerprints"]
+                                    ),
+                                    session_end_represented_prefix_count=len(
+                                        pending_intent.get(
+                                            "represented_prefix_fingerprints"
+                                        )
+                                        or []
                                     ),
                                 )
                             break
@@ -4851,6 +4887,7 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
         *,
         session_end_intent_sha256: str | None = None,
         session_end_message_fingerprints: list[str] | None = None,
+        session_end_represented_prefix_count: int = 0,
     ) -> List[Dict[str, Any]]:
         """Persist new messages to the store.
 
@@ -4900,6 +4937,7 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
             self._ingest_cursor = max(
                 receipt_prefix_count,
                 store_prefix_count if store_prefix_count is not None else 0,
+                min(max(session_end_represented_prefix_count, 0), n),
             )
         cursor = min(max(self._ingest_cursor, 0), n)
         scan_start = 0 if self._ingest_cursor_needs_reconcile else cursor

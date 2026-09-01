@@ -20,7 +20,7 @@ def _engine(tmp_path, name):
     return engine
 
 
-def test_v2_intent_persists_immutable_ingest_cursor(tmp_path):
+def test_v3_intent_persists_immutable_ingest_cursor(tmp_path):
     intent = build_session_end_intent(
         session_id="session-a",
         conversation_id="conversation-a",
@@ -36,9 +36,47 @@ def test_v2_intent_persists_immutable_ingest_cursor(tmp_path):
 
     loaded = load_session_end_intent(path)
 
-    assert loaded["version"] == 2
+    assert loaded["version"] == 3
     assert loaded["ingest_cursor"] == 1
+    assert loaded["represented_prefix_fingerprints"] == []
     assert loaded["intent_sha256"] == intent["intent_sha256"]
+
+
+def test_persisted_intent_proves_matching_active_replay_prefix(tmp_path):
+    engine = _engine(tmp_path, "represented-prefix")
+    messages = [
+        {"role": "system", "content": "compressed context"},
+        {"role": "user", "content": "final turn"},
+    ]
+    engine._ingest_cursor = 1
+    engine._record_session_end_represented_prefix(messages)
+
+    path = engine._persist_session_end_intent(engine._session_id, messages)
+    loaded = load_session_end_intent(path)
+
+    assert loaded["ingest_cursor"] == 1
+    assert loaded["represented_prefix_fingerprints"] == loaded["message_fingerprints"][:1]
+
+
+def test_persisted_intent_rejects_changed_active_replay_prefix(tmp_path):
+    engine = _engine(tmp_path, "changed-represented-prefix")
+    messages = [
+        {"role": "system", "content": "changed compressed context"},
+        {"role": "user", "content": "final turn"},
+    ]
+    engine._ingest_cursor = 1
+    engine._record_session_end_represented_prefix(
+        [
+            {"role": "system", "content": "different compressed context"},
+            dict(messages[1]),
+        ]
+    )
+
+    path = engine._persist_session_end_intent(engine._session_id, messages)
+    loaded = load_session_end_intent(path)
+
+    assert loaded["ingest_cursor"] == 1
+    assert loaded["represented_prefix_fingerprints"] == []
 
 
 def test_loader_preserves_legacy_v1_digest_contract(tmp_path):

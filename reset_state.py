@@ -37,6 +37,7 @@ class ResetStateMixin:
         self._last_compacted_store_id = 0
         self._ingest_cursor = 0
         self._ingest_cursor_needs_reconcile = False
+        self._session_end_represented_prefix_fingerprints = []
         self._last_ingest_reconciliation = {"action": "none", "reason": "not run"}
 
     def _reset_session_scoped_runtime_state(self) -> None:

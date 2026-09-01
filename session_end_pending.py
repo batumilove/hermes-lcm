@@ -16,8 +16,8 @@ from pathlib import Path
 from typing import Any, Dict, Iterable
 
 _PENDING_DIR_SUFFIX = "-session-end-pending"
-_INTENT_VERSION = 2
-_SUPPORTED_INTENT_VERSIONS = (1, 2)
+_INTENT_VERSION = 3
+_SUPPORTED_INTENT_VERSIONS = (1, 2, 3)
 
 
 # Upper bound for any single durability fsync on the session-end path.
@@ -97,10 +97,17 @@ def build_session_end_intent(
     frontier_store_id: int,
     messages: list[Dict[str, Any]],
     ingest_cursor: int = 0,
+    represented_prefix_fingerprints: list[str] | None = None,
 ) -> Dict[str, Any]:
     cursor = int(ingest_cursor or 0)
     if cursor < 0 or cursor > len(messages):
         raise ValueError("pending session-end ingest cursor is out of range")
+    message_fingerprints = session_end_message_fingerprints(messages)
+    represented_fingerprints = list(represented_prefix_fingerprints or [])
+    if represented_fingerprints != message_fingerprints[: len(represented_fingerprints)]:
+        raise ValueError("pending session-end represented prefix fingerprints mismatch")
+    if len(represented_fingerprints) > cursor:
+        raise ValueError("pending session-end represented prefix exceeds ingest cursor")
     identity = {
         "version": _INTENT_VERSION,
         "session_id": str(session_id),
@@ -109,7 +116,8 @@ def build_session_end_intent(
         "frontier_store_id": int(frontier_store_id or 0),
         "messages": messages,
         "ingest_cursor": cursor,
-        "message_fingerprints": session_end_message_fingerprints(messages),
+        "message_fingerprints": message_fingerprints,
+        "represented_prefix_fingerprints": represented_fingerprints,
     }
     digest = hashlib.sha256(_canonical_payload(identity)).hexdigest()
     return {**identity, "intent_sha256": digest, "created_at": time.time()}
@@ -172,6 +180,8 @@ def load_session_end_intent(path: Path) -> Dict[str, Any]:
     ]
     if version >= 2:
         identity_keys.extend(("ingest_cursor", "message_fingerprints"))
+    if version >= 3:
+        identity_keys.append("represented_prefix_fingerprints")
     identity = {key: payload.get(key) for key in identity_keys}
     expected = hashlib.sha256(_canonical_payload(identity)).hexdigest()
     if not supplied or supplied != expected:
@@ -187,6 +197,18 @@ def load_session_end_intent(path: Path) -> Dict[str, Any]:
         fingerprints = payload.get("message_fingerprints")
         if fingerprints != session_end_message_fingerprints(payload["messages"]):
             raise ValueError("pending session-end message fingerprints mismatch")
+    if version >= 3:
+        represented_fingerprints = payload.get("represented_prefix_fingerprints")
+        if not isinstance(represented_fingerprints, list) or not all(
+            isinstance(item, str) for item in represented_fingerprints
+        ):
+            raise ValueError(
+                "pending session-end represented prefix fingerprints must be a list of strings"
+            )
+        if represented_fingerprints != payload["message_fingerprints"][: len(represented_fingerprints)]:
+            raise ValueError("pending session-end represented prefix fingerprints mismatch")
+        if len(represented_fingerprints) > payload["ingest_cursor"]:
+            raise ValueError("pending session-end represented prefix exceeds ingest cursor")
     return payload
 
 
