@@ -79,6 +79,29 @@ def test_persisted_intent_rejects_changed_active_replay_prefix(tmp_path):
     assert loaded["represented_prefix_fingerprints"] == []
 
 
+def test_bypassed_compaction_does_not_record_an_unstored_represented_prefix(tmp_path):
+    engine = LCMEngine(
+        config=LCMConfig(
+            database_path=str(tmp_path / "bypassed-represented-prefix.db"),
+            ignore_session_patterns=["ignored:*"],
+        )
+    )
+    messages = [
+        {"role": "system", "content": "system"},
+        {"role": "user", "content": "ignored session turn"},
+    ]
+    try:
+        engine.on_session_start("ignored:session", platform="cli", context_length=1_000)
+        engine.threshold_tokens = 100_000
+        engine._ingest_cursor = len(messages)
+
+        assert engine.compress(messages, current_tokens=1) == messages
+        assert engine._store.get_session_count("ignored:session") == 0
+        assert not engine._session_end_represented_prefix_fingerprints
+    finally:
+        engine.shutdown()
+
+
 def test_loader_preserves_legacy_v1_digest_contract(tmp_path):
     identity = {
         "version": 1,

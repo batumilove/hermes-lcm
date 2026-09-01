@@ -374,8 +374,15 @@ class CompactionMixin:
             record_represented_prefix = getattr(
                 self, "_record_session_end_represented_prefix", None
             )
+            bypasses_lcm_context_management = getattr(
+                self, "_bypasses_lcm_context_management", None
+            )
             if (
                 callable(record_represented_prefix)
+                and not (
+                    callable(bypasses_lcm_context_management)
+                    and bypasses_lcm_context_management()
+                )
                 and not getattr(self, "_ingest_cursor_needs_reconcile", False)
                 and getattr(self, "_ingest_cursor", -1) == len(result)
             ):
