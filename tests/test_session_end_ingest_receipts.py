@@ -201,7 +201,7 @@ def test_engine_clamps_runtime_cursor_to_immutable_snapshot(tmp_path):
         engine.shutdown()
 
 
-def test_deferred_recovery_replays_only_uningested_cursor_suffix(tmp_path):
+def test_deferred_recovery_does_not_trust_unproven_cursor_prefix(tmp_path):
     engine = _engine(tmp_path, "cursor-replay")
     session_id = engine._session_id
     conversation_id = engine._conversation_id
@@ -228,6 +228,7 @@ def test_deferred_recovery_replays_only_uningested_cursor_suffix(tmp_path):
         persisted = engine._store.get_session_messages(session_id)
         assert [message.get("content") for message in persisted] == [
             "historical persisted row",
+            "compressed context not stored as a prefix",
             "final unpersisted turn",
         ]
         assert engine._store.has_session_end_ingest_receipt(digest)

@@ -31,6 +31,51 @@ from hermes_lcm.engine import LCMEngine
 
 
 @pytest.mark.parametrize("delivery_path", ["direct", "deferred"])
+def test_session_end_cursor_cannot_skip_an_unproven_durable_gap(
+    tmp_path,
+    delivery_path,
+):
+    """A process cursor is not proof that the corresponding rows are durable."""
+    config = LCMConfig(database_path=str(tmp_path / f"durable-gap-{delivery_path}.db"))
+    engine = LCMEngine(config=config)
+    session_id = "durable-gap-session"
+    conversation_id = "durable-gap-conversation"
+    engine.on_session_start(
+        session_id,
+        platform="telegram",
+        conversation_id=conversation_id,
+        context_length=200000,
+    )
+    messages = [
+        {"role": "user", "content": f"message {idx}"}
+        for idx in range(6)
+    ]
+    engine._ingest_messages(messages[:2])
+
+    # The active-context cursor can legitimately describe a different,
+    # compacted list. It must not be trusted as durable proof for this full
+    # session-end snapshot: only messages 0 and 1 exist in the store.
+    engine._ingest_cursor = 5
+    engine._ingest_cursor_needs_reconcile = False
+
+    if delivery_path == "direct":
+        engine.on_session_end(session_id, messages)
+    else:
+        pending = engine._persist_session_end_intent(
+            session_id,
+            messages,
+            ingest_cursor=engine._ingest_cursor,
+        )
+        engine._drain_one_session_end_intent(pending)
+
+    rows = engine._store.get_session_messages(session_id)
+    contents = [row["content"] for row in rows]
+    engine.shutdown()
+
+    assert contents == [f"message {idx}" for idx in range(6)]
+
+
+@pytest.mark.parametrize("delivery_path", ["direct", "deferred"])
 def test_full_snapshot_after_filtered_replay_does_not_reappend_durable_tool_ids(
     tmp_path,
     delivery_path,

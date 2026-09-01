@@ -3226,12 +3226,9 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
                 raise_on_error=True,
             )
             ingest_cursor = max(
-                int(intent["ingest_cursor"]),
                 receipt_prefix_count,
                 store_prefix_count if store_prefix_count is not None else 0,
             )
-            if current_session:
-                ingest_cursor = max(ingest_cursor, self._ingest_cursor)
             ingest_cursor = min(ingest_cursor, len(messages))
             suffix = messages[ingest_cursor:]
             if suffix:
@@ -4901,7 +4898,6 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
                 raise_on_error=True,
             )
             self._ingest_cursor = max(
-                self._ingest_cursor,
                 receipt_prefix_count,
                 store_prefix_count if store_prefix_count is not None else 0,
             )
