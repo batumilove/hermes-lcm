@@ -365,12 +365,29 @@ class CompactionMixin:
                  force: bool = False) -> List[Dict[str, Any]]:
         """Run compaction and leave a terminal public status on every failure."""
         try:
-            return self._compress_impl(
+            result = self._compress_impl(
                 messages,
                 current_tokens=current_tokens,
                 focus_topic=focus_topic,
                 force=force,
             )
+            record_represented_prefix = getattr(
+                self, "_record_session_end_represented_prefix", None
+            )
+            bypasses_lcm_context_management = getattr(
+                self, "_bypasses_lcm_context_management", None
+            )
+            if (
+                callable(record_represented_prefix)
+                and not (
+                    callable(bypasses_lcm_context_management)
+                    and bypasses_lcm_context_management()
+                )
+                and not getattr(self, "_ingest_cursor_needs_reconcile", False)
+                and getattr(self, "_ingest_cursor", -1) == len(result)
+            ):
+                record_represented_prefix(result)
+            return result
         except BaseException as exc:
             if _is_sqlite_locked_error(exc):
                 self._last_compression_status = "deferred"
