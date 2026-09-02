@@ -170,3 +170,83 @@ def test_session_end_tool_identity_lookup_does_not_page_full_store(tmp_path, mon
     engine.shutdown()
 
     assert replayed == {0, 1}
+
+
+@pytest.mark.parametrize("delivery_path", ["direct", "deferred"])
+def test_session_end_recognizes_durable_object_form_assistant_tool_call(
+    tmp_path,
+    delivery_path,
+):
+    session_id = "object-form-assistant-tool-call-replay"
+    conversation_id = "agent:main:telegram:dm:object-tool-call"
+    config = LCMConfig(database_path=str(tmp_path / "object-tool-call.db"))
+    call_id = "call_object_already_durable"
+    assistant = {
+        "role": "assistant",
+        "content": "",
+        "tool_calls": {
+            "id": call_id,
+            "type": "function",
+            "function": {"name": "inspect", "arguments": "{}"},
+        },
+    }
+
+    seed = LCMEngine(config=config)
+    seed.on_session_start(
+        session_id,
+        platform="telegram",
+        conversation_id=conversation_id,
+        context_length=200000,
+    )
+    seed._store.append_batch(
+        session_id,
+        [assistant],
+        source="telegram",
+        conversation_id=conversation_id,
+    )
+    seed.shutdown()
+
+    after = LCMEngine(config=config)
+    after.on_session_start(
+        session_id,
+        platform="telegram",
+        conversation_id=conversation_id,
+        context_length=200000,
+    )
+    incoming = [
+        assistant,
+        {
+            "role": "tool",
+            "tool_call_id": call_id,
+            "tool_name": "inspect",
+            "content": "new result",
+        },
+        {"role": "user", "content": "new suffix"},
+    ]
+    if delivery_path == "direct":
+        after.on_session_end(session_id, incoming)
+    else:
+        pending = after._persist_session_end_intent(
+            session_id,
+            incoming,
+            ingest_cursor=0,
+        )
+        after._drain_one_session_end_intent(pending)
+
+    rows = after._store.get_session_messages(session_id)
+    object_call_rows = [
+        row
+        for row in rows
+        if row.get("role") == "assistant"
+        and isinstance(row.get("tool_calls"), dict)
+        and row["tool_calls"].get("id") == call_id
+    ]
+    result_rows = [
+        row
+        for row in rows
+        if row.get("role") == "tool" and row.get("tool_call_id") == call_id
+    ]
+    after.shutdown()
+
+    assert len(object_call_rows) == 1
+    assert len(result_rows) == 1

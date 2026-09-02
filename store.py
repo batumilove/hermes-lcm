@@ -699,7 +699,13 @@ class MessageStore:
                        )
                     FROM messages m
                     JOIN json_each(
-                        CASE WHEN json_valid(m.tool_calls) THEN m.tool_calls ELSE '[]' END
+                        CASE
+                            WHEN NOT json_valid(m.tool_calls) THEN '[]'
+                            WHEN json_type(m.tool_calls) = 'array' THEN m.tool_calls
+                            WHEN json_type(m.tool_calls) = 'object'
+                                THEN json_array(json(m.tool_calls))
+                            ELSE '[]'
+                        END
                     ) AS tool_call
                     WHERE {' AND '.join(common_where)}
                       AND m.role = 'assistant'
