@@ -650,6 +650,75 @@ class MessageStore:
         ).fetchall()
         return [self._row_to_dict(r) for r in rows]
 
+    def find_durable_tool_call_ids(
+        self,
+        session_id: str,
+        call_ids: set[str],
+        *,
+        conversation_id: str | None = None,
+    ) -> tuple[set[str], set[str]]:
+        """Return matching durable result and assistant tool-call IDs.
+
+        Queries are bounded to identities present in the incoming session-end
+        payload instead of materializing and decoding every durable message.
+        """
+        normalized_ids = sorted({str(call_id).strip() for call_id in call_ids if str(call_id).strip()})
+        if not normalized_ids:
+            return set(), set()
+        assert self._conn is not None
+
+        conversation_clause, conversation_args = _conversation_filter_clause(
+            "m.conversation_id",
+            conversation_id,
+        )
+        common_where = ["m.session_id = ?"]
+        common_args: list[Any] = [session_id]
+        if conversation_clause:
+            common_where.append(conversation_clause)
+            common_args.extend(conversation_args)
+
+        durable_result_ids: set[str] = set()
+        durable_assistant_ids: set[str] = set()
+        for offset in range(0, len(normalized_ids), 900):
+            chunk = normalized_ids[offset : offset + 900]
+            placeholders = ",".join("?" for _ in chunk)
+            result_rows = self._conn.execute(
+                f"""SELECT DISTINCT m.tool_call_id
+                    FROM messages m
+                    WHERE {' AND '.join(common_where)}
+                      AND m.role = 'tool'
+                      AND m.tool_call_id IN ({placeholders})""",
+                [*common_args, *chunk],
+            ).fetchall()
+            durable_result_ids.update(str(row[0]).strip() for row in result_rows if row[0])
+
+            assistant_rows = self._conn.execute(
+                f"""SELECT DISTINCT COALESCE(
+                           json_extract(tool_call.value, '$.id'),
+                           json_extract(tool_call.value, '$.tool_call_id')
+                       )
+                    FROM messages m
+                    JOIN json_each(
+                        CASE
+                            WHEN NOT json_valid(m.tool_calls) THEN '[]'
+                            WHEN json_type(m.tool_calls) = 'array' THEN m.tool_calls
+                            WHEN json_type(m.tool_calls) = 'object'
+                                THEN json_array(json(m.tool_calls))
+                            ELSE '[]'
+                        END
+                    ) AS tool_call
+                    WHERE {' AND '.join(common_where)}
+                      AND m.role = 'assistant'
+                      AND COALESCE(
+                          json_extract(tool_call.value, '$.id'),
+                          json_extract(tool_call.value, '$.tool_call_id')
+                      ) IN ({placeholders})""",
+                [*common_args, *chunk],
+            ).fetchall()
+            durable_assistant_ids.update(str(row[0]).strip() for row in assistant_rows if row[0])
+
+        return durable_result_ids, durable_assistant_ids
+
     def _session_load_where(
         self,
         session_id: str,

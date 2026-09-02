@@ -3076,6 +3076,109 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
             messages,
         )
 
+    @staticmethod
+    def _session_end_assistant_tool_call_ids(message: Dict[str, Any]) -> set[str]:
+        tool_calls = (message or {}).get("tool_calls") or []
+        if isinstance(tool_calls, str):
+            try:
+                tool_calls = json.loads(tool_calls)
+            except (TypeError, ValueError, json.JSONDecodeError):
+                return set()
+        if isinstance(tool_calls, dict):
+            tool_calls = [tool_calls]
+        if not isinstance(tool_calls, list):
+            return set()
+        return {
+            str(value).strip()
+            for tool_call in tool_calls
+            if isinstance(tool_call, dict)
+            for value in [tool_call.get("id") or tool_call.get("tool_call_id")]
+            if value and str(value).strip()
+        }
+
+    def _session_end_tool_replay_plan(
+        self,
+        session_id: str,
+        messages: List[Dict[str, Any]],
+        *,
+        conversation_id: str,
+    ) -> tuple[set[int], dict[int, Dict[str, Any]]]:
+        """Find durable tool identities and trim partial assistant replays.
+
+        A contaminated store may contain older partial/full replay bursts before
+        the canonical transcript, so a leading-prefix comparison cannot prove
+        durability. Tool call IDs are stronger: the host must not execute a new
+        call with an ID already durable for the same session/conversation.
+        """
+        incoming_ids: set[str] = set()
+        for message in messages:
+            role = str((message or {}).get("role") or "")
+            if role == "tool":
+                call_id = str((message or {}).get("tool_call_id") or "").strip()
+                if call_id:
+                    incoming_ids.add(call_id)
+            elif role == "assistant":
+                incoming_ids.update(self._session_end_assistant_tool_call_ids(message))
+        stored_result_ids, stored_assistant_ids = self._store.find_durable_tool_call_ids(
+            session_id,
+            incoming_ids,
+            conversation_id=conversation_id,
+        )
+
+        replayed: set[int] = set()
+        rewritten: dict[int, Dict[str, Any]] = {}
+        for index, message in enumerate(messages):
+            role = str((message or {}).get("role") or "")
+            if role == "tool":
+                call_id = str((message or {}).get("tool_call_id") or "").strip()
+                if call_id and call_id in stored_result_ids:
+                    replayed.add(index)
+            elif role == "assistant":
+                call_ids = self._session_end_assistant_tool_call_ids(message)
+                if call_ids and call_ids.issubset(stored_assistant_ids):
+                    replayed.add(index)
+                elif call_ids & stored_assistant_ids:
+                    tool_calls = (message or {}).get("tool_calls") or []
+                    if isinstance(tool_calls, str):
+                        try:
+                            tool_calls = json.loads(tool_calls)
+                        except (TypeError, ValueError, json.JSONDecodeError):
+                            tool_calls = []
+                    if isinstance(tool_calls, dict):
+                        tool_calls = [tool_calls]
+                    if isinstance(tool_calls, list):
+                        kept_calls = [
+                            tool_call
+                            for tool_call in tool_calls
+                            if not (
+                                isinstance(tool_call, dict)
+                                and str(
+                                    tool_call.get("id")
+                                    or tool_call.get("tool_call_id")
+                                    or ""
+                                ).strip()
+                                in stored_assistant_ids
+                            )
+                        ]
+                        replacement = dict(message)
+                        replacement["tool_calls"] = kept_calls
+                        rewritten[index] = replacement
+        return replayed, rewritten
+
+    def _session_end_replayed_tool_indexes(
+        self,
+        session_id: str,
+        messages: List[Dict[str, Any]],
+        *,
+        conversation_id: str,
+    ) -> set[int]:
+        replayed, _ = self._session_end_tool_replay_plan(
+            session_id,
+            messages,
+            conversation_id=conversation_id,
+        )
+        return replayed
+
     def _append_off_current_session_end_suffix(
         self,
         session_id: str,
@@ -3088,8 +3191,16 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
     ) -> list[int]:
         if not session_id or not suffix:
             return []
+        replayed_tool_indexes, rewritten_tool_messages = self._session_end_tool_replay_plan(
+            session_id,
+            suffix,
+            conversation_id=conversation_id,
+        )
         kept: list[Dict[str, Any]] = []
-        for msg in suffix:
+        for index, msg in enumerate(suffix):
+            if index in replayed_tool_indexes:
+                continue
+            msg = rewritten_tool_messages.get(index, msg)
             if self._matches_ignore_message_patterns(msg):
                 self._ignored_message_count += 1
                 excerpt = (text_content_for_pattern_matching(msg.get("content")) or "")[:80].replace("\n", " ")
@@ -4999,6 +5110,18 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
             self._ingest_cursor_needs_reconcile = False
         cursor = min(max(self._ingest_cursor, 0), n)
         tool_anchored_replay_indexes: set[int] = set()
+        if session_end_intent_sha256:
+            (
+                durable_replay_indexes,
+                rewritten_tool_messages,
+            ) = self._session_end_tool_replay_plan(
+                self._session_id,
+                messages,
+                conversation_id=self._conversation_id,
+            )
+            tool_anchored_replay_indexes.update(durable_replay_indexes)
+            for index, replacement in rewritten_tool_messages.items():
+                replay_messages[index] = replacement
         scan_tool_anchored_replay = bool(reconciled_ingest_cursor)
         if cursor > 0:
             cached_source_identities = getattr(self, "_last_active_replay_source_identities", None)
@@ -5035,10 +5158,10 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
                 replay_messages[replay_scan_start:],
                 suppress_tool_less_duplicates=bool(reconciled_ingest_cursor),
             )
-            tool_anchored_replay_indexes = {
+            tool_anchored_replay_indexes.update(
                 replay_scan_start + idx for idx in scanned_replay_indexes
-            }
-            if tool_anchored_replay_indexes:
+            )
+            if scanned_replay_indexes:
                 if not reconciled_ingest_cursor:
                     cursor = 0
                     self._ingest_cursor = 0
