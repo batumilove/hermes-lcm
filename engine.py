@@ -5059,6 +5059,17 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
             )
         cursor = min(max(self._ingest_cursor, 0), n)
         scan_start = 0 if self._ingest_cursor_needs_reconcile else cursor
+        # Capture exact persisted-output provenance before active replay
+        # preparation can recover/externalize content or merge marker metadata.
+        final_form_replay_absolute_indexes = {
+            index
+            for index in range(scan_start, n)
+            if str(messages[index].get("role") or "") == "tool"
+            and _is_hermes_persisted_output_marker(
+                normalize_content_value(messages[index].get("content")) or ""
+            )
+            and self._has_durable_persisted_output_replay_identity(messages[index])
+        }
         ignored_original_messages = [False] * n
         if self._compiled_ignore_message_patterns:
             previous_store_id_map = self._current_compress_store_ids_by_message_id
@@ -5512,12 +5523,50 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
             overflow_recovery_pending=overflow_recovery_pending,
             session_end=bool(session_end_intent_sha256),
         )
+        final_form_replay_candidates = {
+            index
+            for index, (absolute_idx, _message) in enumerate(messages_to_store_with_index)
+            if absolute_idx in final_form_replay_absolute_indexes
+        }
         protected_messages = protect_messages_for_ingest(
             [msg for _idx, msg in messages_to_store_with_index],
             session_id=self._session_id,
             config=self._config,
             hermes_home=self._hermes_home,
         )
+        # Persisted-output recovery and large-result externalization can make a
+        # replay identity exact only after ingest protection. Recheck that final
+        # storage form by durable tool-call key so a restart/rebind miss cannot
+        # reinsert an old tool result; changed-content reuse and tool-less rows
+        # remain eligible for storage.
+        if not session_end_intent_sha256 and final_form_replay_candidates:
+            protected_replay_indexes, protected_replay_scan_count = (
+                self._find_tool_anchored_replay_indexes(
+                    protected_messages,
+                    durable_key_lookup=True,
+                )
+            )
+            protected_replay_indexes.intersection_update(final_form_replay_candidates)
+            if protected_replay_indexes:
+                messages_to_store_with_index = [
+                    pair
+                    for index, pair in enumerate(messages_to_store_with_index)
+                    if index not in protected_replay_indexes
+                ]
+                protected_messages = [
+                    message
+                    for index, message in enumerate(protected_messages)
+                    if index not in protected_replay_indexes
+                ]
+                self._record_ingest_reconciliation(
+                    action="filtered replay",
+                    reason="replayed durable tool identity after ingest protection",
+                    cursor=cursor,
+                    incoming=n,
+                    session_count=self._store.get_session_count(self._session_id),
+                    stored_tail_count=protected_replay_scan_count,
+                    effective_incoming=len(protected_messages),
+                )
         recovery_tool_call_ids = self._active_replay_recovery_tool_call_ids(
             active_replay_messages
         )
