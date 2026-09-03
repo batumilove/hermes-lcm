@@ -534,6 +534,7 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
         self._pending_reset_conversation_id: str = ""
         self._pending_reset_frontier_store_id: int = 0
         self._compression_boundary_ingest_pending = False
+        self._overflow_recovery_ingest_pending = False
         self._compression_boundary_active_placeholder_digest_budget: dict[str, int] = {}
         self._compression_boundary_active_placeholder_digest_ordinals: dict[str, set[int]] = {}
         self._compression_boundary_stored_placeholder_digest_counts: dict[str, int] = {}
@@ -777,6 +778,7 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
         self._session_stateless = False
         self._clear_pending_reset_boundary()
         self._compression_boundary_ingest_pending = False
+        self._overflow_recovery_ingest_pending = False
         self._compression_boundary_active_placeholder_digest_budget = {}
         self._compression_boundary_active_placeholder_digest_ordinals = {}
         self._compression_boundary_stored_placeholder_digest_counts = {}
@@ -3077,7 +3079,7 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
         )
 
     @staticmethod
-    def _session_end_assistant_tool_call_ids(message: Dict[str, Any]) -> set[str]:
+    def _assistant_tool_call_ids(message: Dict[str, Any]) -> set[str]:
         tool_calls = (message or {}).get("tool_calls") or []
         if isinstance(tool_calls, str):
             try:
@@ -3106,9 +3108,11 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
         """Find durable tool identities and trim partial assistant replays.
 
         A contaminated store may contain older partial/full replay bursts before
-        the canonical transcript, so a leading-prefix comparison cannot prove
-        durability. Tool call IDs are stronger: the host must not execute a new
-        call with an ID already durable for the same session/conversation.
+        the canonical transcript, so a bounded tail or leading-prefix comparison
+        cannot prove durability. Tool call IDs are stronger: the host must not
+        execute a new call with an ID already durable for the same
+        session/conversation. This supports both session-end delivery and the
+        first ordinary ingest after forced overflow recovery.
         """
         incoming_ids: set[str] = set()
         for message in messages:
@@ -3118,7 +3122,7 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
                 if call_id:
                     incoming_ids.add(call_id)
             elif role == "assistant":
-                incoming_ids.update(self._session_end_assistant_tool_call_ids(message))
+                incoming_ids.update(self._assistant_tool_call_ids(message))
         stored_result_ids, stored_assistant_ids = self._store.find_durable_tool_call_ids(
             session_id,
             incoming_ids,
@@ -3134,7 +3138,7 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
                 if call_id and call_id in stored_result_ids:
                     replayed.add(index)
             elif role == "assistant":
-                call_ids = self._session_end_assistant_tool_call_ids(message)
+                call_ids = self._assistant_tool_call_ids(message)
                 if call_ids and call_ids.issubset(stored_assistant_ids):
                     replayed.add(index)
                 elif call_ids & stored_assistant_ids:
@@ -5109,6 +5113,9 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
             self._ingest_cursor = self._reconcile_ingest_cursor_from_store(reconcile_messages)
             self._ingest_cursor_needs_reconcile = False
         cursor = min(max(self._ingest_cursor, 0), n)
+        overflow_recovery_rebind = bool(
+            self._overflow_recovery_ingest_pending and cursor < n
+        )
         tool_anchored_replay_indexes: set[int] = set()
         # The post-turn hook can hand an already-bound runtime a process-local
         # cursor of zero while this session already has durable rows (for example
@@ -5225,6 +5232,8 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
                 )
             cached_replay = self._cached_active_replay_messages(messages)
             self._compression_boundary_ingest_pending = False
+            if session_end_intent_sha256 or overflow_recovery_rebind:
+                self._overflow_recovery_ingest_pending = False
             self._compression_boundary_active_placeholder_digest_budget = {}
             self._compression_boundary_active_placeholder_digest_ordinals = {}
             self._compression_boundary_stored_placeholder_digest_counts = {}
@@ -5465,6 +5474,7 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
                 )
             self._ingest_cursor = n
             self._compression_boundary_ingest_pending = False
+            self._overflow_recovery_ingest_pending = False
             self._compression_boundary_active_placeholder_digest_budget = {}
             self._compression_boundary_active_placeholder_digest_ordinals = {}
             self._compression_boundary_stored_placeholder_digest_counts = {}
@@ -5523,6 +5533,7 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
         # (maintainer #388 P1).
         self._ingest_cursor = n
         self._compression_boundary_ingest_pending = False
+        self._overflow_recovery_ingest_pending = False
         self._compression_boundary_active_placeholder_digest_budget = {}
         self._compression_boundary_active_placeholder_digest_ordinals = {}
         self._compression_boundary_stored_placeholder_digest_counts = {}
@@ -6700,6 +6711,7 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
             self._last_compression_noop_reason = ""
             self._ingest_cursor = len(compressed)
             self._ingest_cursor_needs_reconcile = False
+            self._overflow_recovery_ingest_pending = True
             logger.info(
                 "LCM assembly guardrail recovery: %d messages → %d (no new summary node)",
                 len(original_messages),
