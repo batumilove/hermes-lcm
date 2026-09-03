@@ -863,6 +863,8 @@ class ReconcileMixin:
         messages: List[Dict[str, Any]],
         *,
         suppress_tool_less_duplicates: bool = False,
+        durable_key_lookup: bool = False,
+        preignored_indexes: set[int] | None = None,
     ) -> tuple[set[int], int]:
         """Find stable tool rows replayed after a changed active-context prefix.
 
@@ -883,7 +885,11 @@ class ReconcileMixin:
             (raw_index, msg)
             for raw_index, msg in enumerate(messages)
             if not self._is_replayed_context_scaffold_message(msg)
-            and not self._matches_ignore_message_patterns(msg)
+            and (
+                raw_index not in preignored_indexes
+                if preignored_indexes is not None
+                else not self._matches_ignore_message_patterns(msg)
+            )
         ]
         incoming_tool_offsets = [
             offset
@@ -894,11 +900,24 @@ class ReconcileMixin:
         if not incoming_tool_offsets:
             return set(), 0
 
-        scan_limit = min(max(len(visible_messages) * 4, 256), 4096)
-        scanned_rows = self._store.get_session_tail(
-            self._session_id,
-            limit=scan_limit,
-        )
+        if durable_key_lookup:
+            incoming_call_ids = {
+                str(msg.get("tool_call_id") or "").strip()
+                for offset in incoming_tool_offsets
+                for _raw_index, msg in [visible_messages[offset]]
+                if str(msg.get("tool_call_id") or "").strip()
+            }
+            scanned_rows = self._store.get_tool_call_replay_neighborhoods(
+                self._session_id,
+                incoming_call_ids,
+                conversation_id=getattr(self, "_conversation_id", None),
+            )
+        else:
+            scan_limit = min(max(len(visible_messages) * 4, 256), 4096)
+            scanned_rows = self._store.get_session_tail(
+                self._session_id,
+                limit=scan_limit,
+            )
         scanned_row_count = len(scanned_rows)
         stored_rows = [
             row

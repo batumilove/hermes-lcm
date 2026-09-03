@@ -5110,18 +5110,50 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
             self._ingest_cursor_needs_reconcile = False
         cursor = min(max(self._ingest_cursor, 0), n)
         tool_anchored_replay_indexes: set[int] = set()
-        if session_end_intent_sha256:
-            (
-                durable_replay_indexes,
-                rewritten_tool_messages,
-            ) = self._session_end_tool_replay_plan(
-                self._session_id,
-                messages,
-                conversation_id=self._conversation_id,
+        # The post-turn hook can hand an already-bound runtime a process-local
+        # cursor of zero while this session already has durable rows (for example
+        # after a runtime clone/rebind).  Do not depend on bounded tail proximity:
+        # use incoming tool-call IDs to fetch a bounded durable candidate set,
+        # then suppress only full-identity assistant/tool matches. Reused call IDs
+        # with changed arguments or results and every tool-less row remain new.
+        if cursor < n:
+            if session_end_intent_sha256:
+                (
+                    durable_replay_indexes,
+                    rewritten_tool_messages,
+                ) = self._session_end_tool_replay_plan(
+                    self._session_id,
+                    messages[cursor:],
+                    conversation_id=self._conversation_id,
+                )
+                for index, replacement in rewritten_tool_messages.items():
+                    replay_messages[cursor + index] = replacement
+            else:
+                candidate_messages = replay_messages[cursor:]
+                relative_ignored_indexes = {
+                    index
+                    for index in range(len(candidate_messages))
+                    if ignored_original_messages[cursor + index]
+                }
+                if any(
+                    index not in relative_ignored_indexes
+                    and str(message.get("role") or "") == "tool"
+                    and bool(str(message.get("tool_call_id") or "").strip())
+                    for index, message in enumerate(candidate_messages)
+                ):
+                    (
+                        durable_replay_indexes,
+                        _durable_replay_scan_count,
+                    ) = self._find_tool_anchored_replay_indexes(
+                        candidate_messages,
+                        durable_key_lookup=True,
+                        preignored_indexes=relative_ignored_indexes,
+                    )
+                else:
+                    durable_replay_indexes = set()
+            tool_anchored_replay_indexes.update(
+                cursor + index for index in durable_replay_indexes
             )
-            tool_anchored_replay_indexes.update(durable_replay_indexes)
-            for index, replacement in rewritten_tool_messages.items():
-                replay_messages[index] = replacement
         scan_tool_anchored_replay = bool(reconciled_ingest_cursor)
         if cursor > 0:
             cached_source_identities = getattr(self, "_last_active_replay_source_identities", None)

@@ -719,6 +719,75 @@ class MessageStore:
 
         return durable_result_ids, durable_assistant_ids
 
+    def get_tool_call_replay_neighborhoods(
+        self,
+        session_id: str,
+        call_ids: set[str],
+        *,
+        conversation_id: str | None = None,
+    ) -> List[Dict[str, Any]]:
+        """Return durable tool rows for ``call_ids`` and their predecessors.
+
+        The result is bounded by incoming tool-call identities rather than tail
+        proximity.  Returning the immediately preceding durable row lets replay
+        reconciliation prove the assistant/tool pair by full message identity;
+        a reused call ID with changed arguments or result content stays new.
+        """
+        normalized_ids = sorted(
+            {str(call_id).strip() for call_id in call_ids if str(call_id).strip()}
+        )
+        if not normalized_ids:
+            return []
+        assert self._conn is not None
+
+        conversation_clause, conversation_args = _conversation_filter_clause(
+            "m.conversation_id",
+            conversation_id,
+        )
+        previous_conversation_clause, previous_conversation_args = (
+            _conversation_filter_clause("previous.conversation_id", conversation_id)
+        )
+        common_where = ["m.session_id = ?"]
+        common_args: list[Any] = [session_id]
+        if conversation_clause:
+            common_where.append(conversation_clause)
+            common_args.extend(conversation_args)
+        previous_where = [
+            "previous.session_id = m.session_id",
+            "previous.store_id < m.store_id",
+        ]
+        if previous_conversation_clause:
+            previous_where.append(previous_conversation_clause)
+
+        wanted_store_ids: set[int] = set()
+        for offset in range(0, len(normalized_ids), 900):
+            chunk = normalized_ids[offset : offset + 900]
+            placeholders = ",".join("?" for _ in chunk)
+            rows = self._conn.execute(
+                f"""SELECT m.store_id,
+                            (SELECT MAX(previous.store_id)
+                               FROM messages previous
+                              WHERE {' AND '.join(previous_where)}) AS previous_store_id
+                       FROM messages m
+                      WHERE {' AND '.join(common_where)}
+                        AND m.role = 'tool'
+                        AND m.tool_call_id IN ({placeholders})""",
+                [
+                    *previous_conversation_args,
+                    *common_args,
+                    *chunk,
+                ],
+            ).fetchall()
+            for row in rows:
+                wanted_store_ids.add(int(row[0]))
+                if row[1] is not None:
+                    wanted_store_ids.add(int(row[1]))
+
+        if not wanted_store_ids:
+            return []
+        messages = self.get_batch(sorted(wanted_store_ids))
+        return [messages[store_id] for store_id in sorted(messages)]
+
     def _session_load_where(
         self,
         session_id: str,
