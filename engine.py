@@ -5202,6 +5202,25 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
             )
             if scanned_replay_indexes:
                 if not reconciled_ingest_cursor:
+                    # The changed-prefix tail scan can turn rows before the old
+                    # cursor into storage candidates by rewinding to zero.  The
+                    # first durable-key pass covered only messages[cursor:], so
+                    # rescan the newly exposed prefix by durable tool-call key;
+                    # a bounded tail lookup may not reach old externalized rows.
+                    prefix_messages = replay_messages[:cursor]
+                    if any(
+                        str(message.get("role") or "") == "tool"
+                        and bool(str(message.get("tool_call_id") or "").strip())
+                        for message in prefix_messages
+                    ):
+                        (
+                            prefix_replay_indexes,
+                            _prefix_replay_scan_count,
+                        ) = self._find_tool_anchored_replay_indexes(
+                            prefix_messages,
+                            durable_key_lookup=True,
+                        )
+                        tool_anchored_replay_indexes.update(prefix_replay_indexes)
                     cursor = 0
                     self._ingest_cursor = 0
                 session_count = self._store.get_session_count(self._session_id)
