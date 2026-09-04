@@ -5503,6 +5503,53 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
             self._clear_foreground_rebind_candidate_if_bound_session_confirmed()
             return self._remember_active_replay_messages(messages, active_replay_messages)
 
+        final_form_replay_candidate_indexes: set[int] = set()
+        if reconciled_ingest_cursor:
+            for relative_index, (absolute_index, message) in enumerate(messages_to_store_with_index):
+                call_id = str(message.get("tool_call_id") or "").strip()
+                if str(message.get("role") or "") != "tool" or not call_id:
+                    continue
+                has_adjacent_new_call = False
+                if relative_index > 0:
+                    previous_absolute_index, previous_message = messages_to_store_with_index[
+                        relative_index - 1
+                    ]
+                    has_adjacent_new_call = (
+                        previous_absolute_index == absolute_index - 1
+                        and str(previous_message.get("role") or "") == "assistant"
+                        and call_id in self._assistant_tool_call_ids(previous_message)
+                    )
+                if not has_adjacent_new_call:
+                    if self._has_durable_persisted_output_replay_identity(message):
+                        final_form_replay_candidate_indexes.add(relative_index)
+
+        if final_form_replay_candidate_indexes:
+            messages_to_store_with_index = [
+                item
+                for index, item in enumerate(messages_to_store_with_index)
+                if index not in final_form_replay_candidate_indexes
+            ]
+            session_count = self._store.get_session_count(self._session_id)
+            self._record_ingest_reconciliation(
+                action="filtered replay",
+                reason="replayed unanchored durable persisted-output identity",
+                cursor=cursor,
+                incoming=n,
+                session_count=session_count,
+                stored_tail_count=session_count,
+                effective_incoming=len(messages_to_store_with_index),
+            )
+
+        if not messages_to_store_with_index:
+            self._ingest_cursor = n
+            self._compression_boundary_ingest_pending = False
+            self._overflow_recovery_ingest_pending = False
+            self._compression_boundary_active_placeholder_digest_budget = {}
+            self._compression_boundary_active_placeholder_digest_ordinals = {}
+            self._compression_boundary_stored_placeholder_digest_counts = {}
+            self._clear_foreground_rebind_candidate_if_bound_session_confirmed()
+            return self._remember_active_replay_messages(messages, active_replay_messages)
+
         self._warn_if_duplicate_tool_admission(
             messages_to_store_with_index,
             incoming_count=n,

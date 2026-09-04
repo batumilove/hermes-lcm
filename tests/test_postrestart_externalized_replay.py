@@ -29,7 +29,7 @@ def _tool_result(call_id: str, content: str) -> dict:
     }
 
 
-def test_fresh_process_rebind_does_not_reexternalize_one_old_result(tmp_path):
+def test_fresh_process_rebind_does_not_reexternalize_one_old_result(tmp_path, monkeypatch):
     """A 77-row durable transcript plus one new user row stores only that row.
 
     This mirrors the observed production boundary: the fresh engine receives the
@@ -40,6 +40,10 @@ def test_fresh_process_rebind_does_not_reexternalize_one_old_result(tmp_path):
     session_id = "postrestart-full-transcript-rebind"
     conversation_id = "agent:main:telegram:dm:sanitized:thread"
     target_call_id = "call_old_large_result_near_end"
+    monkeypatch.setattr(
+        "hermes_lcm.ingest_protection.tempfile.gettempdir",
+        lambda: str(tmp_path),
+    )
     config = LCMConfig(
         database_path=str(tmp_path / "rebind.db"),
         large_output_externalization_enabled=True,
