@@ -1100,6 +1100,23 @@ class ReconcileMixin:
                     call_ids.add(str(value).strip())
             return call_ids
 
+        def is_orphan_recovery_result(msg: Dict[str, Any]) -> bool:
+            if str(msg.get("role") or "") != "tool":
+                return False
+            content = normalize_content_value(msg.get("content")) or ""
+            return content.lstrip().startswith("[Orphan recovery:")
+
+        durable_result_call_ids = {
+            str(row.get("tool_call_id") or "").strip()
+            for row in stored_rows
+            if str(row.get("role") or "") == "tool"
+            and str(row.get("tool_call_id") or "").strip()
+        }
+        durable_assistant_call_ids: set[str] = set()
+        for row in stored_rows:
+            if str(row.get("role") or "") == "assistant":
+                durable_assistant_call_ids.update(assistant_tool_call_ids(row))
+
         stored_tool_anchors: dict[tuple[str, str, str, str, str], list[int]] = {}
         for stored_offset, (stored_row, stored_identity) in enumerate(
             zip(stored_rows, stored_identities)
@@ -1170,6 +1187,32 @@ class ReconcileMixin:
                     and identities_match(incoming_identity, stored_identities[candidate])
                 ]
                 if len(unique_candidates) != 1:
+                    # A resumed Hermes session can replace an already-durable
+                    # result with an orphan-recovery placeholder. Its content
+                    # intentionally differs, so exact identity cannot prove
+                    # replay; the durable call ID plus the placeholder proves
+                    # that no new execution completed.
+                    call_id = str(incoming_tool.get("tool_call_id") or "").strip()
+                    if (
+                        call_id in durable_result_call_ids
+                        and is_orphan_recovery_result(incoming_tool)
+                    ):
+                        replayed_raw_indexes.add(incoming_raw_index)
+                        if incoming_anchor > 0:
+                            incoming_previous_raw, incoming_previous = visible_messages[
+                                incoming_anchor - 1
+                            ]
+                            previous_call_ids = assistant_tool_call_ids(incoming_previous)
+                            if (
+                                str(incoming_previous.get("role") or "") == "assistant"
+                                and call_id in previous_call_ids
+                                and previous_call_ids
+                                and previous_call_ids.issubset(
+                                    durable_assistant_call_ids
+                                )
+                            ):
+                                replayed_raw_indexes.add(incoming_previous_raw)
+                        continue
                     # Exact duplicate tool rows are still replay-safe to drop,
                     # but reusing a claimed durable occurrence must not create
                     # another anchor pair: that would turn singleton evidence
