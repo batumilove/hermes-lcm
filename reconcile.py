@@ -28,6 +28,7 @@ from .externalize import (
     extract_externalized_ref,
     externalized_tool_result_has_persisted_output_marker,
     find_externalized_tool_result_content_for_call,
+    is_externalized_placeholder,
     load_externalized_payload,
 )
 from .ingest_protection import (
@@ -360,7 +361,10 @@ class ReconcileMixin:
                 session_id=session_id,
             )
             tool_calls = self._restore_ingest_payload_placeholders_in_value(tool_calls, session_id=session_id)
-        ref = extract_externalized_ref(content)
+        # A raw tool result may quote an externalization marker as ordinary
+        # text. Only substitute sidecar content when the entire field is the
+        # compact placeholder; otherwise an embedded ref corrupts identity.
+        ref = extract_externalized_ref(content) if is_externalized_placeholder(content) else None
         if ref and "quarantined_assistant_output" not in content:
             payload = load_externalized_payload(
                 ref,

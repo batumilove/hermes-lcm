@@ -10,6 +10,7 @@ from collections import Counter
 
 from hermes_lcm.config import LCMConfig
 from hermes_lcm.engine import LCMEngine
+from hermes_lcm.externalize import maybe_externalize_tool_output
 
 
 def test_rebound_raw_large_tool_result_matches_durable_externalized_marker(tmp_path):
@@ -268,3 +269,87 @@ def test_new_engine_suppresses_sparse_resumed_snapshot_with_orphan_tools(tmp_pat
     assert all(tool_counts[call_id] == 1 for call_id in [exact_call_id, *orphan_call_ids]), evidence
     assert all(assistant_call_counts[call_id] == 1 for call_id in [exact_call_id, *orphan_call_ids]), evidence
     assert content_counts["genuinely new resumed request"] == 1, evidence
+
+
+def test_embedded_externalized_ref_does_not_replace_whole_replay_identity(tmp_path):
+    """An embedded ref is quoted output, not a whole-content placeholder.
+
+    Real execute_code output can contain an earlier externalization marker as
+    ordinary text.  Replay identity must compare that complete raw output with
+    the payload behind the durable *outer* marker.  Treating the embedded ref as
+    the identity for the entire message makes a resumed singleton look new and
+    appends a byte-identical duplicate.
+    """
+    session_id = "production-shaped-embedded-externalized-ref"
+    conversation_id = "agent:main:telegram:dm:sanitized:thread"
+    call_id = "call_sanitized_execute_code"
+    config = LCMConfig(
+        database_path=str(tmp_path / "embedded-ref-replay.db"),
+        large_output_externalization_enabled=True,
+        large_output_externalization_threshold_chars=256,
+        large_output_externalization_path=str(tmp_path / "externalized-embedded"),
+    )
+    inner = maybe_externalize_tool_output(
+        "inner payload that was quoted by a later tool " + ("x" * 4096),
+        tool_call_id="call_sanitized_inner",
+        session_id=session_id,
+        config=config,
+    )
+    assert inner is not None
+    raw_tool = {
+        "role": "tool",
+        "tool_call_id": call_id,
+        "tool_name": "execute_code",
+        "content": (
+            "wrapper output before the quoted marker\n"
+            + inner["placeholder"]
+            + "\nwrapper output after the quoted marker "
+            + ("y" * 512)
+        ),
+    }
+    initial = [
+        {"role": "user", "content": "original request"},
+        {
+            "role": "assistant",
+            "content": "",
+            "tool_calls": [
+                {"id": call_id, "type": "function", "function": {"name": "execute_code", "arguments": "{}"}}
+            ],
+        },
+        raw_tool,
+        {"role": "assistant", "content": "original completion"},
+    ]
+    first = LCMEngine(config=config)
+    first.on_session_start(
+        session_id,
+        platform="telegram",
+        conversation_id=conversation_id,
+        context_length=200000,
+    )
+    first._ingest_messages(initial)
+    first.shutdown()
+
+    resumed = LCMEngine(config=config)
+    resumed.on_session_start(
+        session_id,
+        platform="telegram",
+        conversation_id=conversation_id,
+        context_length=200000,
+    )
+    resumed._ingest_messages(
+        [dict(raw_tool), {"role": "user", "content": "genuinely new resumed suffix"}]
+    )
+    rows = resumed._store.get_session_messages(session_id)
+    tool_count = sum(1 for row in rows if row.get("tool_call_id") == call_id)
+    new_user_count = sum(
+        1 for row in rows if row.get("content") == "genuinely new resumed suffix"
+    )
+    evidence = {
+        "tool_count": tool_count,
+        "new_user_count": new_user_count,
+        "reconciliation": resumed._last_ingest_reconciliation,
+    }
+    resumed.shutdown()
+
+    assert tool_count == 1, evidence
+    assert new_user_count == 1, evidence
