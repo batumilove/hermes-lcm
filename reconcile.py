@@ -1118,6 +1118,7 @@ class ReconcileMixin:
 
         replayed_raw_indexes: set[int] = set()
         matched_tool_anchor_pairs: list[tuple[int, int]] = []
+        claimed_stored_tool_anchors: set[int] = set()
         # Align repeated identical anchors as an ordered durable subsequence.
         # Walking both sides newest-to-oldest keeps the latest-match bias for a
         # singleton replay without allowing multiple incoming anchors to bind
@@ -1156,7 +1157,8 @@ class ReconcileMixin:
             matching_candidates = [
                 stored_anchor
                 for stored_anchor in reversed(candidates)
-                if stored_anchor < stored_anchor_ceiling
+                if stored_anchor not in claimed_stored_tool_anchors
+                and stored_anchor < stored_anchor_ceiling
                 and identities_match(incoming_identity, stored_identities[stored_anchor])
             ]
             matched_out_of_order_unique = False
@@ -1164,9 +1166,44 @@ class ReconcileMixin:
                 unique_candidates = [
                     candidate
                     for candidate in candidates
-                    if identities_match(incoming_identity, stored_identities[candidate])
+                    if candidate not in claimed_stored_tool_anchors
+                    and identities_match(incoming_identity, stored_identities[candidate])
                 ]
                 if len(unique_candidates) != 1:
+                    # Exact duplicate tool rows are still replay-safe to drop,
+                    # but reusing a claimed durable occurrence must not create
+                    # another anchor pair: that would turn singleton evidence
+                    # into false multi-anchor proof across an unmatched gap.
+                    if candidates and not unique_candidates:
+                        replayed_raw_indexes.add(incoming_raw_index)
+                        if len(candidates) == 1:
+                            claimed_anchor = candidates[0]
+                            for pair_index, (
+                                paired_incoming,
+                                paired_stored,
+                            ) in enumerate(matched_tool_anchor_pairs):
+                                if (
+                                    paired_stored == claimed_anchor
+                                    and incoming_anchor < paired_incoming
+                                ):
+                                    # Keep singleton proof at the oldest replay
+                                    # occurrence. A later duplicate remains
+                                    # suppressible as a tool row, but cannot
+                                    # move the boundary past an unmatched gap.
+                                    matched_tool_anchor_pairs[pair_index] = (
+                                        incoming_anchor,
+                                        claimed_anchor,
+                                    )
+                                    break
+                        if incoming_anchor > 0:
+                            incoming_previous_raw, _ = visible_messages[
+                                incoming_anchor - 1
+                            ]
+                            if any(
+                                previous_assistant_matches(candidate)
+                                for candidate in candidates
+                            ):
+                                replayed_raw_indexes.add(incoming_previous_raw)
                     continue
                 # A unique exact tool identity is safe even when a restarted
                 # snapshot wraps from the durable tail back to older context.
@@ -1184,6 +1221,7 @@ class ReconcileMixin:
             )
             if not matched_out_of_order_unique:
                 stored_anchor_ceiling = stored_anchor
+            claimed_stored_tool_anchors.add(stored_anchor)
             replayed_raw_indexes.add(incoming_raw_index)
             matched_tool_anchor_pairs.append((incoming_anchor, stored_anchor))
             call_id = str(incoming_tool.get("tool_call_id") or "").strip()
