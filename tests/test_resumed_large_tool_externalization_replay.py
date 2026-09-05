@@ -157,3 +157,114 @@ def test_cursor_rewind_rescans_pre_cursor_durable_tools_by_key(tmp_path):
     assert all(tool_counts[call_id] == 1 for call_id in old_call_ids), evidence
     assert tool_counts[recent_call_id] == 1, evidence
     assert content_counts["genuinely new post-rewind suffix"] == 1, evidence
+
+
+def test_new_engine_suppresses_sparse_resumed_snapshot_with_orphan_tools(tmp_path):
+    """A fresh engine must not append old IDs from a sparse resume snapshot.
+
+    Hermes can resume a completed session with only selected interrupted tool
+    results rather than the original assistant multi-call row.  Side-effecting
+    calls are represented by orphan-recovery placeholders.  The durable session
+    already proves every call ID was stored, so the resumed representation must
+    not create a second physical tool row or assistant call-id occurrence.
+    """
+    session_id = "production-shaped-sparse-resume"
+    conversation_id = "agent:main:telegram:dm:sanitized:thread"
+    exact_call_id = "call_sanitized_exact_large"
+    orphan_call_ids = ["call_sanitized_orphan_1", "call_sanitized_orphan_2"]
+    config = LCMConfig(
+        database_path=str(tmp_path / "sparse-resume.db"),
+        large_output_externalization_enabled=True,
+        large_output_externalization_threshold_chars=256,
+        large_output_externalization_path=str(tmp_path / "externalized-sparse"),
+    )
+
+    initial_user = {"role": "user", "content": "original request"}
+    initial_assistant = {
+        "role": "assistant",
+        "content": "",
+        "tool_calls": [
+            {"id": call_id, "type": "function", "function": {"name": "execute_code", "arguments": "{}"}}
+            for call_id in [exact_call_id, *orphan_call_ids]
+        ],
+    }
+    durable_tools = [
+        {
+            "role": "tool",
+            "tool_call_id": call_id,
+            "tool_name": "execute_code",
+            "content": f"large durable result for {call_id} " + ("x" * 4096),
+        }
+        for call_id in [exact_call_id, *orphan_call_ids]
+    ]
+    old_final = {"role": "assistant", "content": "completed original answer"}
+
+    first = LCMEngine(config=config)
+    first.on_session_start(
+        session_id,
+        platform="telegram",
+        conversation_id=conversation_id,
+        context_length=200000,
+    )
+    first._ingest_messages([initial_user, initial_assistant, *durable_tools, old_final])
+    first.shutdown()
+
+    resumed = LCMEngine(config=config)
+    resumed.on_session_start(
+        session_id,
+        platform="telegram",
+        conversation_id=conversation_id,
+        context_length=200000,
+    )
+    sparse_snapshot = [
+        dict(initial_user),
+        dict(durable_tools[0]),
+        *[
+            row
+            for call_id in orphan_call_ids
+            for row in (
+                {
+                    "role": "assistant",
+                    "content": "",
+                    "tool_calls": [
+                        {"id": call_id, "type": "function", "function": {"name": "execute_code", "arguments": "{}"}}
+                    ],
+                },
+                {
+                    "role": "tool",
+                    "tool_call_id": call_id,
+                    "tool_name": "execute_code",
+                    "content": "[Orphan recovery: interrupted side-effecting tool may have executed; its effect is UNKNOWN.]",
+                },
+            )
+        ],
+        dict(old_final),
+        {"role": "user", "content": "genuinely new resumed request"},
+    ]
+    resumed._ingest_messages(sparse_snapshot)
+
+    rows = resumed._store.get_session_messages(session_id)
+    tool_counts = Counter(
+        str(row["tool_call_id"])
+        for row in rows
+        if row.get("tool_call_id")
+    )
+    assistant_call_counts = Counter(
+        str(call.get("id") or call.get("tool_call_id"))
+        for row in rows
+        if str(row.get("role") or "") == "assistant"
+        for call in (row.get("tool_calls") or [])
+        if isinstance(call, dict) and (call.get("id") or call.get("tool_call_id"))
+    )
+    content_counts = Counter(str(row.get("content") or "") for row in rows)
+    evidence = {
+        "tool_counts": dict(tool_counts),
+        "assistant_call_counts": dict(assistant_call_counts),
+        "new_user_count": content_counts["genuinely new resumed request"],
+        "row_count": len(rows),
+    }
+    resumed.shutdown()
+
+    assert all(tool_counts[call_id] == 1 for call_id in [exact_call_id, *orphan_call_ids]), evidence
+    assert all(assistant_call_counts[call_id] == 1 for call_id in [exact_call_id, *orphan_call_ids]), evidence
+    assert content_counts["genuinely new resumed request"] == 1, evidence
