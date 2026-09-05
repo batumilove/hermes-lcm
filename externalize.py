@@ -1002,7 +1002,16 @@ def find_externalized_tool_result_content_for_call(
     """
     if not tool_call_id:
         return None
-    if (expected_chars is not None or persisted_output_source_path) and not persisted_output_preview_sha256:
+    exact_generation_supplied = (
+        persisted_output_file_size is not None
+        and persisted_output_file_mtime_ns is not None
+        and persisted_output_file_ctime_ns is not None
+    )
+    if (
+        (expected_chars is not None or persisted_output_source_path)
+        and not persisted_output_preview_sha256
+        and not exact_generation_supplied
+    ):
         return None
     storage_dir = get_large_output_storage_dir(config, hermes_home=hermes_home, create=False)
     if not storage_dir.exists() or not storage_dir.is_dir():
