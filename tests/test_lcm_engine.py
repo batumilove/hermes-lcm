@@ -4932,6 +4932,78 @@ class TestEngineABC:
         assert scanned == 3
         assert indexes == {1, 2, 3}
 
+    def test_tool_less_restart_suppression_requires_sequence_alignment(
+        self, tmp_path, monkeypatch
+    ):
+        db_path = tmp_path / "tool-replay-sequence-alignment.db"
+        engine = LCMEngine(config=LCMConfig(database_path=str(db_path)))
+        engine.on_session_start(
+            "tool-replay-sequence-alignment-session",
+            platform="telegram",
+            context_length=200000,
+        )
+        repeated_user = {"role": "user", "content": "same exact request"}
+        scaffold_tool = {
+            "role": "tool",
+            "tool_call_id": "call_scaffold_anchor",
+            "tool_name": "inspect",
+            "content": (
+                "[Session Arc Summary (d1, node 999)]\n"
+                "synthetic historical context\n"
+                "[Expand for details: synthetic]"
+            ),
+        }
+        assert engine._is_replayed_context_scaffold_message(scaffold_tool)
+        monkeypatch.setattr(
+            engine._store,
+            "get_session_tail",
+            lambda session_id, limit=1000: [repeated_user, scaffold_tool],
+        )
+
+        indexes, scanned = engine._find_tool_anchored_replay_indexes(
+            [scaffold_tool, repeated_user],
+            suppress_tool_less_duplicates=True,
+        )
+
+        assert scanned == 2
+        assert indexes == {0}
+
+    def test_scaffold_tool_replay_requires_matching_explicit_tool_name(
+        self, tmp_path, monkeypatch
+    ):
+        db_path = tmp_path / "tool-replay-explicit-name.db"
+        engine = LCMEngine(config=LCMConfig(database_path=str(db_path)))
+        engine.on_session_start(
+            "tool-replay-explicit-name-session",
+            platform="telegram",
+            context_length=200000,
+        )
+        stored_tool = {
+            "role": "tool",
+            "tool_call_id": "call_scaffold_name",
+            "tool_name": "inspect_old",
+            "content": (
+                "[Session Arc Summary (d1, node 999)]\n"
+                "synthetic historical context\n"
+                "[Expand for details: synthetic]"
+            ),
+        }
+        incoming_tool = {**stored_tool, "tool_name": "inspect_new"}
+        assert engine._is_replayed_context_scaffold_message(incoming_tool)
+        monkeypatch.setattr(
+            engine._store,
+            "get_session_tail",
+            lambda session_id, limit=1000: [stored_tool],
+        )
+
+        indexes, scanned = engine._find_tool_anchored_replay_indexes(
+            [incoming_tool],
+            suppress_tool_less_duplicates=True,
+        )
+
+        assert scanned == 1
+        assert indexes == set()
+
     def test_existing_session_restart_tool_anchor_reuses_externalized_payload(self, tmp_path):
         db_path = tmp_path / "restart-tool-anchor-payload.db"
         payload_dir = tmp_path / "payloads"

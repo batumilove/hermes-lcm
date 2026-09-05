@@ -525,7 +525,7 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
         # keep anchoring opt-in rather than changing its public behavior.
         self._pending_context_anchor_messages: Optional[List[Dict[str, Any]]] = None
         self._current_compress_store_ids_by_message_id: dict[int, int] = {}
-        self._current_compress_placeholder_identity_counts: dict[tuple[str, str, str, str], int] = {}
+        self._current_compress_placeholder_identity_counts: dict[tuple[str, str, str, str, str], int] = {}
         self._last_active_replay_source_identities: list[tuple[Any, ...]] = []
         self._last_active_replay_messages: list[Dict[str, Any]] = []
         self._generated_ignored_active_replay_placeholder_message_ids: set[int] = set()
@@ -4942,9 +4942,9 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
         return durable_content is not None
 
     @classmethod
-    def _is_active_context_droppable_identity(cls, identity: tuple[str, str, str, str]) -> bool:
+    def _is_active_context_droppable_identity(cls, identity: tuple[str, str, str, str, str]) -> bool:
         """Return true for durable rows sanitized out of active replay only."""
-        role, content, _tool_call_id, tool_calls = identity
+        role, content, _tool_call_id, tool_calls, _tool_name = identity
         if role != "assistant" or tool_calls:
             return False
         return _should_drop_active_assistant_message({
