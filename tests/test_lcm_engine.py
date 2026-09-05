@@ -5004,6 +5004,93 @@ class TestEngineABC:
         assert scanned == 1
         assert indexes == set()
 
+    def test_tool_replay_infers_missing_name_from_paired_assistant_call(
+        self, tmp_path, monkeypatch
+    ):
+        db_path = tmp_path / "tool-replay-inferred-name.db"
+        engine = LCMEngine(config=LCMConfig(database_path=str(db_path)))
+        engine.on_session_start(
+            "tool-replay-inferred-name-session",
+            platform="telegram",
+            context_length=200000,
+        )
+        assistant_call = {
+            "role": "assistant",
+            "content": "Calling",
+            "tool_calls": [
+                {
+                    "id": "call_inferred_name",
+                    "type": "function",
+                    "function": {"name": "inspect", "arguments": "{}"},
+                }
+            ],
+        }
+        stored_tool = {
+            "role": "tool",
+            "tool_call_id": "call_inferred_name",
+            "tool_name": "inspect",
+            "content": (
+                "[Session Arc Summary (d1, node 999)]\n"
+                "synthetic historical context\n"
+                "[Expand for details: synthetic]"
+            ),
+        }
+        incoming_tool = {key: value for key, value in stored_tool.items() if key != "tool_name"}
+        monkeypatch.setattr(
+            engine._store,
+            "get_session_tail",
+            lambda session_id, limit=1000: [assistant_call, stored_tool],
+        )
+
+        indexes, scanned = engine._find_tool_anchored_replay_indexes(
+            [assistant_call, incoming_tool],
+            suppress_tool_less_duplicates=True,
+        )
+
+        assert scanned == 2
+        assert indexes == {0, 1}
+
+    def test_tool_replay_aligns_repeated_identical_anchors_in_durable_order(
+        self, tmp_path, monkeypatch
+    ):
+        db_path = tmp_path / "tool-replay-repeated-anchor-order.db"
+        engine = LCMEngine(config=LCMConfig(database_path=str(db_path)))
+        engine.on_session_start(
+            "tool-replay-repeated-anchor-order-session",
+            platform="telegram",
+            context_length=200000,
+        )
+        first_assistant = {
+            "role": "assistant",
+            "content": "Calling first",
+            "tool_calls": [{"id": "call_repeat", "function": {"name": "inspect", "arguments": "{}"}}],
+        }
+        second_assistant = {
+            "role": "assistant",
+            "content": "Calling second",
+            "tool_calls": [{"id": "call_repeat", "function": {"name": "inspect", "arguments": "{}"}}],
+        }
+        tool_result = {
+            "role": "tool",
+            "tool_call_id": "call_repeat",
+            "tool_name": "inspect",
+            "content": "identical replayed result",
+        }
+        durable_rows = [first_assistant, tool_result, second_assistant, tool_result]
+        monkeypatch.setattr(
+            engine._store,
+            "get_session_tail",
+            lambda session_id, limit=1000: durable_rows,
+        )
+
+        indexes, scanned = engine._find_tool_anchored_replay_indexes(
+            durable_rows,
+            suppress_tool_less_duplicates=True,
+        )
+
+        assert scanned == 4
+        assert indexes == {0, 1, 2, 3}
+
     def test_existing_session_restart_tool_anchor_reuses_externalized_payload(self, tmp_path):
         db_path = tmp_path / "restart-tool-anchor-payload.db"
         payload_dir = tmp_path / "payloads"
