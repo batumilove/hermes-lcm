@@ -884,7 +884,13 @@ class ReconcileMixin:
         visible_messages = [
             (raw_index, msg)
             for raw_index, msg in enumerate(messages)
-            if not self._is_replayed_context_scaffold_message(msg)
+            if (
+                not self._is_replayed_context_scaffold_message(msg)
+                or (
+                    str(msg.get("role") or "") == "tool"
+                    and bool(str(msg.get("tool_call_id") or "").strip())
+                )
+            )
             and (
                 raw_index not in preignored_indexes
                 if preignored_indexes is not None
