@@ -226,9 +226,12 @@ def test_final_form_replay_filter_records_session_end_receipt(
 
     assert len(rows) == 1, evidence
     if delivery_path == "direct":
+        # Direct delivery first traverses the canonical strict-replay scan,
+        # which proves and filters this persisted output by its durable tool
+        # anchor before the later persisted-output fallback is reached.
         assert evidence["reconciliation"] == {
             "action": "filtered replay",
-            "reason": "replayed unanchored durable persisted-output identity",
+            "reason": "replayed durable tool-anchored segment",
             "cursor": 0,
             "incoming": 1,
             "session_count": 1,
