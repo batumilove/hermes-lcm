@@ -3229,7 +3229,11 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
                 str(message.get("role") or "") == "tool"
                 and call_id
                 and not has_adjacent_new_call
-                and self._has_durable_persisted_output_replay_identity(message)
+                and self._has_durable_persisted_output_replay_identity(
+                    message,
+                    session_id=session_id,
+                    conversation_id=conversation_id,
+                )
             ):
                 continue
             final_form_kept.append((index, message))

@@ -88,9 +88,23 @@ class ReconcileMixin:
         except (TypeError, ValueError):
             return str(tool_calls)
 
-    def _has_durable_persisted_output_replay_identity(self, msg: Dict[str, Any]) -> bool:
+    def _has_durable_persisted_output_replay_identity(
+        self,
+        msg: Dict[str, Any],
+        *,
+        session_id: str | None = None,
+        conversation_id: str | None = None,
+    ) -> bool:
         role = str(msg.get("role") or "unknown")
         content = normalize_content_value(msg.get("content")) or ""
+        resolved_session_id = str(
+            session_id or msg.get("session_id") or getattr(self, "_session_id", None) or ""
+        )
+        resolved_conversation_id = (
+            conversation_id
+            if conversation_id is not None
+            else getattr(self, "_conversation_id", None)
+        )
         if role != "tool" or not _is_hermes_persisted_output_marker(content):
             return False
         expected_chars = _expected_persisted_output_chars(content)
@@ -108,7 +122,7 @@ class ReconcileMixin:
         require_live_file_freshness = True
         durable_content = find_externalized_tool_result_content_for_call(
             tool_call_id=str(msg.get("tool_call_id") or ""),
-            session_id=str(msg.get("session_id") or self._session_id or ""),
+            session_id=resolved_session_id,
             expected_chars=expected_chars,
             persisted_output_source_path=persisted_output_source_path,
             persisted_output_preview_sha256=persisted_output_preview_sha256,
@@ -131,7 +145,7 @@ class ReconcileMixin:
             # retaining a potentially sensitive raw-preview digest.
             exact_generation_content = find_externalized_tool_result_content_for_call(
                 tool_call_id=str(msg.get("tool_call_id") or ""),
-                session_id=str(msg.get("session_id") or self._session_id or ""),
+                session_id=resolved_session_id,
                 expected_chars=expected_chars,
                 persisted_output_source_path=persisted_output_source_path,
                 persisted_output_file_size=recovered_generation["size"],
@@ -198,9 +212,9 @@ class ReconcileMixin:
         if not call_id:
             return False
         durable_rows = self._store.get_tool_call_replay_neighborhoods(
-            self._session_id,
+            resolved_session_id,
             {call_id},
-            conversation_id=getattr(self, "_conversation_id", None),
+            conversation_id=resolved_conversation_id,
         )
         for durable_row in durable_rows:
             if (

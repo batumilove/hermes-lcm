@@ -240,6 +240,84 @@ def test_final_form_replay_filter_records_session_end_receipt(
     assert receipt_recorded, evidence
 
 
+def test_deferred_final_form_filter_uses_intent_session_identity_when_bound_elsewhere(
+    tmp_path,
+    monkeypatch,
+):
+    ended_session_id = "postrestart-deferred-ended-session"
+    ended_conversation_id = "agent:main:telegram:dm:sanitized:ended"
+    active_session_id = "postrestart-active-successor-session"
+    active_conversation_id = "agent:main:telegram:dm:sanitized:successor"
+    call_id = "call_replayed_from_ended_session"
+    raw_content = "large ended-session result " + ("x" * 1024)
+    monkeypatch.setattr(
+        "hermes_lcm.ingest_protection.tempfile.gettempdir",
+        lambda: str(tmp_path),
+    )
+    config = LCMConfig(
+        database_path=str(tmp_path / "off-current-receipt.db"),
+        large_output_externalization_enabled=True,
+        large_output_externalization_threshold_chars=256,
+        large_output_externalization_path=str(tmp_path / "externalized"),
+    )
+
+    host_storage = tmp_path / "hermes-results"
+    host_storage.mkdir()
+    persisted_path = host_storage / "call_replayed_from_ended_session.txt"
+    persisted_path.write_text(raw_content, encoding="utf-8")
+    persisted_marker = (
+        "<persisted-output>\n"
+        f"This tool result was too large ({len(raw_content):,} characters, 1.0 KB).\n"
+        f"Full output saved to: {persisted_path}\n"
+        "Use the read_file tool with offset and limit to access specific sections of this output.\n\n"
+        "Preview (first 30 chars):\n"
+        f"{raw_content[:30]}\n...\n"
+        "</persisted-output>"
+    )
+
+    seed = LCMEngine(config=config, hermes_home=str(tmp_path / "hermes"))
+    seed.on_session_start(
+        ended_session_id,
+        platform="telegram",
+        conversation_id=ended_conversation_id,
+        context_length=272000,
+    )
+    seed.ingest([_tool_result(call_id, raw_content)])
+    seed.shutdown()
+
+    rebound = LCMEngine(config=config, hermes_home=str(tmp_path / "hermes"))
+    rebound._session_id = active_session_id
+    rebound._conversation_id = active_conversation_id
+    monkeypatch.setattr(
+        rebound,
+        "_session_end_tool_replay_plan",
+        lambda *_args, **_kwargs: (set(), {}),
+    )
+    appended = rebound._append_off_current_session_end_suffix(
+        ended_session_id,
+        [_tool_result(call_id, persisted_marker)],
+        source="telegram",
+        conversation_id=ended_conversation_id,
+    )
+
+    rows = rebound._store.get_session_messages(ended_session_id)
+    tool_rows = [
+        row
+        for row in rows
+        if row.get("role") == "tool" and row.get("tool_call_id") == call_id
+    ]
+    evidence = {
+        "row_count": len(rows),
+        "tool_row_count": len(tool_rows),
+        "appended": appended,
+    }
+    rebound.shutdown()
+
+    assert len(rows) == 1, evidence
+    assert len(tool_rows) == 1, evidence
+    assert appended == [], evidence
+
+
 @pytest.mark.parametrize(
     ("intervening_messages", "expected_row_count", "expected_tool_rows"),
     [
