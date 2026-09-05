@@ -1261,9 +1261,15 @@ class ReconcileMixin:
                                 candidate_position = positions[position_index]
                                 if matched_at is None or candidate_position < matched_at:
                                     matched_at = candidate_position
-                        if matched_at is not None:
-                            replayed_raw_indexes.add(raw_index)
-                            stored_cursor = matched_at + 1
+                        if matched_at is None:
+                            # Once a visible non-tool row is not durable-proven,
+                            # everything farther from this anchor is ambiguous.
+                            # Skipping over it would turn this back into broad
+                            # identity-membership suppression and can drop a
+                            # legitimate repeated suffix.
+                            break
+                        replayed_raw_indexes.add(raw_index)
+                        stored_cursor = matched_at + 1
                         incoming_offset += step
 
         return replayed_raw_indexes, scanned_row_count

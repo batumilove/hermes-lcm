@@ -5126,6 +5126,68 @@ class TestEngineABC:
         assert scanned == 4
         assert indexes == {0, 1, 2, 3}
 
+    def test_tool_less_restart_suppression_stops_after_unmatched_forward_row(
+        self, tmp_path, monkeypatch
+    ):
+        db_path = tmp_path / "tool-replay-forward-gap.db"
+        engine = LCMEngine(config=LCMConfig(database_path=str(db_path)))
+        engine.on_session_start(
+            "tool-replay-forward-gap-session",
+            platform="telegram",
+            context_length=200000,
+        )
+        anchor = {
+            "role": "tool",
+            "tool_call_id": "call_forward_gap",
+            "tool_name": "inspect",
+            "content": "anchor result",
+        }
+        repeated = {"role": "user", "content": "same words"}
+        monkeypatch.setattr(
+            engine._store,
+            "get_session_tail",
+            lambda session_id, limit=1000: [anchor, repeated],
+        )
+
+        indexes, scanned = engine._find_tool_anchored_replay_indexes(
+            [anchor, {"role": "user", "content": "new intervening turn"}, repeated],
+            suppress_tool_less_duplicates=True,
+        )
+
+        assert scanned == 2
+        assert indexes == {0}
+
+    def test_tool_less_restart_suppression_stops_after_unmatched_backward_row(
+        self, tmp_path, monkeypatch
+    ):
+        db_path = tmp_path / "tool-replay-backward-gap.db"
+        engine = LCMEngine(config=LCMConfig(database_path=str(db_path)))
+        engine.on_session_start(
+            "tool-replay-backward-gap-session",
+            platform="telegram",
+            context_length=200000,
+        )
+        repeated = {"role": "user", "content": "same words"}
+        anchor = {
+            "role": "tool",
+            "tool_call_id": "call_backward_gap",
+            "tool_name": "inspect",
+            "content": "anchor result",
+        }
+        monkeypatch.setattr(
+            engine._store,
+            "get_session_tail",
+            lambda session_id, limit=1000: [repeated, anchor],
+        )
+
+        indexes, scanned = engine._find_tool_anchored_replay_indexes(
+            [repeated, {"role": "user", "content": "new intervening turn"}, anchor],
+            suppress_tool_less_duplicates=True,
+        )
+
+        assert scanned == 2
+        assert indexes == {2}
+
     def test_tool_replay_aligns_repeated_identical_anchors_in_durable_order(
         self, tmp_path, monkeypatch
     ):
