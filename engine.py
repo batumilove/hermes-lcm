@@ -3200,7 +3200,7 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
             suffix,
             conversation_id=conversation_id,
         )
-        kept: list[Dict[str, Any]] = []
+        kept_with_index: list[tuple[int, Dict[str, Any]]] = []
         for index, msg in enumerate(suffix):
             if index in replayed_tool_indexes:
                 continue
@@ -3214,15 +3214,16 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
                     excerpt,
                 )
                 continue
-            kept.append(msg)
+            kept_with_index.append((index, msg))
 
-        final_form_kept: list[Dict[str, Any]] = []
-        for message in kept:
+        final_form_kept: list[tuple[int, Dict[str, Any]]] = []
+        for index, message in kept_with_index:
             call_id = str(message.get("tool_call_id") or "").strip()
             has_adjacent_new_call = bool(
                 final_form_kept
-                and str(final_form_kept[-1].get("role") or "") == "assistant"
-                and call_id in self._assistant_tool_call_ids(final_form_kept[-1])
+                and final_form_kept[-1][0] == index - 1
+                and str(final_form_kept[-1][1].get("role") or "") == "assistant"
+                and call_id in self._assistant_tool_call_ids(final_form_kept[-1][1])
             )
             if (
                 str(message.get("role") or "") == "tool"
@@ -3231,8 +3232,8 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
                 and self._has_durable_persisted_output_replay_identity(message)
             ):
                 continue
-            final_form_kept.append(message)
-        kept = final_form_kept
+            final_form_kept.append((index, message))
+        kept = [message for _index, message in final_form_kept]
 
         if not kept:
             if session_end_intent_sha256 is not None:

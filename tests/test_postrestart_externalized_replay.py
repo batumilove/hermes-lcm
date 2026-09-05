@@ -238,3 +238,101 @@ def test_final_form_replay_filter_records_session_end_receipt(
     else:
         assert pending is not None and not pending.exists(), evidence
     assert receipt_recorded, evidence
+
+
+@pytest.mark.parametrize(
+    ("intervening_messages", "expected_row_count", "expected_tool_rows"),
+    [
+        ([], 3, 2),
+        ([{"role": "user", "content": "intervening turn"}], 2, 1),
+    ],
+)
+def test_deferred_final_form_filter_requires_original_tool_call_adjacency(
+    tmp_path,
+    monkeypatch,
+    intervening_messages,
+    expected_row_count,
+    expected_tool_rows,
+):
+    session_id = "postrestart-deferred-original-adjacency"
+    conversation_id = "agent:main:telegram:dm:sanitized:adjacency"
+    call_id = "call_reused_at_deferred_session_end"
+    raw_content = "large durable result " + ("x" * 1024)
+    monkeypatch.setattr(
+        "hermes_lcm.ingest_protection.tempfile.gettempdir",
+        lambda: str(tmp_path),
+    )
+    config = LCMConfig(
+        database_path=str(tmp_path / "adjacency.db"),
+        large_output_externalization_enabled=True,
+        large_output_externalization_threshold_chars=256,
+        large_output_externalization_path=str(tmp_path / "externalized"),
+    )
+
+    seed = LCMEngine(config=config, hermes_home=str(tmp_path / "hermes"))
+    seed.on_session_start(
+        session_id,
+        platform="telegram",
+        conversation_id=conversation_id,
+        context_length=272000,
+    )
+    seed.ingest([_tool_result(call_id, raw_content)])
+    seed.shutdown()
+
+    host_storage = tmp_path / "hermes-results"
+    host_storage.mkdir()
+    persisted_path = host_storage / "call_reused_at_deferred_session_end.txt"
+    persisted_path.write_text(raw_content, encoding="utf-8")
+    persisted_marker = (
+        "<persisted-output>\n"
+        f"This tool result was too large ({len(raw_content):,} characters, 1.0 KB).\n"
+        f"Full output saved to: {persisted_path}\n"
+        "Use the read_file tool with offset and limit to access specific sections of this output.\n\n"
+        "Preview (first 30 chars):\n"
+        f"{raw_content[:30]}\n...\n"
+        "</persisted-output>"
+    )
+
+    rebound = LCMEngine(config=config, hermes_home=str(tmp_path / "hermes"))
+    rebound.on_session_start(
+        session_id,
+        platform="telegram",
+        conversation_id=conversation_id,
+        context_length=272000,
+    )
+    monkeypatch.setattr(
+        rebound,
+        "_session_end_tool_replay_plan",
+        lambda _session_id, messages, **_kwargs: (
+            {1} if len(messages) == 3 else set(),
+            {},
+        ),
+    )
+    snapshot = [
+        _assistant_call(call_id),
+        *intervening_messages,
+        _tool_result(call_id, persisted_marker),
+    ]
+    pending = rebound._persist_session_end_intent(
+        session_id,
+        snapshot,
+        ingest_cursor=rebound._ingest_cursor,
+    )
+    rebound._drain_one_session_end_intent(pending)
+
+    rows = rebound._store.get_session_messages(session_id)
+    tool_rows = [
+        row
+        for row in rows
+        if row.get("role") == "tool" and row.get("tool_call_id") == call_id
+    ]
+    evidence = {
+        "row_count": len(rows),
+        "tool_row_count": len(tool_rows),
+        "pending_exists": pending.exists(),
+    }
+    rebound.shutdown()
+
+    assert len(rows) == expected_row_count, evidence
+    assert len(tool_rows) == expected_tool_rows, evidence
+    assert not pending.exists(), evidence
