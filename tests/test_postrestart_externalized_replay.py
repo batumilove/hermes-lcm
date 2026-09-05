@@ -127,3 +127,84 @@ def test_fresh_process_rebind_does_not_reexternalize_one_old_result(tmp_path, mo
 
     assert counts[target_call_id] == 1, evidence
     assert len(rows) == 78, evidence
+
+
+def test_final_form_replay_filter_records_session_end_receipt(tmp_path, monkeypatch):
+    session_id = "postrestart-final-filter-session-end"
+    conversation_id = "agent:main:telegram:dm:sanitized:receipt"
+    call_id = "call_replayed_at_session_end"
+    digest = "a" * 64
+    raw_content = "large replayed result " + ("x" * 1024)
+    monkeypatch.setattr(
+        "hermes_lcm.ingest_protection.tempfile.gettempdir",
+        lambda: str(tmp_path),
+    )
+    config = LCMConfig(
+        database_path=str(tmp_path / "receipt.db"),
+        large_output_externalization_enabled=True,
+        large_output_externalization_threshold_chars=256,
+        large_output_externalization_path=str(tmp_path / "externalized"),
+    )
+
+    seed = LCMEngine(config=config, hermes_home=str(tmp_path / "hermes"))
+    seed.on_session_start(
+        session_id,
+        platform="telegram",
+        conversation_id=conversation_id,
+        context_length=272000,
+    )
+    seed.ingest([_tool_result(call_id, raw_content)])
+    assert seed._store.get_session_count(session_id) == 1
+    seed.shutdown()
+
+    host_storage = tmp_path / "hermes-results"
+    host_storage.mkdir()
+    persisted_path = host_storage / "call_replayed_at_session_end.txt"
+    persisted_path.write_text(raw_content, encoding="utf-8")
+    persisted_marker = (
+        "<persisted-output>\n"
+        f"This tool result was too large ({len(raw_content):,} characters, 1.0 KB).\n"
+        f"Full output saved to: {persisted_path}\n"
+        "Use the read_file tool with offset and limit to access specific sections of this output.\n\n"
+        "Preview (first 30 chars):\n"
+        f"{raw_content[:30]}\n...\n"
+        "</persisted-output>"
+    )
+
+    rebound = LCMEngine(config=config, hermes_home=str(tmp_path / "hermes"))
+    rebound.on_session_start(
+        session_id,
+        platform="telegram",
+        conversation_id=conversation_id,
+        context_length=272000,
+    )
+    monkeypatch.setattr(
+        rebound,
+        "_session_end_tool_replay_plan",
+        lambda *_args, **_kwargs: (set(), {}),
+    )
+    rebound._ingest_messages(
+        [_tool_result(call_id, persisted_marker)],
+        session_end_intent_sha256=digest,
+        session_end_message_fingerprints=["fixture-session-end-fingerprint"],
+    )
+
+    rows = rebound._store.get_session_messages(session_id)
+    evidence = {
+        "row_count": len(rows),
+        "reconciliation": rebound._last_ingest_reconciliation,
+    }
+    receipt_recorded = rebound._store.has_session_end_ingest_receipt(digest)
+    rebound.shutdown()
+
+    assert len(rows) == 1, evidence
+    assert evidence["reconciliation"] == {
+        "action": "filtered replay",
+        "reason": "replayed unanchored durable persisted-output identity",
+        "cursor": 0,
+        "incoming": 1,
+        "session_count": 1,
+        "stored_tail_count": 1,
+        "effective_incoming": 0,
+    }, evidence
+    assert receipt_recorded, evidence

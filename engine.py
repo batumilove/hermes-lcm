@@ -5541,6 +5541,13 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
             )
 
         if not messages_to_store_with_index:
+            if session_end_intent_sha256:
+                self._store.record_session_end_ingest_receipt(
+                    session_end_intent_sha256,
+                    session_id=self._session_id,
+                    conversation_id=self._conversation_id,
+                    message_fingerprints=session_end_message_fingerprints or [],
+                )
             self._ingest_cursor = n
             self._compression_boundary_ingest_pending = False
             self._overflow_recovery_ingest_pending = False
