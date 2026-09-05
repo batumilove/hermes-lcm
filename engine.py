@@ -3200,7 +3200,7 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
             suffix,
             conversation_id=conversation_id,
         )
-        kept: list[Dict[str, Any]] = []
+        kept_with_index: list[tuple[int, Dict[str, Any]]] = []
         for index, msg in enumerate(suffix):
             if index in replayed_tool_indexes:
                 continue
@@ -3214,7 +3214,31 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
                     excerpt,
                 )
                 continue
-            kept.append(msg)
+            kept_with_index.append((index, msg))
+
+        final_form_kept: list[tuple[int, Dict[str, Any]]] = []
+        for index, message in kept_with_index:
+            call_id = str(message.get("tool_call_id") or "").strip()
+            has_adjacent_new_call = bool(
+                final_form_kept
+                and final_form_kept[-1][0] == index - 1
+                and str(final_form_kept[-1][1].get("role") or "") == "assistant"
+                and call_id in self._assistant_tool_call_ids(final_form_kept[-1][1])
+            )
+            if (
+                str(message.get("role") or "") == "tool"
+                and call_id
+                and not has_adjacent_new_call
+                and self._has_durable_persisted_output_replay_identity(
+                    message,
+                    session_id=session_id,
+                    conversation_id=conversation_id,
+                )
+            ):
+                continue
+            final_form_kept.append((index, message))
+        kept = [message for _index, message in final_form_kept]
+
         if not kept:
             if session_end_intent_sha256 is not None:
                 if session_end_message_fingerprints is None:
@@ -5199,6 +5223,11 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
             ) = self._find_tool_anchored_replay_indexes(
                 replay_messages[replay_scan_start:],
                 suppress_tool_less_duplicates=bool(reconciled_ingest_cursor),
+                # A changed active prefix may rewind the effective ingest cursor
+                # after the first suffix-only durable-key pass. Old tool anchors
+                # can be arbitrarily far from the durable tail, so the rewind
+                # pass must also resolve candidates by tool-call key.
+                durable_key_lookup=True,
             )
             tool_anchored_replay_indexes.update(
                 replay_scan_start + idx for idx in scanned_replay_indexes
@@ -5485,6 +5514,60 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
                     store_msg = original_msg
                 kept.append((absolute_idx, store_msg))
             messages_to_store_with_index = kept
+
+        if not messages_to_store_with_index:
+            if session_end_intent_sha256:
+                self._store.record_session_end_ingest_receipt(
+                    session_end_intent_sha256,
+                    session_id=self._session_id,
+                    conversation_id=self._conversation_id,
+                    message_fingerprints=session_end_message_fingerprints or [],
+                )
+            self._ingest_cursor = n
+            self._compression_boundary_ingest_pending = False
+            self._overflow_recovery_ingest_pending = False
+            self._compression_boundary_active_placeholder_digest_budget = {}
+            self._compression_boundary_active_placeholder_digest_ordinals = {}
+            self._compression_boundary_stored_placeholder_digest_counts = {}
+            self._clear_foreground_rebind_candidate_if_bound_session_confirmed()
+            return self._remember_active_replay_messages(messages, active_replay_messages)
+
+        final_form_replay_candidate_indexes: set[int] = set()
+        if reconciled_ingest_cursor:
+            for relative_index, (absolute_index, message) in enumerate(messages_to_store_with_index):
+                call_id = str(message.get("tool_call_id") or "").strip()
+                if str(message.get("role") or "") != "tool" or not call_id:
+                    continue
+                has_adjacent_new_call = False
+                if relative_index > 0:
+                    previous_absolute_index, previous_message = messages_to_store_with_index[
+                        relative_index - 1
+                    ]
+                    has_adjacent_new_call = (
+                        previous_absolute_index == absolute_index - 1
+                        and str(previous_message.get("role") or "") == "assistant"
+                        and call_id in self._assistant_tool_call_ids(previous_message)
+                    )
+                if not has_adjacent_new_call:
+                    if self._has_durable_persisted_output_replay_identity(message):
+                        final_form_replay_candidate_indexes.add(relative_index)
+
+        if final_form_replay_candidate_indexes:
+            messages_to_store_with_index = [
+                item
+                for index, item in enumerate(messages_to_store_with_index)
+                if index not in final_form_replay_candidate_indexes
+            ]
+            session_count = self._store.get_session_count(self._session_id)
+            self._record_ingest_reconciliation(
+                action="filtered replay",
+                reason="replayed unanchored durable persisted-output identity",
+                cursor=cursor,
+                incoming=n,
+                session_count=session_count,
+                stored_tail_count=session_count,
+                effective_incoming=len(messages_to_store_with_index),
+            )
 
         if not messages_to_store_with_index:
             if session_end_intent_sha256:
