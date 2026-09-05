@@ -1254,8 +1254,7 @@ class ReconcileMixin:
                     stored_identities[stored_anchor],
                 ) or (
                     persisted_output_anchor_proven
-                    and str(stored_rows[stored_anchor].get("tool_call_id") or "").strip()
-                    == call_id
+                    and previous_assistant_matches(stored_anchor)
                 )
 
             def previous_assistant_matches(stored_anchor: int) -> bool:
@@ -1297,7 +1296,11 @@ class ReconcileMixin:
                     # but reusing a claimed durable occurrence must not create
                     # another anchor pair: that would turn singleton evidence
                     # into false multi-anchor proof across an unmatched gap.
-                    if candidates and not unique_candidates:
+                    if (
+                        candidates
+                        and not unique_candidates
+                        and not persisted_output_anchor_proven
+                    ):
                         replayed_raw_indexes.add(incoming_raw_index)
                         if len(candidates) == 1:
                             claimed_anchor = candidates[0]
