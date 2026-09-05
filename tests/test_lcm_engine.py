@@ -5050,6 +5050,82 @@ class TestEngineABC:
         assert scanned == 2
         assert indexes == {0, 1}
 
+    def test_tool_replay_does_not_infer_missing_name_from_nonadjacent_assistant(self, tmp_path, monkeypatch):
+        db_path = tmp_path / "tool-replay-nonadjacent-name.db"
+        engine = LCMEngine(config=LCMConfig(database_path=str(db_path)))
+        engine.on_session_start(
+            "tool-replay-nonadjacent-name-session",
+            platform="telegram",
+            context_length=200000,
+        )
+        assistant_call = {
+            "role": "assistant",
+            "content": "Calling",
+            "tool_calls": [{"id": "call_nonadjacent", "function": {"name": "inspect", "arguments": "{}"}}],
+        }
+        intervening = {"role": "user", "content": "different exchange"}
+        stored_tool = {
+            "role": "tool",
+            "tool_call_id": "call_nonadjacent",
+            "tool_name": "inspect",
+            "content": "result",
+        }
+        incoming_tool = {key: value for key, value in stored_tool.items() if key != "tool_name"}
+        monkeypatch.setattr(
+            engine._store,
+            "get_session_tail",
+            lambda session_id, limit=1000: [assistant_call, intervening, stored_tool],
+        )
+
+        indexes, scanned = engine._find_tool_anchored_replay_indexes(
+            [assistant_call, intervening, incoming_tool],
+            suppress_tool_less_duplicates=True,
+        )
+
+        assert scanned == 3
+        assert indexes == set()
+
+    def test_tool_replay_infers_reused_call_id_names_from_each_adjacent_pair(self, tmp_path, monkeypatch):
+        db_path = tmp_path / "tool-replay-reused-call-id-names.db"
+        engine = LCMEngine(config=LCMConfig(database_path=str(db_path)))
+        engine.on_session_start(
+            "tool-replay-reused-call-id-names-session",
+            platform="telegram",
+            context_length=200000,
+        )
+        first_assistant = {
+            "role": "assistant",
+            "content": "First",
+            "tool_calls": [{"id": "call_reused", "function": {"name": "inspect_first", "arguments": "{}"}}],
+        }
+        second_assistant = {
+            "role": "assistant",
+            "content": "Second",
+            "tool_calls": [{"id": "call_reused", "function": {"name": "inspect_second", "arguments": "{}"}}],
+        }
+        first_stored = {"role": "tool", "tool_call_id": "call_reused", "tool_name": "inspect_first", "content": "first result"}
+        second_stored = {"role": "tool", "tool_call_id": "call_reused", "tool_name": "inspect_second", "content": "second result"}
+        durable_rows = [first_assistant, first_stored, second_assistant, second_stored]
+        incoming_rows = [
+            first_assistant,
+            {key: value for key, value in first_stored.items() if key != "tool_name"},
+            second_assistant,
+            {key: value for key, value in second_stored.items() if key != "tool_name"},
+        ]
+        monkeypatch.setattr(
+            engine._store,
+            "get_session_tail",
+            lambda session_id, limit=1000: durable_rows,
+        )
+
+        indexes, scanned = engine._find_tool_anchored_replay_indexes(
+            incoming_rows,
+            suppress_tool_less_duplicates=True,
+        )
+
+        assert scanned == 4
+        assert indexes == {0, 1, 2, 3}
+
     def test_tool_replay_aligns_repeated_identical_anchors_in_durable_order(
         self, tmp_path, monkeypatch
     ):

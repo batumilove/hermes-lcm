@@ -165,7 +165,7 @@ class ReconcileMixin:
         msg: Dict[str, Any],
         *,
         stored_row: bool = False,
-        inferred_tool_names: dict[str, str] | None = None,
+        inferred_tool_name: str | None = None,
     ) -> tuple[str, str, str, str, str]:
         role = str(msg.get("role") or "unknown")
         content = normalize_content_value(msg.get("content")) or ""
@@ -296,8 +296,8 @@ class ReconcileMixin:
                 content = payload["content"]
         tool_calls_identity = self._stable_tool_calls_identity(tool_calls)
         tool_name = str(msg.get("tool_name") or "") if role == "tool" else ""
-        if role == "tool" and not tool_name and inferred_tool_names:
-            tool_name = inferred_tool_names.get(str(msg.get("tool_call_id") or "").strip(), "")
+        if role == "tool" and not tool_name and inferred_tool_name:
+            tool_name = inferred_tool_name
         return (
             role,
             content,
@@ -1005,12 +1005,20 @@ class ReconcileMixin:
         if not stored_rows:
             return set(), scanned_row_count
 
-        def inferred_tool_names(rows: List[Dict[str, Any]]) -> dict[str, str]:
-            candidates: dict[str, set[str]] = {}
-            for row in rows:
-                if str(row.get("role") or "") != "assistant":
+        def inferred_tool_names(rows: List[Dict[str, Any]]) -> list[str | None]:
+            inferred: list[str | None] = [None] * len(rows)
+            for offset, row in enumerate(rows):
+                if (
+                    offset == 0
+                    or str(row.get("role") or "") != "tool"
+                    or bool(str(row.get("tool_name") or "").strip())
+                ):
                     continue
-                tool_calls = row.get("tool_calls") or []
+                call_id = str(row.get("tool_call_id") or "").strip()
+                previous = rows[offset - 1]
+                if not call_id or str(previous.get("role") or "") != "assistant":
+                    continue
+                tool_calls = previous.get("tool_calls") or []
                 if isinstance(tool_calls, str):
                     try:
                         tool_calls = json.loads(tool_calls)
@@ -1020,10 +1028,11 @@ class ReconcileMixin:
                     tool_calls = [tool_calls]
                 if not isinstance(tool_calls, list):
                     continue
+                names: set[str] = set()
                 for tool_call in tool_calls:
                     if not isinstance(tool_call, dict):
                         continue
-                    call_id = str(
+                    candidate_call_id = str(
                         tool_call.get("id") or tool_call.get("tool_call_id") or ""
                     ).strip()
                     function = tool_call.get("function") or {}
@@ -1032,29 +1041,29 @@ class ReconcileMixin:
                         if isinstance(function, dict)
                         else ""
                     )
-                    if call_id and tool_name:
-                        candidates.setdefault(call_id, set()).add(tool_name)
-            return {
-                call_id: next(iter(names))
-                for call_id, names in candidates.items()
-                if len(names) == 1
-            }
+                    if candidate_call_id == call_id and tool_name:
+                        names.add(tool_name)
+                if len(names) == 1:
+                    inferred[offset] = next(iter(names))
+            return inferred
 
-        incoming_name_map = inferred_tool_names(
-            [msg for _raw_index, msg in visible_messages]
-        )
+        incoming_rows = [msg for _raw_index, msg in visible_messages]
+        incoming_name_map = inferred_tool_names(incoming_rows)
         stored_name_map = inferred_tool_names(stored_rows)
         incoming_identities = [
-            self._message_replay_identity(msg, inferred_tool_names=incoming_name_map)
-            for _raw_index, msg in visible_messages
+            self._message_replay_identity(
+                msg,
+                inferred_tool_name=incoming_name_map[offset],
+            )
+            for offset, msg in enumerate(incoming_rows)
         ]
         stored_identities = [
             self._message_replay_identity(
                 row,
                 stored_row=True,
-                inferred_tool_names=stored_name_map,
+                inferred_tool_name=stored_name_map[offset],
             )
-            for row in stored_rows
+            for offset, row in enumerate(stored_rows)
         ]
 
         def identities_match(
