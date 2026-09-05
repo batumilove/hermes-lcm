@@ -3215,6 +3215,25 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
                 )
                 continue
             kept.append(msg)
+
+        final_form_kept: list[Dict[str, Any]] = []
+        for message in kept:
+            call_id = str(message.get("tool_call_id") or "").strip()
+            has_adjacent_new_call = bool(
+                final_form_kept
+                and str(final_form_kept[-1].get("role") or "") == "assistant"
+                and call_id in self._assistant_tool_call_ids(final_form_kept[-1])
+            )
+            if (
+                str(message.get("role") or "") == "tool"
+                and call_id
+                and not has_adjacent_new_call
+                and self._has_durable_persisted_output_replay_identity(message)
+            ):
+                continue
+            final_form_kept.append(message)
+        kept = final_form_kept
+
         if not kept:
             if session_end_intent_sha256 is not None:
                 if session_end_message_fingerprints is None:

@@ -2,6 +2,8 @@
 
 from collections import Counter
 
+import pytest
+
 from hermes_lcm.config import LCMConfig
 from hermes_lcm.engine import LCMEngine
 
@@ -129,11 +131,15 @@ def test_fresh_process_rebind_does_not_reexternalize_one_old_result(tmp_path, mo
     assert len(rows) == 78, evidence
 
 
-def test_final_form_replay_filter_records_session_end_receipt(tmp_path, monkeypatch):
+@pytest.mark.parametrize("delivery_path", ["direct", "deferred"])
+def test_final_form_replay_filter_records_session_end_receipt(
+    tmp_path,
+    monkeypatch,
+    delivery_path,
+):
     session_id = "postrestart-final-filter-session-end"
     conversation_id = "agent:main:telegram:dm:sanitized:receipt"
     call_id = "call_replayed_at_session_end"
-    digest = "a" * 64
     raw_content = "large replayed result " + ("x" * 1024)
     monkeypatch.setattr(
         "hermes_lcm.ingest_protection.tempfile.gettempdir",
@@ -183,28 +189,52 @@ def test_final_form_replay_filter_records_session_end_receipt(tmp_path, monkeypa
         "_session_end_tool_replay_plan",
         lambda *_args, **_kwargs: (set(), {}),
     )
-    rebound._ingest_messages(
-        [_tool_result(call_id, persisted_marker)],
-        session_end_intent_sha256=digest,
-        session_end_message_fingerprints=["fixture-session-end-fingerprint"],
+    recorded_receipts = []
+    original_record_receipt = rebound._store.record_session_end_ingest_receipt
+
+    def record_receipt(intent_sha256, **kwargs):
+        original_record_receipt(intent_sha256, **kwargs)
+        recorded_receipts.append(intent_sha256)
+
+    monkeypatch.setattr(
+        rebound._store,
+        "record_session_end_ingest_receipt",
+        record_receipt,
     )
+    final_snapshot = [_tool_result(call_id, persisted_marker)]
+    pending = None
+    if delivery_path == "direct":
+        rebound.on_session_end(session_id, final_snapshot)
+    else:
+        pending = rebound._persist_session_end_intent(
+            session_id,
+            final_snapshot,
+            ingest_cursor=rebound._ingest_cursor,
+        )
+        rebound._drain_one_session_end_intent(pending)
 
     rows = rebound._store.get_session_messages(session_id)
     evidence = {
         "row_count": len(rows),
         "reconciliation": rebound._last_ingest_reconciliation,
     }
-    receipt_recorded = rebound._store.has_session_end_ingest_receipt(digest)
+    receipt_recorded = (
+        len(recorded_receipts) == 1
+        and rebound._store.has_session_end_ingest_receipt(recorded_receipts[0])
+    )
     rebound.shutdown()
 
     assert len(rows) == 1, evidence
-    assert evidence["reconciliation"] == {
-        "action": "filtered replay",
-        "reason": "replayed unanchored durable persisted-output identity",
-        "cursor": 0,
-        "incoming": 1,
-        "session_count": 1,
-        "stored_tail_count": 1,
-        "effective_incoming": 0,
-    }, evidence
+    if delivery_path == "direct":
+        assert evidence["reconciliation"] == {
+            "action": "filtered replay",
+            "reason": "replayed unanchored durable persisted-output identity",
+            "cursor": 0,
+            "incoming": 1,
+            "session_count": 1,
+            "stored_tail_count": 1,
+            "effective_incoming": 0,
+        }, evidence
+    else:
+        assert pending is not None and not pending.exists(), evidence
     assert receipt_recorded, evidence
