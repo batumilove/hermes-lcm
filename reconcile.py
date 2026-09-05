@@ -1159,8 +1159,21 @@ class ReconcileMixin:
                 if stored_anchor < stored_anchor_ceiling
                 and identities_match(incoming_identity, stored_identities[stored_anchor])
             ]
+            matched_out_of_order_unique = False
             if not matching_candidates:
-                continue
+                unique_candidates = [
+                    candidate
+                    for candidate in candidates
+                    if identities_match(incoming_identity, stored_identities[candidate])
+                ]
+                if len(unique_candidates) != 1:
+                    continue
+                # A unique exact tool identity is safe even when a restarted
+                # snapshot wraps from the durable tail back to older context.
+                # Only repeated identities need the monotonic ceiling to bind
+                # each incoming anchor to a distinct durable occurrence.
+                matching_candidates = unique_candidates
+                matched_out_of_order_unique = True
             stored_anchor = next(
                 (
                     candidate
@@ -1169,7 +1182,8 @@ class ReconcileMixin:
                 ),
                 matching_candidates[0],
             )
-            stored_anchor_ceiling = stored_anchor
+            if not matched_out_of_order_unique:
+                stored_anchor_ceiling = stored_anchor
             replayed_raw_indexes.add(incoming_raw_index)
             matched_tool_anchor_pairs.append((incoming_anchor, stored_anchor))
             call_id = str(incoming_tool.get("tool_call_id") or "").strip()
@@ -1190,6 +1204,12 @@ class ReconcileMixin:
                 replayed_raw_indexes.add(incoming_previous_raw)
 
         if matched_tool_anchor_pairs and suppress_tool_less_duplicates:
+            # Multiple ordered anchors prove that the batch is a replayed
+            # snapshot even when fresh compacted/filler rows are interleaved.
+            # A singleton anchor does not provide that boundary: after the
+            # first unmatched row, later equal identities may be a legitimate
+            # repeated suffix and must remain appendable.
+            allow_interleaved_gaps = len(matched_tool_anchor_pairs) > 1
             # Extend each proven tool anchor only through ordered rows on the
             # same side of the corresponding durable anchor. Incoming scaffold
             # or compacted filler may be interleaved, so exact adjacency is not
@@ -1262,12 +1282,14 @@ class ReconcileMixin:
                                 if matched_at is None or candidate_position < matched_at:
                                     matched_at = candidate_position
                         if matched_at is None:
-                            # Once a visible non-tool row is not durable-proven,
-                            # everything farther from this anchor is ambiguous.
-                            # Skipping over it would turn this back into broad
-                            # identity-membership suppression and can drop a
-                            # legitimate repeated suffix.
-                            break
+                            if not allow_interleaved_gaps:
+                                # Once a visible non-tool row is not
+                                # durable-proven, a singleton anchor cannot
+                                # distinguish farther replay from a legitimate
+                                # repeated suffix.
+                                break
+                            incoming_offset += step
+                            continue
                         replayed_raw_indexes.add(raw_index)
                         stored_cursor = matched_at + 1
                         incoming_offset += step
