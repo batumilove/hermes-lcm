@@ -118,6 +118,37 @@ class ReconcileMixin:
             hermes_home=self._hermes_home,
         )
         recovered_content, recovered_generation = recovered_with_stat
+        recovered_identity_content = normalize_content_value(
+            redact_sensitive_value(
+                recovered_content,
+                self._config,
+                parse_json_strings=False,
+            )
+        )
+        if _has_lossy_sensitive_redaction(recovered_identity_content):
+            # Lossy content alone cannot distinguish legitimate retries. An
+            # exact live-file generation is sufficient provenance without
+            # retaining a potentially sensitive raw-preview digest.
+            exact_generation_content = find_externalized_tool_result_content_for_call(
+                tool_call_id=str(msg.get("tool_call_id") or ""),
+                session_id=str(msg.get("session_id") or self._session_id or ""),
+                expected_chars=expected_chars,
+                persisted_output_source_path=persisted_output_source_path,
+                persisted_output_file_size=recovered_generation["size"],
+                persisted_output_file_mtime_ns=recovered_generation["mtime_ns"],
+                persisted_output_file_ctime_ns=recovered_generation["ctime_ns"],
+                config=self._config,
+                hermes_home=self._hermes_home,
+            )
+            if (
+                exact_generation_content is not None
+                and _has_lossy_sensitive_redaction(exact_generation_content)
+                and self._recovered_content_matches_durable_identity(
+                    recovered_content,
+                    exact_generation_content,
+                )
+            ):
+                return True
         if durable_content is not None:
             if _has_lossy_sensitive_redaction(durable_content):
                 # A lossy durable value cannot distinguish retries whose only
