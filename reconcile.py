@@ -159,6 +159,7 @@ class ReconcileMixin:
                 durable_content,
             )
 
+
         # Older payloads created from raw tool content have no persisted-source
         # provenance. Resolve those rows by the durable session and call ID,
         # then require exact, non-lossy recovered-content identity.
@@ -1232,8 +1233,27 @@ class ReconcileMixin:
                         )
                         if candidate not in claimed_stored_tool_anchors
                     ]
+                    incoming_previous = (
+                        visible_messages[incoming_anchor - 1][1]
+                        if incoming_anchor > 0
+                        else None
+                    )
+                    has_adjacent_new_call = bool(
+                        incoming_previous is not None
+                        and str(incoming_previous.get("role") or "")
+                        == "assistant"
+                        and call_id in assistant_tool_call_ids(incoming_previous)
+                    )
+                    persisted_previous_matches = bool(
+                        len(persisted_candidates) == 1
+                        and previous_assistant_matches(persisted_candidates[0])
+                    )
                     if (
                         len(persisted_candidates) == 1
+                        and (
+                            not has_adjacent_new_call
+                            or persisted_previous_matches
+                        )
                         and _is_hermes_persisted_output_marker(
                             normalize_content_value(incoming_tool.get("content"))
                             or ""
@@ -1248,7 +1268,7 @@ class ReconcileMixin:
                         matched_tool_anchor_pairs.append(
                             (incoming_anchor, stored_anchor)
                         )
-                        if previous_assistant_matches(stored_anchor):
+                        if persisted_previous_matches:
                             incoming_previous_raw, _ = visible_messages[
                                 incoming_anchor - 1
                             ]
