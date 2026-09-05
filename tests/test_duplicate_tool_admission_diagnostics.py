@@ -4,6 +4,7 @@ import hashlib
 import json
 import logging
 
+import hermes_lcm.engine as engine_module
 from hermes_lcm.config import LCMConfig
 from hermes_lcm.engine import LCMEngine
 
@@ -56,6 +57,11 @@ def test_exact_duplicate_reaching_storage_admission_emits_bounded_receipt_withou
         "_find_tool_anchored_replay_indexes",
         lambda *_args, **_kwargs: (set(), 0),
     )
+
+    def fail_if_git_is_probed(_root):
+        raise AssertionError("diagnostic admission path must not probe git")
+
+    monkeypatch.setattr(engine_module, "_git_runtime_identity", fail_if_git_is_probed)
 
     with caplog.at_level(logging.WARNING, logger="hermes_lcm.engine"):
         engine._ingest_messages([_tool(call_id, content)])
@@ -115,3 +121,95 @@ def test_new_standalone_tool_content_with_reused_id_stays_silent_and_persists(
 
     assert [row["content"] for row in rows] == ["first result", "different result"]
     assert EVENT_PREFIX not in caplog.text
+
+
+def test_receipt_is_hard_bounded_with_an_adversarial_engine_class_name(
+    tmp_path, monkeypatch, caplog
+):
+    config = LCMConfig(database_path=str(tmp_path / "bounded-receipt.db"))
+    engine_type = type("X" * 10000, (LCMEngine,), {})
+    engine = engine_type(config=config)
+    engine.on_session_start("bounded-session", context_length=200000)
+    engine._ingest_messages([_tool("call_bounded", "same result")])
+    engine._ingest_cursor = 0
+    engine._ingest_cursor_needs_reconcile = False
+    monkeypatch.setattr(
+        engine,
+        "_find_tool_anchored_replay_indexes",
+        lambda *_args, **_kwargs: (set(), 0),
+    )
+
+    with caplog.at_level(logging.WARNING, logger="hermes_lcm.engine"):
+        engine._ingest_messages([_tool("call_bounded", "same result")])
+
+    engine.shutdown()
+    records = [record.message for record in caplog.records if record.message.startswith(EVENT_PREFIX)]
+    assert len(records) == 1
+    assert len(records[0].encode("utf-8")) <= 4096
+    assert json.loads(records[0][len(EVENT_PREFIX) :])["receipt_truncated"] is True
+
+
+def test_failing_diagnostic_logging_handler_does_not_block_storage(tmp_path, monkeypatch):
+    class FailingHandler(logging.Handler):
+        def emit(self, record):
+            message = record.getMessage()
+            if EVENT_PREFIX in message or message.startswith(
+                "LCM duplicate-tool admission diagnostic failed:"
+            ):
+                raise RuntimeError("diagnostic sink unavailable")
+
+    config = LCMConfig(database_path=str(tmp_path / "failing-handler.db"))
+    session_id = "failing-handler-session"
+    engine = LCMEngine(config=config)
+    engine.on_session_start(session_id, context_length=200000)
+    engine._ingest_messages([_tool("call_handler", "same result")])
+    engine._ingest_cursor = 0
+    engine._ingest_cursor_needs_reconcile = False
+    monkeypatch.setattr(
+        engine,
+        "_find_tool_anchored_replay_indexes",
+        lambda *_args, **_kwargs: (set(), 0),
+    )
+    handler = FailingHandler()
+    logger = logging.getLogger("hermes_lcm.engine")
+    prior_level = logger.level
+    logger.setLevel(logging.DEBUG)
+    logger.addHandler(handler)
+    try:
+        engine._ingest_messages([_tool("call_handler", "same result")])
+    finally:
+        logger.removeHandler(handler)
+        logger.setLevel(prior_level)
+
+    rows = engine._store.get_session_messages(session_id)
+    engine.shutdown()
+    assert len(rows) == 2
+
+
+def test_diagnostic_store_lookup_is_indexed_and_result_bounded(tmp_path):
+    config = LCMConfig(database_path=str(tmp_path / "bounded-lookup.db"))
+    engine = LCMEngine(config=config)
+    engine.on_session_start("lookup-session", context_length=200000)
+    for idx in range(100):
+        engine._store.append(
+            "lookup-session",
+            _tool("reused-call", f"result-{idx}"),
+        )
+
+    rows = engine._store.get_bounded_tool_call_rows(
+        "lookup-session",
+        {"reused-call"},
+        max_call_ids=8,
+        max_rows=16,
+    )
+    plan = engine._store.connection.execute(
+        "EXPLAIN QUERY PLAN SELECT store_id FROM messages "
+        "INDEXED BY idx_msg_session WHERE session_id = ? "
+        "ORDER BY store_id DESC LIMIT ?",
+        ("lookup-session", 256),
+    ).fetchall()
+    engine.shutdown()
+
+    assert len(rows) == 16
+    assert [row["content"] for row in rows] == [f"result-{idx}" for idx in range(84, 100)]
+    assert any("idx_msg_session" in str(row) for row in plan)

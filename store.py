@@ -788,6 +788,61 @@ class MessageStore:
         messages = self.get_batch(sorted(wanted_store_ids))
         return [messages[store_id] for store_id in sorted(messages)]
 
+    def get_bounded_tool_call_rows(
+        self,
+        session_id: str,
+        call_ids: set[str],
+        *,
+        conversation_id: str | None = None,
+        max_call_ids: int = 8,
+        max_rows: int = 64,
+    ) -> List[Dict[str, Any]]:
+        """Return a bounded recent sample of durable tool rows.
+
+        This is for best-effort diagnostics, not replay reconciliation. Both
+        caller-controlled limits are clamped so diagnostic work and memory stay
+        bounded even when one tool-call identity has a large durable history.
+        """
+        call_limit = min(max(int(max_call_ids), 0), 8)
+        row_limit = min(max(int(max_rows), 0), 64)
+        normalized_ids = sorted(
+            {str(call_id).strip() for call_id in call_ids if str(call_id).strip()}
+        )[:call_limit]
+        if not normalized_ids or not row_limit:
+            return []
+        assert self._conn is not None
+
+        # Use the existing session/store index and cap the raw scan itself.
+        # Adding a new index here would turn diagnostics into a potentially
+        # expensive migration for large live databases.
+        scan_limit = 256
+        rows = self._conn.execute(
+            f"""SELECT {_MESSAGE_SELECT_COLUMNS}
+                  FROM messages INDEXED BY idx_msg_session
+                 WHERE session_id = ?
+                 ORDER BY store_id DESC
+                 LIMIT ?""",
+            (session_id, scan_limit),
+        ).fetchall()
+        normalized_conversation_id = _normalize_conversation_id_value(conversation_id)
+        matches: list[Dict[str, Any]] = []
+        for row in rows:
+            decoded = self._row_to_dict(row)
+            if decoded.get("role") != "tool":
+                continue
+            if str(decoded.get("tool_call_id") or "").strip() not in normalized_ids:
+                continue
+            if (
+                normalized_conversation_id
+                and _normalize_conversation_id_value(decoded.get("conversation_id"))
+                != normalized_conversation_id
+            ):
+                continue
+            matches.append(decoded)
+            if len(matches) >= row_limit:
+                break
+        return list(reversed(matches))
+
     def _session_load_where(
         self,
         session_id: str,

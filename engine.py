@@ -5599,24 +5599,30 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
         never message content, raw session IDs, or raw tool-call IDs.
         """
         try:
-            candidates = [
-                (absolute_idx, message)
-                for absolute_idx, message in messages_to_store_with_index
-                if str(message.get("role") or "") == "tool"
-                and bool(str(message.get("tool_call_id") or "").strip())
-            ]
+            candidate_tool_count = 0
+            candidates: list[tuple[int, Dict[str, Any]]] = []
+            for absolute_idx, message in messages_to_store_with_index:
+                if str(message.get("role") or "") != "tool" or not str(
+                    message.get("tool_call_id") or ""
+                ).strip():
+                    continue
+                candidate_tool_count += 1
+                if len(candidates) < 8:
+                    candidates.append((absolute_idx, message))
             if not candidates or not self._session_id:
                 return
             call_ids = {
                 str(message.get("tool_call_id") or "").strip()
                 for _absolute_idx, message in candidates
             }
-            durable_rows = self._store.get_tool_call_replay_neighborhoods(
+            durable_rows = self._store.get_bounded_tool_call_rows(
                 self._session_id,
                 call_ids,
                 conversation_id=self._conversation_id,
+                max_call_ids=8,
+                max_rows=64,
             )
-            durable_tools: dict[tuple[str, str, str, str], list[int]] = {}
+            durable_tools: dict[tuple[str, str, str, str, str], list[int]] = {}
             for row in durable_rows:
                 if str(row.get("role") or "") != "tool":
                     continue
@@ -5644,14 +5650,17 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
             if not duplicate_count:
                 return
 
-            git_identity = _git_runtime_identity(_PLUGIN_ROOT)
             metadata = _plugin_metadata()
             database_path = getattr(self._config, "database_path", "")
+            engine_class = f"{type(self).__module__}.{type(self).__qualname__}"
+            receipt_truncated = len(engine_class) > 128
             event = {
                 "schema": "lcm_duplicate_tool_admission_v1",
                 "duplicate_count": duplicate_count,
                 "duplicates_truncated": duplicate_count > len(duplicates),
                 "duplicates": duplicates,
+                "candidate_tool_count": candidate_tool_count,
+                "candidates_truncated": candidate_tool_count > len(candidates),
                 "incoming_count": incoming_count,
                 "admission_count": len(messages_to_store_with_index),
                 "cursor": cursor,
@@ -5664,17 +5673,40 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
                 "database_path_sha256": self._diagnostic_sha256(database_path),
                 "pid": os.getpid(),
                 "invocation_id": str(os.environ.get("INVOCATION_ID") or "")[:64],
-                "engine_class": f"{type(self).__module__}.{type(self).__qualname__}",
+                "engine_class": engine_class[:128],
                 "plugin_name": metadata.get("name", "hermes-lcm")[:64],
                 "plugin_version": metadata.get("version", "unknown")[:64],
-                "plugin_git_commit": str(git_identity.get("plugin_git_commit") or "")[:40],
+                # Avoid subprocess probes on the ingestion hot path. Immutable
+                # generation identity remains available through deployment
+                # manifests and the existing status surface.
+                "plugin_git_commit": "",
+                "receipt_truncated": receipt_truncated,
             }
-            logger.warning(
-                "LCM_DUPLICATE_TOOL_ADMISSION_DIAGNOSTIC %s",
-                json.dumps(event, sort_keys=True, separators=(",", ":")),
-            )
+            prefix = "LCM_DUPLICATE_TOOL_ADMISSION_DIAGNOSTIC "
+            serialized = json.dumps(event, sort_keys=True, separators=(",", ":"))
+            if len((prefix + serialized).encode("utf-8")) > 4096:
+                event["duplicates"] = []
+                event["duplicates_truncated"] = True
+                event["receipt_truncated"] = True
+                serialized = json.dumps(event, sort_keys=True, separators=(",", ":"))
+            if len((prefix + serialized).encode("utf-8")) > 4096:
+                event = {
+                    "schema": "lcm_duplicate_tool_admission_v1",
+                    "duplicate_count": duplicate_count,
+                    "duplicates": [],
+                    "duplicates_truncated": True,
+                    "receipt_truncated": True,
+                }
+                serialized = json.dumps(event, sort_keys=True, separators=(",", ":"))
+            try:
+                logger.warning("%s%s", prefix, serialized)
+            except Exception:
+                pass
         except Exception as exc:
-            logger.debug("LCM duplicate-tool admission diagnostic failed: %s", exc)
+            try:
+                logger.debug("LCM duplicate-tool admission diagnostic failed: %s", exc)
+            except Exception:
+                pass
 
     @staticmethod
     def _protected_message_uses_raw_payload_active_stub(message: Dict[str, Any]) -> bool:
