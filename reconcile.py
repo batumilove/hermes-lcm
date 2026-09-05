@@ -20,6 +20,7 @@ from __future__ import annotations
 
 import json
 import re
+from bisect import bisect_left
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
@@ -118,13 +119,54 @@ class ReconcileMixin:
         )
         if durable_content is None:
             return False
-        if recovered_with_stat is not None:
-            recovered_content, _file_stat = recovered_with_stat
-            if not self._recovered_content_matches_durable_identity(recovered_content, durable_content):
+        recovered_content, recovered_generation = recovered_with_stat
+        if _has_lossy_sensitive_redaction(durable_content):
+            # A lossy durable value cannot distinguish retries whose only
+            # difference was redacted. Suppress only when the current config
+            # also redacts the recovered value and the durable payload proves
+            # the exact live file generation.
+            recovered_identity_content = normalize_content_value(
+                redact_sensitive_value(
+                    recovered_content,
+                    self._config,
+                    parse_json_strings=False,
+                )
+            )
+            if not _has_lossy_sensitive_redaction(recovered_identity_content):
                 return False
-        return True
+            exact_generation_content = find_externalized_tool_result_content_for_call(
+                tool_call_id=str(msg.get("tool_call_id") or ""),
+                session_id=str(msg.get("session_id") or self._session_id or ""),
+                expected_chars=expected_chars,
+                persisted_output_source_path=persisted_output_source_path,
+                persisted_output_preview_sha256=persisted_output_preview_sha256,
+                allow_redacted_preview_match=allow_redacted_preview_match,
+                persisted_output_file_size=recovered_generation["size"],
+                persisted_output_file_mtime_ns=recovered_generation["mtime_ns"],
+                persisted_output_file_ctime_ns=recovered_generation["ctime_ns"],
+                config=self._config,
+                hermes_home=self._hermes_home,
+            )
+            return bool(
+                exact_generation_content is not None
+                and _has_lossy_sensitive_redaction(exact_generation_content)
+                and self._recovered_content_matches_durable_identity(
+                    recovered_content,
+                    exact_generation_content,
+                )
+            )
+        return self._recovered_content_matches_durable_identity(
+            recovered_content,
+            durable_content,
+        )
 
-    def _message_replay_identity(self, msg: Dict[str, Any], *, stored_row: bool = False) -> tuple[str, str, str, str]:
+    def _message_replay_identity(
+        self,
+        msg: Dict[str, Any],
+        *,
+        stored_row: bool = False,
+        inferred_tool_name: str | None = None,
+    ) -> tuple[str, str, str, str, str]:
         role = str(msg.get("role") or "unknown")
         content = normalize_content_value(msg.get("content")) or ""
         if (
@@ -183,9 +225,27 @@ class ReconcileMixin:
                     config=self._config,
                     hermes_home=self._hermes_home,
                 )
-            if durable_content is not None and (
-                recovered_content is None or self._recovered_content_matches_durable_identity(recovered_content, durable_content)
+            durable_identity_is_safe = (
+                durable_content is not None
+                and (
+                    (
+                        not _has_lossy_sensitive_redaction(durable_content)
+                        and not _has_lossy_sensitive_redaction(recovered_identity_content)
+                    )
+                    or self._has_durable_persisted_output_replay_identity(msg)
+                )
+            )
+            if (
+                durable_identity_is_safe
+                and (
+                    recovered_content is None
+                    or self._recovered_content_matches_durable_identity(
+                        recovered_content,
+                        durable_content,
+                    )
+                )
             ):
+                assert durable_content is not None
                 content = durable_content
             elif recovered_content is not None:
                 stale_durable_content = find_externalized_tool_result_content_for_call(
@@ -235,17 +295,21 @@ class ReconcileMixin:
             if payload is not None and isinstance(payload.get("content"), str):
                 content = payload["content"]
         tool_calls_identity = self._stable_tool_calls_identity(tool_calls)
+        tool_name = str(msg.get("tool_name") or "") if role == "tool" else ""
+        if role == "tool" and not tool_name and inferred_tool_name:
+            tool_name = inferred_tool_name
         return (
             role,
             content,
             str(msg.get("tool_call_id") or ""),
             tool_calls_identity,
+            tool_name,
         )
 
     @staticmethod
     def _matches_store_tail_suffix(
-        stored_tail: list[tuple[str, str, str, str]],
-        candidate_prefix: list[tuple[str, str, str, str]],
+        stored_tail: list[tuple[str, str, str, str, str]],
+        candidate_prefix: list[tuple[str, str, str, str, str]],
     ) -> bool:
         if not candidate_prefix:
             return True
@@ -255,9 +319,9 @@ class ReconcileMixin:
 
     @staticmethod
     def _strip_inline_persisted_output_generation_identity(
-        identity: tuple[str, str, str, str],
-    ) -> tuple[str, str, str, str]:
-        role, content, tool_call_id, tool_calls = identity
+        identity: tuple[str, str, str, str, str],
+    ) -> tuple[str, str, str, str, str]:
+        role, content, tool_call_id, tool_calls, tool_name = identity
         if role != "tool" or not isinstance(content, str):
             return identity
         stripped = re.sub(
@@ -266,7 +330,7 @@ class ReconcileMixin:
             "\n",
             content,
         )
-        return (role, stripped, tool_call_id, tool_calls)
+        return (role, stripped, tool_call_id, tool_calls, tool_name)
 
     def _stored_row_has_durable_persisted_output_marker(self, row: Dict[str, Any]) -> bool:
         if str(row.get("role") or "") != "tool":
@@ -283,22 +347,28 @@ class ReconcileMixin:
 
     @staticmethod
     def _persisted_output_durable_wildcard_identity(
-        identity: tuple[str, str, str, str],
-    ) -> tuple[str, str, str, str]:
-        role, _content, tool_call_id, tool_calls = identity
-        return (role, "[LCM persisted-output durable replay]", tool_call_id, tool_calls)
+        identity: tuple[str, str, str, str, str],
+    ) -> tuple[str, str, str, str, str]:
+        role, _content, tool_call_id, tool_calls, tool_name = identity
+        return (
+            role,
+            "[LCM persisted-output durable replay]",
+            tool_call_id,
+            tool_calls,
+            tool_name,
+        )
 
     def _matches_persisted_output_durable_full_replay(
         self,
         candidate_messages: list[Dict[str, Any]],
-        candidate_prefix: list[tuple[str, str, str, str]],
-        stored_tail: list[tuple[str, str, str, str]],
+        candidate_prefix: list[tuple[str, str, str, str, str]],
+        stored_tail: list[tuple[str, str, str, str, str]],
         stored_tail_rows: list[Dict[str, Any]] | None,
     ) -> bool:
         if not stored_tail_rows or len(candidate_prefix) != len(stored_tail) or len(candidate_messages) != len(candidate_prefix):
             return False
-        transformed_candidate: list[tuple[str, str, str, str]] = []
-        transformed_stored: list[tuple[str, str, str, str]] = []
+        transformed_candidate: list[tuple[str, str, str, str, str]] = []
+        transformed_stored: list[tuple[str, str, str, str, str]] = []
         saw_persisted_output = False
         for candidate_msg, candidate_identity, stored_identity, stored_row in zip(
             candidate_messages,
@@ -349,9 +419,9 @@ class ReconcileMixin:
     @classmethod
     def _active_cleanup_replay_identity(
         cls,
-        identity: tuple[str, str, str, str],
-    ) -> tuple[str, str, str, str] | None:
-        role, content, tool_call_id, tool_calls = identity
+        identity: tuple[str, str, str, str, str],
+    ) -> tuple[str, str, str, str, str] | None:
+        role, content, tool_call_id, tool_calls, tool_name = identity
         if role != "assistant":
             return identity
         msg: dict[str, Any] = {
@@ -372,11 +442,12 @@ class ReconcileMixin:
             normalize_content_value(cleaned.get("content")) or "",
             tool_call_id,
             tool_calls,
+            tool_name,
         )
 
     @staticmethod
-    def _is_quarantined_assistant_replay_identity(identity: tuple[str, str, str, str]) -> bool:
-        role, content, _tool_call_id, _tool_calls = identity
+    def _is_quarantined_assistant_replay_identity(identity: tuple[str, str, str, str, str]) -> bool:
+        role, content, _tool_call_id, _tool_calls, _tool_name = identity
         if role != "assistant":
             return False
         text = str(content or "").strip()
@@ -403,15 +474,15 @@ class ReconcileMixin:
 
     def _stored_tail_for_sanitized_active_replay(
         self,
-        stored_tail: list[tuple[str, str, str, str]],
-    ) -> list[tuple[str, str, str, str]]:
+        stored_tail: list[tuple[str, str, str, str, str]],
+    ) -> list[tuple[str, str, str, str, str]]:
         """Mirror active-context cleanup for restart replay reconciliation.
 
         Raw storage remains lossless. This view is used only to reconcile a
         restarted process when the host replays sanitized active context where
         assistant rows may be removed or have internal content stripped.
         """
-        sanitized_tail: list[tuple[str, str, str, str]] = []
+        sanitized_tail: list[tuple[str, str, str, str, str]] = []
         for identity in stored_tail:
             cleaned_identity = self._active_cleanup_replay_identity(identity)
             if cleaned_identity is not None:
@@ -421,7 +492,7 @@ class ReconcileMixin:
     def _find_reconciled_cursor_for_store_tail(
         self,
         messages: List[Dict[str, Any]],
-        stored_tail: list[tuple[str, str, str, str]],
+        stored_tail: list[tuple[str, str, str, str, str]],
         *,
         stored_tail_rows: list[Dict[str, Any]] | None = None,
         allow_empty_prefix: bool,
@@ -433,7 +504,7 @@ class ReconcileMixin:
         sanitized_tail_collapsed = len(sanitized_replay_tail) < len(stored_tail)
         boundary_messages = list(stored_tail_rows or [])
         if not boundary_messages:
-            for role, content, tool_call_id, tool_calls in stored_tail:
+            for role, content, tool_call_id, tool_calls, tool_name in stored_tail:
                 try:
                     decoded_tool_calls = json.loads(tool_calls) if tool_calls else []
                 except (TypeError, ValueError, json.JSONDecodeError):
@@ -443,6 +514,7 @@ class ReconcileMixin:
                     "content": content,
                     "tool_call_id": tool_call_id,
                     "tool_calls": decoded_tool_calls,
+                    "tool_name": tool_name,
                 })
         effective_fresh_tail_count = self._fresh_tail_boundary(boundary_messages).count
         empty_prefix_cursor: int | None = None
@@ -766,7 +838,7 @@ class ReconcileMixin:
     def _effective_replay_identities(
         self,
         messages: List[Dict[str, Any]],
-    ) -> list[tuple[str, str, str, str]]:
+    ) -> list[tuple[str, str, str, str, str]]:
         return [
             self._message_replay_identity(msg)
             for msg in messages
@@ -825,8 +897,8 @@ class ReconcileMixin:
         ]
 
         def identities_match(
-            incoming_identity: tuple[str, str, str, str],
-            stored_identity: tuple[str, str, str, str],
+            incoming_identity: tuple[str, str, str, str, str],
+            stored_identity: tuple[str, str, str, str, str],
         ) -> bool:
             if incoming_identity == stored_identity:
                 return True
@@ -884,7 +956,13 @@ class ReconcileMixin:
         visible_messages = [
             (raw_index, msg)
             for raw_index, msg in enumerate(messages)
-            if not self._is_replayed_context_scaffold_message(msg)
+            if (
+                not self._is_replayed_context_scaffold_message(msg)
+                or (
+                    str(msg.get("role") or "") == "tool"
+                    and bool(str(msg.get("tool_call_id") or "").strip())
+                )
+            )
             and (
                 raw_index not in preignored_indexes
                 if preignored_indexes is not None
@@ -927,18 +1005,70 @@ class ReconcileMixin:
         if not stored_rows:
             return set(), scanned_row_count
 
+        def inferred_tool_names(rows: List[Dict[str, Any]]) -> list[str | None]:
+            inferred: list[str | None] = [None] * len(rows)
+            for offset, row in enumerate(rows):
+                if (
+                    offset == 0
+                    or str(row.get("role") or "") != "tool"
+                    or bool(str(row.get("tool_name") or "").strip())
+                ):
+                    continue
+                call_id = str(row.get("tool_call_id") or "").strip()
+                previous = rows[offset - 1]
+                if not call_id or str(previous.get("role") or "") != "assistant":
+                    continue
+                tool_calls = previous.get("tool_calls") or []
+                if isinstance(tool_calls, str):
+                    try:
+                        tool_calls = json.loads(tool_calls)
+                    except (TypeError, ValueError, json.JSONDecodeError):
+                        continue
+                if isinstance(tool_calls, dict):
+                    tool_calls = [tool_calls]
+                if not isinstance(tool_calls, list):
+                    continue
+                names: set[str] = set()
+                for tool_call in tool_calls:
+                    if not isinstance(tool_call, dict):
+                        continue
+                    candidate_call_id = str(
+                        tool_call.get("id") or tool_call.get("tool_call_id") or ""
+                    ).strip()
+                    function = tool_call.get("function") or {}
+                    tool_name = (
+                        str(function.get("name") or "").strip()
+                        if isinstance(function, dict)
+                        else ""
+                    )
+                    if candidate_call_id == call_id and tool_name:
+                        names.add(tool_name)
+                if len(names) == 1:
+                    inferred[offset] = next(iter(names))
+            return inferred
+
+        incoming_rows = [msg for _raw_index, msg in visible_messages]
+        incoming_name_map = inferred_tool_names(incoming_rows)
+        stored_name_map = inferred_tool_names(stored_rows)
         incoming_identities = [
-            self._message_replay_identity(msg)
-            for _raw_index, msg in visible_messages
+            self._message_replay_identity(
+                msg,
+                inferred_tool_name=incoming_name_map[offset],
+            )
+            for offset, msg in enumerate(incoming_rows)
         ]
         stored_identities = [
-            self._message_replay_identity(row, stored_row=True)
-            for row in stored_rows
+            self._message_replay_identity(
+                row,
+                stored_row=True,
+                inferred_tool_name=stored_name_map[offset],
+            )
+            for offset, row in enumerate(stored_rows)
         ]
 
         def identities_match(
-            incoming_identity: tuple[str, str, str, str],
-            stored_identity: tuple[str, str, str, str],
+            incoming_identity: tuple[str, str, str, str, str],
+            stored_identity: tuple[str, str, str, str, str],
         ) -> bool:
             if incoming_identity == stored_identity:
                 return True
@@ -970,7 +1100,7 @@ class ReconcileMixin:
                     call_ids.add(str(value).strip())
             return call_ids
 
-        stored_tool_anchors: dict[tuple[str, str, str, str], list[int]] = {}
+        stored_tool_anchors: dict[tuple[str, str, str, str, str], list[int]] = {}
         for stored_offset, (stored_row, stored_identity) in enumerate(
             zip(stored_rows, stored_identities)
         ):
@@ -987,7 +1117,14 @@ class ReconcileMixin:
                 stored_tool_anchors.setdefault(key, []).append(stored_offset)
 
         replayed_raw_indexes: set[int] = set()
-        for incoming_anchor in incoming_tool_offsets:
+        matched_tool_anchor_pairs: list[tuple[int, int]] = []
+        claimed_stored_tool_anchors: set[int] = set()
+        # Align repeated identical anchors as an ordered durable subsequence.
+        # Walking both sides newest-to-oldest keeps the latest-match bias for a
+        # singleton replay without allowing multiple incoming anchors to bind
+        # to the same durable occurrence.
+        stored_anchor_ceiling = len(stored_rows)
+        for incoming_anchor in reversed(incoming_tool_offsets):
             incoming_raw_index, incoming_tool = visible_messages[incoming_anchor]
             incoming_identity = incoming_identities[incoming_anchor]
             # Missing persisted-output source files do not make an exact stored
@@ -997,16 +1134,16 @@ class ReconcileMixin:
             # identity lookup below still preserves changed markers and markers
             # whose call id/content have never been stored.
             candidates = stored_tool_anchors.get(incoming_identity, [])
-            for stored_anchor in candidates:
-                if not identities_match(incoming_identity, stored_identities[stored_anchor]):
-                    continue
-                replayed_raw_indexes.add(incoming_raw_index)
+
+            def previous_assistant_matches(stored_anchor: int) -> bool:
+                if incoming_anchor <= 0 or stored_anchor <= 0:
+                    return False
                 call_id = str(incoming_tool.get("tool_call_id") or "").strip()
-                if incoming_anchor <= 0 or stored_anchor <= 0 or not call_id:
-                    continue
-                incoming_previous_raw, incoming_previous = visible_messages[incoming_anchor - 1]
+                if not call_id:
+                    return False
+                incoming_previous = visible_messages[incoming_anchor - 1][1]
                 stored_previous = stored_rows[stored_anchor - 1]
-                if (
+                return (
                     str(incoming_previous.get("role") or "") == "assistant"
                     and str(stored_previous.get("role") or "") == "assistant"
                     and call_id in assistant_tool_call_ids(incoming_previous)
@@ -1015,40 +1152,193 @@ class ReconcileMixin:
                         incoming_identities[incoming_anchor - 1],
                         stored_identities[stored_anchor - 1],
                     )
-                ):
-                    replayed_raw_indexes.add(incoming_previous_raw)
+                )
 
-        if replayed_raw_indexes and suppress_tool_less_duplicates:
-            # Interleaved snapshot replay: once a batch is proven to replay
-            # durable tool results, tool-less rows whose full identity
-            # byte-matches a durable row are part of the same replayed
-            # snapshot, not legitimate repetition.  Suppress them too.  A
-            # batch with no tool anchor keeps the conservative behavior:
-            # ambiguous tool-less duplicates stay preserved.
-            stored_identity_keys: set[tuple[str, str, str, str]] = set()
-            for stored_row, stored_identity in zip(stored_rows, stored_identities):
-                stored_identity_keys.add(stored_identity)
-                cleaned = self._active_cleanup_replay_identity(stored_identity)
-                if cleaned is not None:
-                    stored_identity_keys.add(cleaned)
-            for offset, (raw_index, msg) in enumerate(visible_messages):
-                if raw_index in replayed_raw_indexes:
+            matching_candidates = [
+                stored_anchor
+                for stored_anchor in reversed(candidates)
+                if stored_anchor not in claimed_stored_tool_anchors
+                and stored_anchor < stored_anchor_ceiling
+                and identities_match(incoming_identity, stored_identities[stored_anchor])
+            ]
+            matched_out_of_order_unique = False
+            if not matching_candidates:
+                unique_candidates = [
+                    candidate
+                    for candidate in candidates
+                    if candidate not in claimed_stored_tool_anchors
+                    and identities_match(incoming_identity, stored_identities[candidate])
+                ]
+                if len(unique_candidates) != 1:
+                    # Exact duplicate tool rows are still replay-safe to drop,
+                    # but reusing a claimed durable occurrence must not create
+                    # another anchor pair: that would turn singleton evidence
+                    # into false multi-anchor proof across an unmatched gap.
+                    if candidates and not unique_candidates:
+                        replayed_raw_indexes.add(incoming_raw_index)
+                        if len(candidates) == 1:
+                            claimed_anchor = candidates[0]
+                            for pair_index, (
+                                paired_incoming,
+                                paired_stored,
+                            ) in enumerate(matched_tool_anchor_pairs):
+                                if (
+                                    paired_stored == claimed_anchor
+                                    and incoming_anchor < paired_incoming
+                                ):
+                                    # Keep singleton proof at the oldest replay
+                                    # occurrence. A later duplicate remains
+                                    # suppressible as a tool row, but cannot
+                                    # move the boundary past an unmatched gap.
+                                    matched_tool_anchor_pairs[pair_index] = (
+                                        incoming_anchor,
+                                        claimed_anchor,
+                                    )
+                                    break
+                        if incoming_anchor > 0:
+                            incoming_previous_raw, _ = visible_messages[
+                                incoming_anchor - 1
+                            ]
+                            if any(
+                                previous_assistant_matches(candidate)
+                                for candidate in candidates
+                            ):
+                                replayed_raw_indexes.add(incoming_previous_raw)
                     continue
-                if str(msg.get("role") or "") == "tool" and bool(
-                    str(msg.get("tool_call_id") or "")
-                ):
-                    continue
-                identity = incoming_identities[offset]
-                if identity in stored_identity_keys:
-                    replayed_raw_indexes.add(raw_index)
+                # A unique exact tool identity is safe even when a restarted
+                # snapshot wraps from the durable tail back to older context.
+                # Only repeated identities need the monotonic ceiling to bind
+                # each incoming anchor to a distinct durable occurrence.
+                matching_candidates = unique_candidates
+                matched_out_of_order_unique = True
+            stored_anchor = next(
+                (
+                    candidate
+                    for candidate in matching_candidates
+                    if previous_assistant_matches(candidate)
+                ),
+                matching_candidates[0],
+            )
+            if not matched_out_of_order_unique:
+                stored_anchor_ceiling = stored_anchor
+            claimed_stored_tool_anchors.add(stored_anchor)
+            replayed_raw_indexes.add(incoming_raw_index)
+            matched_tool_anchor_pairs.append((incoming_anchor, stored_anchor))
+            call_id = str(incoming_tool.get("tool_call_id") or "").strip()
+            if incoming_anchor <= 0 or stored_anchor <= 0 or not call_id:
+                continue
+            incoming_previous_raw, incoming_previous = visible_messages[incoming_anchor - 1]
+            stored_previous = stored_rows[stored_anchor - 1]
+            if (
+                str(incoming_previous.get("role") or "") == "assistant"
+                and str(stored_previous.get("role") or "") == "assistant"
+                and call_id in assistant_tool_call_ids(incoming_previous)
+                and call_id in assistant_tool_call_ids(stored_previous)
+                and identities_match(
+                    incoming_identities[incoming_anchor - 1],
+                    stored_identities[stored_anchor - 1],
+                )
+            ):
+                replayed_raw_indexes.add(incoming_previous_raw)
+
+        if matched_tool_anchor_pairs and suppress_tool_less_duplicates:
+            # Multiple ordered anchors prove that the batch is a replayed
+            # snapshot even when fresh compacted/filler rows are interleaved.
+            # A singleton anchor does not provide that boundary: after the
+            # first unmatched row, later equal identities may be a legitimate
+            # repeated suffix and must remain appendable.
+            allow_interleaved_gaps = len(matched_tool_anchor_pairs) > 1
+            # Extend each proven tool anchor only through ordered rows on the
+            # same side of the corresponding durable anchor. Incoming scaffold
+            # or compacted filler may be interleaved, so exact adjacency is not
+            # required, but matching cannot cross another tool-result anchor or
+            # reverse durable order. This keeps suppression bound to the proven
+            # tool exchange instead of using global identity membership.
+            segment_positions_cache: dict[
+                tuple[int, int],
+                tuple[int, dict[tuple[str, str, str, str, str], list[int]]],
+            ] = {}
+            for incoming_anchor, stored_anchor in matched_tool_anchor_pairs:
+                for step in (-1, 1):
+                    cache_key = (stored_anchor, step)
+                    cached_segment = segment_positions_cache.get(cache_key)
+                    if cached_segment is None:
+                        stored_segment: list[int] = []
+                        stored_offset = stored_anchor + step
+                        while 0 <= stored_offset < len(stored_rows):
+                            stored_message = stored_rows[stored_offset]
+                            if str(stored_message.get("role") or "") == "tool" and bool(
+                                str(stored_message.get("tool_call_id") or "")
+                            ):
+                                break
+                            stored_segment.append(stored_offset)
+                            stored_offset += step
+                        positions_by_identity: dict[
+                            tuple[str, str, str, str, str], list[int]
+                        ] = {}
+                        for cursor_position, candidate_offset in enumerate(stored_segment):
+                            candidate_identity = stored_identities[candidate_offset]
+                            keys = {candidate_identity}
+                            cleaned_identity = self._active_cleanup_replay_identity(
+                                candidate_identity
+                            )
+                            if cleaned_identity is not None:
+                                keys.add(cleaned_identity)
+                            for key in keys:
+                                positions_by_identity.setdefault(key, []).append(
+                                    cursor_position
+                                )
+                        cached_segment = (len(stored_segment), positions_by_identity)
+                        segment_positions_cache[cache_key] = cached_segment
+
+                    stored_segment_length, positions_by_identity = cached_segment
+
+                    stored_cursor = 0
+                    incoming_offset = incoming_anchor + step
+                    while (
+                        0 <= incoming_offset < len(visible_messages)
+                        and stored_cursor < stored_segment_length
+                    ):
+                        raw_index, message = visible_messages[incoming_offset]
+                        if str(message.get("role") or "") == "tool" and bool(
+                            str(message.get("tool_call_id") or "")
+                        ):
+                            break
+                        incoming_identity = incoming_identities[incoming_offset]
+                        matched_at = None
+                        incoming_keys = {incoming_identity}
+                        incoming_cleaned = self._active_cleanup_replay_identity(
+                            incoming_identity
+                        )
+                        if incoming_cleaned is not None:
+                            incoming_keys.add(incoming_cleaned)
+                        for key in incoming_keys:
+                            positions = positions_by_identity.get(key, [])
+                            position_index = bisect_left(positions, stored_cursor)
+                            if position_index < len(positions):
+                                candidate_position = positions[position_index]
+                                if matched_at is None or candidate_position < matched_at:
+                                    matched_at = candidate_position
+                        if matched_at is None:
+                            if not allow_interleaved_gaps:
+                                # Once a visible non-tool row is not
+                                # durable-proven, a singleton anchor cannot
+                                # distinguish farther replay from a legitimate
+                                # repeated suffix.
+                                break
+                            incoming_offset += step
+                            continue
+                        replayed_raw_indexes.add(raw_index)
+                        stored_cursor = matched_at + 1
+                        incoming_offset += step
 
         return replayed_raw_indexes, scanned_row_count
 
     def _is_suspicious_stale_no_overlap_snapshot(
         self,
-        incoming_identities: list[tuple[str, str, str, str]],
-        stored_tail: list[tuple[str, str, str, str]],
-        stored_head: list[tuple[str, str, str, str]],
+        incoming_identities: list[tuple[str, str, str, str, str]],
+        stored_tail: list[tuple[str, str, str, str, str]],
+        stored_head: list[tuple[str, str, str, str, str]],
     ) -> bool:
         """Return true for short stale snapshots with no durable-tail overlap.
 
@@ -1248,12 +1538,13 @@ class ReconcileMixin:
         )
         return 0
 
-    def _raw_externalized_placeholder_replay_identity(self, msg: Dict[str, Any]) -> tuple[str, str, str, str]:
+    def _raw_externalized_placeholder_replay_identity(self, msg: Dict[str, Any]) -> tuple[str, str, str, str, str]:
         return (
             str(msg.get("role") or "unknown"),
             normalize_content_value(msg.get("content")) or "",
             self._stable_tool_calls_identity(msg.get("tool_calls")),
             str(msg.get("tool_call_id") or ""),
+            str(msg.get("tool_name") or ""),
         )
 
     def _get_store_id_map_for_messages(self, messages: List[Dict[str, Any]]) -> dict[int, int]:
@@ -1309,9 +1600,9 @@ class ReconcileMixin:
         # Lazily memoize raw-placeholder identities: only the placeholder-ref
         # paths need them, and most histories have few (or none), so computing
         # them on demand keeps the common case free.
-        _raw_placeholder_identity_cache: dict[int, tuple[str, str, str, str]] = {}
+        _raw_placeholder_identity_cache: dict[int, tuple[str, str, str, str, str]] = {}
 
-        def stored_raw_placeholder_identity(probe_idx: int) -> tuple[str, str, str, str]:
+        def stored_raw_placeholder_identity(probe_idx: int) -> tuple[str, str, str, str, str]:
             cached = _raw_placeholder_identity_cache.get(probe_idx)
             if cached is None:
                 cached = self._raw_externalized_placeholder_replay_identity(candidates[probe_idx])
@@ -1345,7 +1636,7 @@ class ReconcileMixin:
                 if surplus_count > 0:
                     active_surplus_skips[identity] = surplus_count
 
-        placeholder_identity_counts: dict[tuple[str, str, str, str], int] = {}
+        placeholder_identity_counts: dict[tuple[str, str, str, str, str], int] = {}
         for msg in messages:
             msg_content = normalize_content_value(msg.get("content")) or ""
             if msg.get("store_id") is None and self._content_has_externalized_placeholder_ref(msg_content):
@@ -1354,7 +1645,7 @@ class ReconcileMixin:
         self._current_compress_placeholder_identity_counts = placeholder_identity_counts
 
         def find_raw_placeholder_match_index(
-            raw_identity: tuple[str, str, str, str],
+            raw_identity: tuple[str, str, str, str, str],
             start_idx: int,
         ) -> int | None:
             probe_idx = start_idx
