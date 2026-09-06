@@ -301,3 +301,140 @@ def test_diagnostic_store_lookup_skips_oversized_content(tmp_path):
     engine.shutdown()
 
     assert [row["content"] for row in rows] == ["small result"]
+
+
+def test_diagnostic_store_lookup_bounds_call_id_iteration(tmp_path):
+    class ExplodingCallIds(set):
+        def __iter__(self):
+            for index, value in enumerate(super().__iter__()):
+                if index >= 8:
+                    raise AssertionError("diagnostic iterated beyond max_call_ids")
+                yield value
+
+    config = LCMConfig(database_path=str(tmp_path / "bounded-call-ids.db"))
+    engine = LCMEngine(config=config)
+    engine.on_session_start("bounded-call-id-session", context_length=200000)
+    engine._store.append(
+        "bounded-call-id-session",
+        _tool("call_0", "small result"),
+    )
+
+    rows = engine._store.get_bounded_tool_call_rows(
+        "bounded-call-id-session",
+        ExplodingCallIds({f"call_{index}" for index in range(100)}),
+        max_call_ids=8,
+    )
+    engine.shutdown()
+
+    assert len(rows) <= 1
+
+
+def test_conversation_lookup_bounds_the_correct_conversation_window(tmp_path):
+    config = LCMConfig(database_path=str(tmp_path / "conversation-window.db"))
+    engine = LCMEngine(config=config)
+    session_id = "shared-session"
+    engine.on_session_start(session_id, context_length=200000)
+    engine._store.append(
+        session_id,
+        _tool("call_target_conversation", "target result"),
+        conversation_id="conversation-a",
+    )
+    for index in range(256):
+        engine._store.append(
+            session_id,
+            _tool(f"call_other_{index}", f"other-{index}"),
+            conversation_id="conversation-b",
+        )
+
+    statements = []
+    engine._store.connection.set_trace_callback(statements.append)
+    rows = engine._store.get_bounded_tool_call_rows(
+        session_id,
+        {"call_target_conversation"},
+        conversation_id="conversation-a",
+    )
+    engine._store.connection.set_trace_callback(None)
+    engine.shutdown()
+
+    assert [row["content"] for row in rows] == ["target result"]
+    assert any("INDEXED BY idx_msg_conversation_session" in sql for sql in statements)
+
+
+def test_multibyte_tool_name_within_character_bound_is_detected(tmp_path, caplog):
+    config = LCMConfig(database_path=str(tmp_path / "multibyte-tool-name.db"))
+    session_id = "multibyte-tool-name-session"
+    duplicate = _tool("call_multibyte_name", "same result")
+    duplicate["tool_name"] = "é" * 512
+    engine = LCMEngine(config=config)
+    engine.on_session_start(session_id, context_length=200000)
+    engine._ingest_messages([duplicate])
+
+    with caplog.at_level(logging.WARNING, logger="hermes_lcm.engine"):
+        engine._warn_if_duplicate_tool_admission(
+            [(0, duplicate)],
+            incoming_count=1,
+            cursor=0,
+            cursor_before_reconcile=0,
+            reconcile_requested=False,
+            overflow_recovery_pending=False,
+            session_end=False,
+        )
+    engine.shutdown()
+
+    assert EVENT_PREFIX in caplog.text
+
+
+def test_name_only_tool_message_matches_canonical_stored_shape(tmp_path, caplog):
+    config = LCMConfig(database_path=str(tmp_path / "name-only-tool.db"))
+    session_id = "name-only-tool-session"
+    duplicate = {
+        "role": "tool",
+        "tool_call_id": "call_name_only",
+        "name": "inspect",
+        "content": "same result",
+    }
+    engine = LCMEngine(config=config)
+    engine.on_session_start(session_id, context_length=200000)
+    engine._ingest_messages([duplicate])
+
+    with caplog.at_level(logging.WARNING, logger="hermes_lcm.engine"):
+        engine._warn_if_duplicate_tool_admission(
+            [(0, duplicate)],
+            incoming_count=1,
+            cursor=0,
+            cursor_before_reconcile=0,
+            reconcile_requested=False,
+            overflow_recovery_pending=False,
+            session_end=False,
+        )
+    engine.shutdown()
+
+    assert EVENT_PREFIX in caplog.text
+
+
+def test_diagnostic_failure_log_does_not_emit_exception_text(tmp_path, monkeypatch, caplog):
+    config = LCMConfig(database_path=str(tmp_path / "exception-redaction.db"))
+    engine = LCMEngine(config=config)
+    engine.on_session_start("private-session-value", context_length=200000)
+    duplicate = _tool("private-call-value", "private-content-value")
+
+    def fail_with_private_text(*_args, **_kwargs):
+        raise RuntimeError("private-session-value private-call-value private-content-value")
+
+    monkeypatch.setattr(engine._store, "get_bounded_tool_call_rows", fail_with_private_text)
+    with caplog.at_level(logging.DEBUG, logger="hermes_lcm.engine"):
+        engine._warn_if_duplicate_tool_admission(
+            [(0, duplicate)],
+            incoming_count=1,
+            cursor=0,
+            cursor_before_reconcile=0,
+            reconcile_requested=False,
+            overflow_recovery_pending=False,
+            session_end=False,
+        )
+    engine.shutdown()
+
+    assert "LCM duplicate-tool admission diagnostic failed" in caplog.text
+    assert "private-session-value" not in caplog.text
+    assert "private-call-value" not in caplog.text
+    assert "private-content-value" not in caplog.text
