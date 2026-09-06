@@ -796,51 +796,91 @@ class MessageStore:
         conversation_id: str | None = None,
         max_call_ids: int = 8,
         max_rows: int = 64,
+        max_content_bytes: int = 65_536,
     ) -> List[Dict[str, Any]]:
-        """Return a bounded recent sample of durable tool rows.
+        """Return a byte-bounded recent sample of durable tool rows.
 
-        This is for best-effort diagnostics, not replay reconciliation. Both
-        caller-controlled limits are clamped so diagnostic work and memory stay
-        bounded even when one tool-call identity has a large durable history.
+        This is for best-effort diagnostics, not replay reconciliation. Counts
+        and projected text are clamped, and only bounded prefixes are returned;
+        diagnostic callers never load external payload sidecars through this
+        path.
         """
         call_limit = min(max(int(max_call_ids), 0), 8)
         row_limit = min(max(int(max_rows), 0), 64)
+        content_limit = min(max(int(max_content_bytes), 0), 65_536)
         normalized_ids = sorted(
-            {str(call_id).strip() for call_id in call_ids if str(call_id).strip()}
+            {
+                value
+                for call_id in call_ids
+                if (value := str(call_id).strip())
+                and len(value) <= 512
+                and len(value.encode("utf-8", errors="replace")) <= 2048
+            }
         )[:call_limit]
-        if not normalized_ids or not row_limit:
+        if not normalized_ids or not row_limit or not content_limit:
             return []
         assert self._conn is not None
 
-        # Use the existing session/store index and cap the raw scan itself.
-        # Adding a new index here would turn diagnostics into a potentially
-        # expensive migration for large live databases.
+        # First bind the scan to the newest 256 store IDs using the existing
+        # session index. The outer query projects bounded BLOB prefixes only, so
+        # even a matching row with a huge TEXT value cannot enter Python in full.
         scan_limit = 256
-        rows = self._conn.execute(
-            f"""SELECT {_MESSAGE_SELECT_COLUMNS}
-                  FROM messages INDEXED BY idx_msg_session
-                 WHERE session_id = ?
-                 ORDER BY store_id DESC
-                 LIMIT ?""",
-            (session_id, scan_limit),
-        ).fetchall()
+        placeholders = ",".join("?" for _ in normalized_ids)
         normalized_conversation_id = _normalize_conversation_id_value(conversation_id)
+        conversation_clause = ""
+        conversation_args: list[Any] = []
+        if normalized_conversation_id:
+            conversation_clause = " AND m.conversation_id = ?"
+            conversation_args.append(normalized_conversation_id)
+        rows = self._conn.execute(
+            f"""WITH recent AS (
+                    SELECT store_id
+                      FROM messages INDEXED BY idx_msg_session
+                     WHERE session_id = ?
+                     ORDER BY store_id DESC
+                     LIMIT ?
+                )
+                SELECT m.store_id,
+                       m.role,
+                       substr(CAST(m.content AS BLOB), 1, ?),
+                       m.tool_call_id,
+                       substr(CAST(COALESCE(m.tool_name, '') AS BLOB), 1, 513)
+                  FROM recent
+                  JOIN messages m ON m.store_id = recent.store_id
+                 WHERE m.role = 'tool'
+                   AND m.tool_call_id IN ({placeholders})
+                   {conversation_clause}
+                 ORDER BY m.store_id DESC
+                 LIMIT ?""",
+            [
+                session_id,
+                scan_limit,
+                content_limit + 1,
+                *normalized_ids,
+                *conversation_args,
+                row_limit,
+            ],
+        ).fetchall()
         matches: list[Dict[str, Any]] = []
-        for row in rows:
-            decoded = self._row_to_dict(row)
-            if decoded.get("role") != "tool":
+        for store_id, role, content_prefix, tool_call_id, tool_name_prefix in rows:
+            content_bytes = bytes(content_prefix or b"")
+            tool_name_bytes = bytes(tool_name_prefix or b"")
+            if len(content_bytes) > content_limit or len(tool_name_bytes) > 512:
                 continue
-            if str(decoded.get("tool_call_id") or "").strip() not in normalized_ids:
+            try:
+                content = content_bytes.decode("utf-8")
+                tool_name = tool_name_bytes.decode("utf-8")
+            except UnicodeDecodeError:
                 continue
-            if (
-                normalized_conversation_id
-                and _normalize_conversation_id_value(decoded.get("conversation_id"))
-                != normalized_conversation_id
-            ):
-                continue
-            matches.append(decoded)
-            if len(matches) >= row_limit:
-                break
+            matches.append(
+                {
+                    "store_id": int(store_id),
+                    "role": str(role or ""),
+                    "content": content,
+                    "tool_call_id": str(tool_call_id or ""),
+                    "tool_name": tool_name,
+                }
+            )
         return list(reversed(matches))
 
     def _session_load_where(

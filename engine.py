@@ -14,7 +14,7 @@ import sqlite3
 import threading
 import time
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Mapping, Optional
 
 from agent.context_engine import ContextEngine
 
@@ -5659,6 +5659,44 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
         text = normalize_content_value(value) or ""
         return hashlib.sha256(text.encode("utf-8", errors="replace")).hexdigest()
 
+    @staticmethod
+    def _bounded_tool_diagnostic_identity(
+        message: Mapping[str, Any],
+        *,
+        max_content_bytes: int = 65_536,
+    ) -> tuple[str, str, str, str] | None:
+        """Build an exact tool identity without payload-sidecar recovery.
+
+        The diagnostic path accepts only ordinary in-memory text already inside
+        a strict byte budget. Oversized or structured content is skipped rather
+        than normalized or externalized, preserving admission behavior while
+        bounding observer memory and I/O.
+        """
+        if str(message.get("role") or "") != "tool":
+            return None
+        call_id = str(message.get("tool_call_id") or "").strip()
+        tool_name = str(message.get("tool_name") or message.get("name") or "").strip()
+        if not call_id or len(call_id) > 512 or len(tool_name) > 512:
+            return None
+        if len(call_id.encode("utf-8", errors="replace")) > 2048:
+            return None
+        if len(tool_name.encode("utf-8", errors="replace")) > 2048:
+            return None
+        content = message.get("content")
+        if content is None:
+            text = ""
+        elif isinstance(content, str):
+            text = content
+        else:
+            return None
+        byte_limit = min(max(int(max_content_bytes), 0), 65_536)
+        if not byte_limit or len(text) > byte_limit:
+            return None
+        encoded = text.encode("utf-8", errors="replace")
+        if len(encoded) > byte_limit:
+            return None
+        return ("tool", call_id, tool_name, hashlib.sha256(encoded).hexdigest())
+
     def _warn_if_duplicate_tool_admission(
         self,
         messages_to_store_with_index: list[tuple[int, Dict[str, Any]]],
@@ -5678,50 +5716,49 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
         """
         try:
             candidate_tool_count = 0
-            candidates: list[tuple[int, Dict[str, Any]]] = []
+            candidates: list[tuple[int, Dict[str, Any], tuple[str, str, str, str]]] = []
             for absolute_idx, message in messages_to_store_with_index:
                 if str(message.get("role") or "") != "tool" or not str(
                     message.get("tool_call_id") or ""
                 ).strip():
                     continue
                 candidate_tool_count += 1
-                if len(candidates) < 8:
-                    candidates.append((absolute_idx, message))
+                identity = self._bounded_tool_diagnostic_identity(message)
+                if identity is not None and len(candidates) < 8:
+                    candidates.append((absolute_idx, message, identity))
             if not candidates or not self._session_id:
                 return
-            call_ids = {
-                str(message.get("tool_call_id") or "").strip()
-                for _absolute_idx, message in candidates
-            }
+            call_ids = {identity[1] for _absolute_idx, _message, identity in candidates}
             durable_rows = self._store.get_bounded_tool_call_rows(
                 self._session_id,
                 call_ids,
                 conversation_id=self._conversation_id,
                 max_call_ids=8,
                 max_rows=64,
+                max_content_bytes=65_536,
             )
-            durable_tools: dict[tuple[str, str, str, str, str], list[int]] = {}
+            durable_tools: dict[tuple[str, str, str, str], list[int]] = {}
             for row in durable_rows:
-                if str(row.get("role") or "") != "tool":
+                identity = self._bounded_tool_diagnostic_identity(row)
+                if identity is None:
                     continue
-                identity = self._message_replay_identity(row, stored_row=True)
                 durable_tools.setdefault(identity, []).append(int(row["store_id"]))
 
             duplicates: list[dict[str, Any]] = []
             duplicate_count = 0
-            for absolute_idx, message in candidates:
-                store_ids = durable_tools.get(self._message_replay_identity(message), [])
+            for absolute_idx, _message, identity in candidates:
+                store_ids = durable_tools.get(identity, [])
                 if not store_ids:
                     continue
                 duplicate_count += 1
                 if len(duplicates) >= 8:
                     continue
-                call_id = str(message.get("tool_call_id") or "").strip()
+                call_id = identity[1]
                 duplicates.append(
                     {
                         "incoming_index": absolute_idx,
                         "tool_call_id_sha256": self._diagnostic_sha256(call_id),
-                        "content_sha256": self._diagnostic_sha256(message.get("content")),
+                        "content_sha256": identity[3],
                         "durable_store_ids": store_ids[:8],
                     }
                 )
