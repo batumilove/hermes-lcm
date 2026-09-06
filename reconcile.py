@@ -313,7 +313,10 @@ class ReconcileMixin:
                 return None
             markers = payload.get("persisted_output_markers")
             if not isinstance(markers, list):
-                return None
+                # A row that was externalized from raw tool content predates
+                # persisted-marker metadata. Its scoped ref still binds the
+                # recovered bytes to this exact durable tool row.
+                return payload["content"]
             for marker in markers:
                 if not isinstance(marker, dict):
                     continue
@@ -343,6 +346,45 @@ class ReconcileMixin:
                 exact_generation_content = row_bound_exact_generation_content(durable_row)
                 if exact_generation_content is not None:
                     break
+        if exact_generation_content is None and not require_exact_generation:
+            # Non-exact legacy callers retain the historical global lookup.
+            # Exact-generation callers may only trust the durable row's ref.
+            explicit_incoming_tool_name = str(msg.get("tool_name") or "").strip()
+            legacy_empty_name_payload_is_bound = (
+                not explicit_incoming_tool_name
+                or set(durable_tool_names_by_offset.values()) == {incoming_tool_name}
+            )
+            exact_generation_content = find_externalized_tool_result_content_for_call(
+                tool_call_id=call_id,
+                session_id=resolved_session_id,
+                conversation_id=str(resolved_conversation_id or ""),
+                tool_name=incoming_tool_name,
+                expected_chars=expected_chars,
+                persisted_output_source_path=persisted_output_source_path,
+                persisted_output_file_size=recovered_generation["size"],
+                persisted_output_file_mtime_ns=recovered_generation["mtime_ns"],
+                persisted_output_file_ctime_ns=recovered_generation["ctime_ns"],
+                config=self._config,
+                hermes_home=self._hermes_home,
+            )
+            if (
+                exact_generation_content is None
+                and incoming_tool_name
+                and legacy_empty_name_payload_is_bound
+            ):
+                exact_generation_content = find_externalized_tool_result_content_for_call(
+                    tool_call_id=call_id,
+                    session_id=resolved_session_id,
+                    conversation_id=str(resolved_conversation_id or ""),
+                    tool_name="",
+                    expected_chars=expected_chars,
+                    persisted_output_source_path=persisted_output_source_path,
+                    persisted_output_file_size=recovered_generation["size"],
+                    persisted_output_file_mtime_ns=recovered_generation["mtime_ns"],
+                    persisted_output_file_ctime_ns=recovered_generation["ctime_ns"],
+                    config=self._config,
+                    hermes_home=self._hermes_home,
+                )
         externalized_generation_matches = bool(
             exact_generation_content is not None
             and matching_durable_contents
