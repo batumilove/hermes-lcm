@@ -251,3 +251,53 @@ def test_final_form_replay_filter_runs_before_duplicate_admission_diagnostic(
 
     assert len(rows) == 1
     assert EVENT_PREFIX not in caplog.text
+
+
+def test_diagnostic_identity_does_not_use_replay_payload_recovery(tmp_path, monkeypatch, caplog):
+    config = LCMConfig(database_path=str(tmp_path / "no-payload-recovery.db"))
+    session_id = "no-payload-recovery-session"
+    duplicate = _tool("call_no_payload_recovery", "same bounded result")
+    engine = LCMEngine(config=config)
+    engine.on_session_start(session_id, context_length=200000)
+    engine._store.append(session_id, duplicate)
+
+    def fail_if_replay_identity_is_used(*_args, **_kwargs):
+        raise AssertionError("diagnostics must not recover replay payloads")
+
+    monkeypatch.setattr(engine, "_message_replay_identity", fail_if_replay_identity_is_used)
+    with caplog.at_level(logging.WARNING, logger="hermes_lcm.engine"):
+        engine._warn_if_duplicate_tool_admission(
+            [(0, duplicate)],
+            incoming_count=1,
+            cursor=0,
+            cursor_before_reconcile=0,
+            reconcile_requested=False,
+            overflow_recovery_pending=False,
+            session_end=False,
+        )
+    engine.shutdown()
+
+    assert EVENT_PREFIX in caplog.text
+
+
+def test_diagnostic_store_lookup_skips_oversized_content(tmp_path):
+    config = LCMConfig(database_path=str(tmp_path / "bounded-content.db"))
+    engine = LCMEngine(config=config)
+    engine.on_session_start("bounded-content-session", context_length=200000)
+    engine._store.append(
+        "bounded-content-session",
+        _tool("call_bounded_content", "x" * 70_000),
+    )
+    engine._store.append(
+        "bounded-content-session",
+        _tool("call_bounded_content", "small result"),
+    )
+
+    rows = engine._store.get_bounded_tool_call_rows(
+        "bounded-content-session",
+        {"call_bounded_content"},
+        max_content_bytes=1024,
+    )
+    engine.shutdown()
+
+    assert [row["content"] for row in rows] == ["small result"]
