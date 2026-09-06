@@ -121,7 +121,7 @@ def test_session_end_preserves_only_new_calls_from_mixed_assistant_message(
     assert [call["id"] for call in mixed_rows[0]["tool_calls"]] == [call_b]
 
 
-def test_session_end_tool_identity_lookup_does_not_page_full_store(tmp_path, monkeypatch):
+def test_session_end_tool_identity_lookup_defers_results_to_exact_proof(tmp_path, monkeypatch):
     session_id = "bounded-tool-identity-lookup"
     conversation_id = "agent:main:telegram:dm:bounded-lookup"
     config = LCMConfig(database_path=str(tmp_path / "bounded-lookup.db"))
@@ -169,7 +169,7 @@ def test_session_end_tool_identity_lookup_does_not_page_full_store(tmp_path, mon
     )
     engine.shutdown()
 
-    assert replayed == {0, 1}
+    assert replayed == set()
 
 
 @pytest.mark.parametrize("delivery_path", ["direct", "deferred"])

@@ -42,6 +42,7 @@ from .externalize import (
     extract_externalized_ref,
     find_externalized_payload_for_message,
     find_externalized_tool_result_content_for_call,
+    has_persisted_output_marker_metadata_for_call,
     is_externalized_placeholder,
     load_externalized_payload,
     maybe_externalize_tool_output,
@@ -554,6 +555,7 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
         self._lcm_non_bypass_platforms: dict[str, set[str]] = {}
         self._lcm_session_last_platform: dict[str, str] = {}
         self._lcm_session_last_normal_platform: dict[str, str] = {}
+        self._clone_bypass_bound_session_ids: set[str] = set()
         self._lcm_session_last_bypassed: dict[str, bool] = {}
         self._lcm_session_last_conversation_id: dict[str, str] = {}
         self._lcm_session_last_normal_conversation_id: dict[str, str] = {}
@@ -624,6 +626,12 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
         # must still be able to replace the copied prototype route.
         clone._update_model_pending_session_start = False
         clone._lcm_current_start_allows_bypass_lineage = False
+        # A bypassed prototype may have created an empty durable lifecycle
+        # binding. Carry only that contamination guard—not its mutable bypass
+        # lineage—so a normal agent clone can claim the explicitly supplied
+        # conversation instead of inheriting the bypass conversation.
+        if self._session_id and (self._session_ignored or self._session_stateless):
+            clone._clone_bypass_bound_session_ids.add(self._session_id)
         return clone
 
     def __deepcopy__(self, memo: dict[int, object]) -> "LCMEngine":
@@ -798,6 +806,7 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
             self._lcm_non_bypass_platforms.clear()
             self._lcm_session_last_platform.clear()
             self._lcm_session_last_normal_platform.clear()
+            self._clone_bypass_bound_session_ids.clear()
             self._lcm_session_last_bypassed.clear()
             self._lcm_session_last_conversation_id.clear()
             self._lcm_session_last_normal_conversation_id.clear()
@@ -2741,7 +2750,10 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
         side_channel_rebind = self._session_id_matches_lcm_bypass_filters(
             session_id,
             platform=start_platform,
-        ) or self._has_lcm_bypass_lineage_session(session_id, platform=start_platform)
+        ) or self._has_lcm_bypass_lineage_session(
+            session_id,
+            platform=start_platform,
+        ) or session_id in self._clone_bypass_bound_session_ids
         self._unmark_thread_context_auxiliary_session(
             session_id,
             suppress_as_foreground_reuse=not side_channel_rebind,
@@ -2756,11 +2768,28 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
             self._last_compacted_store_id = 0
             self._last_overflow_recovery_failed = False
             self._last_condensation_suppressed_reason = ""
+        durable_session_state = self._lifecycle.get_by_session(session_id)
+        requested_conversation_id = str(kwargs.get("conversation_id") or "")
+        bound_conversation_id = (
+            requested_conversation_id
+            if requested_conversation_id
+            and (side_channel_rebind or previous_session_id == session_id)
+            else (
+                self._conversation_id
+                if previous_session_id == session_id and self._conversation_id
+                else (
+                    durable_session_state.conversation_id
+                    if durable_session_state is not None
+                    else kwargs.get("conversation_id")
+                )
+            )
+        )
         self._apply_session_start_metadata(session_id, kwargs)
         self._bind_lifecycle_state(
             session_id,
-            conversation_id=kwargs.get("conversation_id"),
+            conversation_id=bound_conversation_id,
         )
+        self._clone_bypass_bound_session_ids.discard(session_id)
         self._schedule_ingest_cursor_reconciliation()
         self._log_session_filter_diagnostics()
 
@@ -2769,7 +2798,11 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
         session_id: str,
         messages: List[Dict[str, Any]],
     ) -> bool:
-        prefix_count = self._session_end_store_prefix_count(session_id, messages)
+        prefix_count = self._session_end_store_prefix_count(
+            session_id,
+            messages,
+            conversation_id=self._conversation_id,
+        )
         return prefix_count is not None and prefix_count > 0
 
     def _session_end_prefix_compare_value(self, value: Any, *, session_id: str) -> Any:
@@ -2925,6 +2958,23 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
                 return None
             if message_identity != stored_identity:
                 return None
+            if (
+                str(msg.get("role") or "") == "tool"
+                and _is_hermes_persisted_output_marker(
+                    normalize_content_value(msg.get("content")) or ""
+                )
+                and not self._has_durable_persisted_output_replay_identity(
+                    msg,
+                    session_id=session_id,
+                    conversation_id=conversation_id,
+                    allow_content_only_legacy=False,
+                    require_exact_generation=True,
+                )
+            ):
+                # Text identity alone cannot represent a persisted-output
+                # execution. Keep only the prefix before this marker unless
+                # its exact source-file generation is durably proven.
+                return idx
         return len(stored_messages)
 
     @staticmethod
@@ -3109,10 +3159,11 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
 
         A contaminated store may contain older partial/full replay bursts before
         the canonical transcript, so a bounded tail or leading-prefix comparison
-        cannot prove durability. Tool call IDs are stronger: the host must not
-        execute a new call with an ID already durable for the same
-        session/conversation. This supports both session-end delivery and the
-        first ordinary ingest after forced overflow recovery.
+        cannot prove durability. Assistant tool-call IDs provide a bounded way to
+        trim durable call declarations. Tool-result rows must not be classified by
+        call ID alone: retries can legitimately reuse the call ID and persisted-
+        output path, so result suppression is deferred to the exact durable identity
+        checks that bind tool name, content, and source-file generation.
         """
         incoming_ids: set[str] = set()
         for message in messages:
@@ -3123,25 +3174,45 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
                     incoming_ids.add(call_id)
             elif role == "assistant":
                 incoming_ids.update(self._assistant_tool_call_ids(message))
-        stored_result_ids, stored_assistant_ids = self._store.find_durable_tool_call_ids(
+        _stored_result_ids, stored_assistant_ids = self._store.find_durable_tool_call_ids(
             session_id,
             incoming_ids,
             conversation_id=conversation_id,
         )
 
-        replayed: set[int] = set()
+        replayed, _scanned = self._find_tool_anchored_replay_indexes(
+            messages,
+            durable_key_lookup=True,
+            replay_session_id=session_id,
+            replay_conversation_id=conversation_id,
+        )
+        changed_result_ids = {
+            str((message or {}).get("tool_call_id") or "").strip()
+            for index, message in enumerate(messages)
+            if str((message or {}).get("role") or "") == "tool"
+            and str((message or {}).get("tool_call_id") or "").strip()
+            and index not in replayed
+        }
+        # A durable assistant call declaration belongs to a new retry when its
+        # incoming result failed exact replay proof. Keep that declaration so the
+        # result remains adjacent and is never mistaken for an orphan replay.
+        replayed = {
+            index
+            for index in replayed
+            if not (
+                str((messages[index] or {}).get("role") or "") == "assistant"
+                and self._assistant_tool_call_ids(messages[index]) & changed_result_ids
+            )
+        }
+        suppressible_assistant_ids = stored_assistant_ids - changed_result_ids
         rewritten: dict[int, Dict[str, Any]] = {}
         for index, message in enumerate(messages):
             role = str((message or {}).get("role") or "")
-            if role == "tool":
-                call_id = str((message or {}).get("tool_call_id") or "").strip()
-                if call_id and call_id in stored_result_ids:
-                    replayed.add(index)
-            elif role == "assistant":
+            if role == "assistant":
                 call_ids = self._assistant_tool_call_ids(message)
-                if call_ids and call_ids.issubset(stored_assistant_ids):
+                if call_ids and call_ids.issubset(suppressible_assistant_ids):
                     replayed.add(index)
-                elif call_ids & stored_assistant_ids:
+                elif call_ids & suppressible_assistant_ids:
                     tool_calls = (message or {}).get("tool_calls") or []
                     if isinstance(tool_calls, str):
                         try:
@@ -3161,7 +3232,7 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
                                     or tool_call.get("tool_call_id")
                                     or ""
                                 ).strip()
-                                in stored_assistant_ids
+                                in suppressible_assistant_ids
                             )
                         ]
                         replacement = dict(message)
@@ -3233,6 +3304,8 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
                     message,
                     session_id=session_id,
                     conversation_id=conversation_id,
+                    allow_content_only_legacy=False,
+                    require_exact_generation=True,
                 )
             ):
                 continue
@@ -3255,6 +3328,7 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
         protected_messages = protect_messages_for_ingest(
             kept,
             session_id=session_id,
+            conversation_id=conversation_id,
             config=self._config,
             hermes_home=self._hermes_home,
         )
@@ -4669,7 +4743,14 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
         if not self._session_id or self._session_ignored or self._session_stateless:
             return
         try:
-            self._ingest_cursor_needs_reconcile = self._store.get_session_count(self._session_id) > 0
+            self._ingest_cursor_needs_reconcile = bool(
+                self._store.get_session_messages_after(
+                    self._session_id,
+                    limit=1,
+                    conversation_id=self._conversation_id,
+                    include_legacy_unscoped=True,
+                )
+            )
         except Exception as exc:  # pragma: no cover - defensive only
             logger.debug("LCM ingest cursor reconciliation probe failed: %s", exc)
             self._ingest_cursor_needs_reconcile = False
@@ -4752,6 +4833,8 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
                 self._session_id,
                 after_store_id=after_store_id,
                 limit=1000,
+                conversation_id=self._conversation_id,
+                include_legacy_unscoped=True,
             )
             if not rows:
                 return False
@@ -4806,6 +4889,9 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
         original_messages: List[Dict[str, Any]],
         active_replay_messages: List[Dict[str, Any]],
     ) -> List[Dict[str, Any]]:
+        for message in active_replay_messages:
+            message.pop("_lcm_durable_marker_before_ingest", None)
+            message.pop("_lcm_legacy_raw_payload_before_ingest", None)
         self._last_active_replay_source_identities = [
             self._message_replay_identity(message) for message in original_messages
         ]
@@ -4944,6 +5030,19 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
     def _has_any_durable_persisted_output_payload_for_marker(self, msg: Dict[str, Any]) -> bool:
         role = str(msg.get("role") or "unknown")
         content = normalize_content_value(msg.get("content")) or ""
+        active_session_id = str(self._session_id or "")
+        active_conversation_id = str(self._conversation_id or "")
+        message_session_id = str(msg.get("session_id") or "")
+        message_conversation_id = str(msg.get("conversation_id") or "")
+        if (
+            not active_session_id
+            or (message_session_id and message_session_id != active_session_id)
+            or (
+                message_conversation_id
+                and message_conversation_id != active_conversation_id
+            )
+        ):
+            return False
         if role != "tool" or not _is_hermes_persisted_output_marker(content):
             return False
         expected_chars = _expected_persisted_output_chars(content)
@@ -4951,18 +5050,68 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
         persisted_output_preview_sha256, allow_redacted_preview_match = self._persisted_output_marker_replay_proof(content)
         if expected_chars is None or not persisted_output_source_path or not persisted_output_preview_sha256:
             return False
-        if recover_hermes_persisted_output_with_file_stat(content) is None:
+        recovered_with_stat = recover_hermes_persisted_output_with_file_stat(content)
+        if recovered_with_stat is None:
             return False
+        _recovered_content, recovered_generation = recovered_with_stat
         durable_content = find_externalized_tool_result_content_for_call(
             tool_call_id=str(msg.get("tool_call_id") or ""),
-            session_id=str(msg.get("session_id") or self._session_id or ""),
+            session_id=active_session_id,
+            conversation_id=active_conversation_id,
+            tool_name=str(msg.get("tool_name") or ""),
             expected_chars=expected_chars,
             persisted_output_source_path=persisted_output_source_path,
             persisted_output_preview_sha256=persisted_output_preview_sha256,
+            persisted_output_file_size=recovered_generation["size"],
+            persisted_output_file_mtime_ns=recovered_generation["mtime_ns"],
+            persisted_output_file_ctime_ns=recovered_generation["ctime_ns"],
             allow_redacted_preview_match=allow_redacted_preview_match,
             config=self._config,
             hermes_home=self._hermes_home,
         )
+        requested_tool_name = str(msg.get("tool_name") or "").strip()
+        if durable_content is None and requested_tool_name:
+            # Legacy payloads may omit tool_name, but an unbound empty-name
+            # fallback would let a different tool reuse another tool's payload.
+            # Require the durable tool row (or its adjacent assistant call) to
+            # bind this call id to the requested name first.
+            call_id = str(msg.get("tool_call_id") or "").strip()
+            durable_rows = self._store.get_tool_call_replay_neighborhoods(
+                active_session_id,
+                {call_id},
+                conversation_id=active_conversation_id,
+            )
+            bound_names: set[str] = set()
+            for offset, durable_row in enumerate(durable_rows):
+                if (
+                    str(durable_row.get("role") or "") != "tool"
+                    or str(durable_row.get("tool_call_id") or "").strip() != call_id
+                ):
+                    continue
+                durable_name = str(durable_row.get("tool_name") or "").strip()
+                if not durable_name and offset > 0:
+                    durable_name = self._assistant_tool_name_for_call(
+                        durable_rows[offset - 1],
+                        call_id,
+                    )
+                if durable_name:
+                    bound_names.add(durable_name)
+            if bound_names == {requested_tool_name}:
+                durable_content = find_externalized_tool_result_content_for_call(
+                    tool_call_id=call_id,
+                    session_id=active_session_id,
+                    conversation_id=active_conversation_id,
+                    tool_name="",
+                    expected_chars=expected_chars,
+                    persisted_output_source_path=persisted_output_source_path,
+                    persisted_output_preview_sha256=persisted_output_preview_sha256,
+                    persisted_output_file_size=recovered_generation["size"],
+                    persisted_output_file_mtime_ns=recovered_generation["mtime_ns"],
+                    persisted_output_file_ctime_ns=recovered_generation["ctime_ns"],
+                    allow_redacted_preview_match=allow_redacted_preview_match,
+                    config=self._config,
+                    hermes_home=self._hermes_home,
+                )
         return durable_content is not None
 
     @classmethod
@@ -5102,6 +5251,64 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
             externalize_messages[idx] = not ignored_original_messages[idx]
         for idx in range(0, scan_start):
             prefer_existing_externalized[idx] = not ignored_original_messages[idx]
+        persisted_output_probe_messages: list[Dict[str, Any]] = []
+        for idx, message in enumerate(messages):
+            probe_message = message
+            call_id = str(message.get("tool_call_id") or "").strip()
+            if (
+                str(message.get("role") or "") == "tool"
+                and call_id
+                and not str(message.get("tool_name") or "").strip()
+                and idx > 0
+            ):
+                inferred_tool_name = self._assistant_tool_name_for_call(
+                    messages[idx - 1],
+                    call_id,
+                )
+                if inferred_tool_name:
+                    probe_message = dict(message)
+                    probe_message["tool_name"] = inferred_tool_name
+            persisted_output_probe_messages.append(probe_message)
+        persisted_output_durable_before_ingest = [
+            bool(
+                str(message.get("role") or "") == "tool"
+                and _is_hermes_persisted_output_marker(
+                    normalize_content_value(message.get("content")) or ""
+                )
+                and self._has_any_durable_persisted_output_payload_for_marker(message)
+            )
+            for message in persisted_output_probe_messages
+        ]
+        persisted_output_had_marker_metadata_before_ingest = [
+            bool(
+                str(message.get("role") or "") == "tool"
+                and _is_hermes_persisted_output_marker(
+                    normalize_content_value(message.get("content")) or ""
+                )
+                and (
+                    has_persisted_output_marker_metadata_for_call(
+                        tool_call_id=str(message.get("tool_call_id") or ""),
+                        session_id=str(self._session_id or ""),
+                        conversation_id=str(self._conversation_id or ""),
+                        tool_name=str(message.get("tool_name") or ""),
+                        config=self._config,
+                        hermes_home=self._hermes_home,
+                    )
+                    or (
+                        bool(str(message.get("tool_name") or "").strip())
+                        and has_persisted_output_marker_metadata_for_call(
+                            tool_call_id=str(message.get("tool_call_id") or ""),
+                            session_id=str(self._session_id or ""),
+                            conversation_id=str(self._conversation_id or ""),
+                            tool_name="",
+                            config=self._config,
+                            hermes_home=self._hermes_home,
+                        )
+                    )
+                )
+            )
+            for message in persisted_output_probe_messages
+        ]
         replay_messages = quarantine_suspicious_assistant_messages(
             messages,
             session_id=self._session_id,
@@ -5111,6 +5318,39 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
             prefer_existing_externalized=prefer_existing_externalized,
         )
         replay_messages = self._redact_active_replay_messages(replay_messages)
+        raw_marker_replay_messages = list(messages)
+        for idx, original_msg in enumerate(messages):
+            if not (
+                str(original_msg.get("role") or "") == "tool"
+                and _is_hermes_persisted_output_marker(
+                    normalize_content_value(original_msg.get("content")) or ""
+                )
+            ):
+                continue
+            # Keep the active replay form redacted. The raw marker remains
+            # available separately in ``messages`` for durable proof and is
+            # restored only on the storage path below.
+            marker_msg = dict(replay_messages[idx])
+            marker_was_durable = persisted_output_durable_before_ingest[idx]
+            legacy_raw_payload = not persisted_output_had_marker_metadata_before_ingest[idx]
+            marker_msg["_lcm_durable_marker_before_ingest"] = marker_was_durable
+            marker_msg["_lcm_legacy_raw_payload_before_ingest"] = legacy_raw_payload
+            replay_messages[idx] = marker_msg
+            raw_marker_msg = dict(original_msg)
+            raw_marker_msg["_lcm_durable_marker_before_ingest"] = marker_was_durable
+            raw_marker_msg["_lcm_legacy_raw_payload_before_ingest"] = legacy_raw_payload
+            raw_marker_replay_messages[idx] = raw_marker_msg
+        replay_proof_messages = [
+            raw_marker_replay_messages[idx]
+            if (
+                str(original_msg.get("role") or "") == "tool"
+                and _is_hermes_persisted_output_marker(
+                    normalize_content_value(original_msg.get("content")) or ""
+                )
+            )
+            else replay_messages[idx]
+            for idx, original_msg in enumerate(messages)
+        ]
         replay_messages = self._apply_ignored_active_replay_placeholders(
             messages,
             replay_messages,
@@ -5120,20 +5360,15 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
         reconciled_ingest_cursor = self._ingest_cursor_needs_reconcile
         if self._ingest_cursor_needs_reconcile:
             reconcile_messages = [
-                original_msg
+                raw_marker_replay_messages[idx]
                 if (
-                    (
-                        str(original_msg.get("role") or "") == "tool"
-                        and _is_hermes_persisted_output_marker(
-                            normalize_content_value(original_msg.get("content")) or ""
-                        )
-                        and self._has_any_durable_persisted_output_payload_for_marker(original_msg)
-                    )
-                    or (
-                        self._compiled_ignore_message_patterns
-                        and ignored_original_messages[idx]
+                    str(original_msg.get("role") or "") == "tool"
+                    and _is_hermes_persisted_output_marker(
+                        normalize_content_value(original_msg.get("content")) or ""
                     )
                 )
+                else original_msg
+                if self._compiled_ignore_message_patterns and ignored_original_messages[idx]
                 else replay_msg
                 for idx, (original_msg, replay_msg) in enumerate(zip(messages, replay_messages))
             ]
@@ -5163,7 +5398,7 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
                 for index, replacement in rewritten_tool_messages.items():
                     replay_messages[cursor + index] = replacement
             else:
-                candidate_messages = replay_messages[cursor:]
+                candidate_messages = replay_proof_messages[cursor:]
                 relative_ignored_indexes = {
                     index
                     for index in range(len(candidate_messages))
@@ -5221,8 +5456,13 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
                 scanned_replay_indexes,
                 replay_scan_count,
             ) = self._find_tool_anchored_replay_indexes(
-                replay_messages[replay_scan_start:],
+                replay_proof_messages[replay_scan_start:],
                 suppress_tool_less_duplicates=bool(reconciled_ingest_cursor),
+                # A changed active prefix may rewind the effective ingest cursor
+                # after the first suffix-only durable-key pass. Old tool anchors
+                # can be arbitrarily far from the durable tail, so the rewind
+                # pass must also resolve candidates by tool-call key.
+                durable_key_lookup=True,
             )
             tool_anchored_replay_indexes.update(
                 replay_scan_start + idx for idx in scanned_replay_indexes
@@ -5234,7 +5474,7 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
                     # first durable-key pass covered only messages[cursor:], so
                     # rescan the newly exposed prefix by durable tool-call key;
                     # a bounded tail lookup may not reach old externalized rows.
-                    prefix_messages = replay_messages[:cursor]
+                    prefix_messages = replay_proof_messages[:cursor]
                     if any(
                         str(message.get("role") or "") == "tool"
                         and bool(str(message.get("tool_call_id") or "").strip())
@@ -5250,7 +5490,10 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
                         tool_anchored_replay_indexes.update(prefix_replay_indexes)
                     cursor = 0
                     self._ingest_cursor = 0
-                session_count = self._store.get_session_count(self._session_id)
+                session_count = self._store.get_session_count(
+                    self._session_id,
+                    conversation_id=self._conversation_id,
+                )
                 self._record_ingest_reconciliation(
                     action="filtered replay",
                     reason="replayed durable tool-anchored segment",
@@ -5294,7 +5537,10 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
         empty_session_placeholder_ordinals: dict[str, set[int]] = {}
         if not compression_boundary_ingest_pending and self._session_id:
             try:
-                if self._store.get_session_count(self._session_id) == 0:
+                if self._store.get_session_count(
+                    self._session_id,
+                    conversation_id=self._conversation_id,
+                ) == 0:
                     empty_session_placeholder_budget = self._load_generated_ignored_placeholder_hash_counts()
                     empty_session_placeholder_ordinals = self._load_generated_ignored_placeholder_hash_ordinals()
             except Exception:
@@ -5506,7 +5752,13 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
                         normalize_content_value(original_msg.get("content")) or ""
                     )
                 ):
-                    store_msg = original_msg
+                    store_msg = dict(original_msg)
+                    for metadata_key in (
+                        "_lcm_durable_marker_before_ingest",
+                        "_lcm_legacy_raw_payload_before_ingest",
+                    ):
+                        if metadata_key in replay_msg:
+                            store_msg[metadata_key] = replay_msg[metadata_key]
                 kept.append((absolute_idx, store_msg))
             messages_to_store_with_index = kept
 
@@ -5544,7 +5796,11 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
                         and call_id in self._assistant_tool_call_ids(previous_message)
                     )
                 if not has_adjacent_new_call:
-                    if self._has_durable_persisted_output_replay_identity(message):
+                    if self._has_durable_persisted_output_replay_identity(
+                        message,
+                        allow_content_only_legacy=False,
+                        require_exact_generation=True,
+                    ):
                         final_form_replay_candidate_indexes.add(relative_index)
 
         if final_form_replay_candidate_indexes:
@@ -5553,16 +5809,20 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
                 for index, item in enumerate(messages_to_store_with_index)
                 if index not in final_form_replay_candidate_indexes
             ]
-            session_count = self._store.get_session_count(self._session_id)
+            session_count = self._store.get_session_count(
+                self._session_id,
+                conversation_id=self._conversation_id,
+            )
             self._record_ingest_reconciliation(
                 action="filtered replay",
-                reason="replayed unanchored durable persisted-output identity",
+                reason="replayed durable tool-anchored segment",
                 cursor=cursor,
                 incoming=n,
                 session_count=session_count,
                 stored_tail_count=session_count,
                 effective_incoming=len(messages_to_store_with_index),
             )
+
 
         if not messages_to_store_with_index:
             if session_end_intent_sha256:
@@ -5593,6 +5853,7 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
         protected_messages = protect_messages_for_ingest(
             [msg for _idx, msg in messages_to_store_with_index],
             session_id=self._session_id,
+            conversation_id=self._conversation_id,
             config=self._config,
             hermes_home=self._hermes_home,
         )
@@ -5635,6 +5896,7 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
             session_end_intent_sha256=session_end_intent_sha256,
             session_end_message_fingerprints=session_end_message_fingerprints,
         )
+
         # Rollup staleness is driven by summary-node PUBLICATION
         # (_invalidate_rollups_for_published_node at every add_node site), not by
         # raw ingest: marking a period stale before its covering summary exists
@@ -5970,6 +6232,8 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
                     content,
                     tool_call_id=tool_id,
                     session_id=self._session_id,
+                    conversation_id=self._conversation_id,
+                    tool_name=str(msg.get("tool_name") or ""),
                     config=self._config,
                     hermes_home=self._hermes_home,
                 )

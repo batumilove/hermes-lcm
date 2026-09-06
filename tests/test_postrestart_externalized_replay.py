@@ -378,6 +378,15 @@ def test_lossy_durable_replay_uses_explicit_session_for_exact_generation_lookup(
         "_recovered_content_matches_durable_identity",
         lambda *_args, **_kwargs: True,
     )
+    monkeypatch.setattr(
+        rebound._store,
+        "get_tool_call_replay_neighborhoods",
+        lambda session_id, call_ids, *, conversation_id=None: [
+            _tool_result(call_id, raw_content)
+        ]
+        if session_id == ended_session_id and call_id in call_ids
+        else [],
+    )
 
     replayed = rebound._has_durable_persisted_output_replay_identity(
         _tool_result(call_id, persisted_marker),

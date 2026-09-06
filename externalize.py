@@ -522,7 +522,7 @@ def resolve_large_output_storage_dir(config, hermes_home: str = "") -> Path:
 
 
 def _externalized_summary(path: Path, payload: Dict[str, Any]) -> Dict[str, Any]:
-    return {
+    summary = {
         "ref": path.name,
         "kind": payload.get("kind", "tool_result"),
         "tool_call_id": payload.get("tool_call_id", ""),
@@ -533,6 +533,21 @@ def _externalized_summary(path: Path, payload: Dict[str, Any]) -> Dict[str, Any]
         "content_bytes": payload.get("content_bytes", len((payload.get("content", "") or "").encode("utf-8"))),
         "created_at": payload.get("created_at"),
     }
+    for field in (
+        "conversation_id",
+        "tool_name",
+        "persisted_output_source_path",
+        "persisted_output_expected_chars",
+        "persisted_output_preview_sha256",
+        "persisted_output_redacted_preview_sha256",
+        "persisted_output_file_size",
+        "persisted_output_file_mtime_ns",
+        "persisted_output_file_ctime_ns",
+        "persisted_output_markers",
+    ):
+        if field in payload:
+            summary[field] = payload[field]
+    return summary
 
 
 def _build_externalized_placeholder(summary: Dict[str, Any]) -> str:
@@ -937,6 +952,8 @@ def find_externalized_payload_for_message(
     *,
     tool_call_id: str = "",
     session_id: str = "",
+    conversation_id: str = "",
+    tool_name: str = "",
     kind: str | None = "tool_result",
     role: str = "",
     config,
@@ -960,6 +977,10 @@ def find_externalized_payload_for_message(
             continue
         if (payload.get("tool_call_id") or "") != (tool_call_id or ""):
             continue
+        if conversation_id and (payload.get("conversation_id") or "") != conversation_id:
+            continue
+        if tool_name and (payload.get("tool_name") or "") != tool_name:
+            continue
         payload_role = payload.get("role") or ""
         if role and payload_role and payload_role != role:
             continue
@@ -980,12 +1001,16 @@ def find_externalized_tool_result_content_for_call(
     *,
     tool_call_id: str,
     session_id: str = "",
+    conversation_id: str = "",
+    tool_name: str = "",
     expected_chars: int | None = None,
     persisted_output_source_path: str | None = None,
     persisted_output_preview_sha256: str | None = None,
     require_persisted_output_file_not_newer: bool = False,
     allow_redacted_preview_match: bool = True,
     require_missing_file_generation_metadata: bool = False,
+    require_no_persisted_output_marker_metadata: bool = False,
+    expected_content: str | None = None,
     persisted_output_file_size: int | None = None,
     persisted_output_file_mtime_ns: int | None = None,
     persisted_output_file_ctime_ns: int | None = None,
@@ -1027,11 +1052,23 @@ def find_externalized_tool_result_content_for_call(
             continue
         if session_id and (payload.get("session_id") or "") != session_id:
             continue
+        if conversation_id and (payload.get("conversation_id") or "") != conversation_id:
+            continue
+        if tool_name and (payload.get("tool_name") or "") != tool_name:
+            continue
         payload_role = payload.get("role") or ""
         if payload_role and payload_role != "tool":
             continue
         content = payload.get("content")
         if not isinstance(content, str):
+            continue
+        marker_entries = _persisted_output_marker_entries(
+            payload,
+            include_legacy_preview_prefix=True,
+        )
+        if require_no_persisted_output_marker_metadata and marker_entries:
+            continue
+        if expected_content is not None and content != expected_content:
             continue
         if (
             expected_chars is not None
@@ -1040,7 +1077,7 @@ def find_externalized_tool_result_content_for_call(
             or require_persisted_output_file_not_newer
         ):
             marker_matches = False
-            for marker in _persisted_output_marker_entries(payload, include_legacy_preview_prefix=True):
+            for marker in marker_entries:
                 if expected_chars is not None and marker.get("expected_chars") != expected_chars:
                     continue
                 if persisted_output_source_path and marker.get("source_path") != persisted_output_source_path:
@@ -1075,6 +1112,41 @@ def find_externalized_tool_result_content_for_call(
                 continue
         return content
     return None
+
+
+def has_persisted_output_marker_metadata_for_call(
+    *,
+    tool_call_id: str,
+    session_id: str = "",
+    conversation_id: str = "",
+    tool_name: str = "",
+    config,
+    hermes_home: str = "",
+) -> bool:
+    """Return whether a durable tool payload already has marker provenance."""
+    if not tool_call_id:
+        return False
+    storage_dir = get_large_output_storage_dir(config, hermes_home=hermes_home, create=False)
+    if not storage_dir.exists() or not storage_dir.is_dir():
+        return False
+    for path in sorted(storage_dir.glob("*.json")):
+        try:
+            payload = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            continue
+        if payload.get("kind", "tool_result") != "tool_result":
+            continue
+        if (payload.get("tool_call_id") or "") != tool_call_id:
+            continue
+        if session_id and (payload.get("session_id") or "") != session_id:
+            continue
+        if conversation_id and (payload.get("conversation_id") or "") != conversation_id:
+            continue
+        if tool_name and (payload.get("tool_name") or "") != tool_name:
+            continue
+        if _persisted_output_marker_entries(payload):
+            return True
+    return False
 
 
 def externalize_ingest_payload(
@@ -1136,6 +1208,8 @@ def maybe_externalize_tool_output(
     *,
     tool_call_id: str = "",
     session_id: str = "",
+    conversation_id: str = "",
+    tool_name: str = "",
     config,
     hermes_home: str = "",
     force: bool = False,
@@ -1145,6 +1219,8 @@ def maybe_externalize_tool_output(
         kind="tool_result",
         tool_call_id=tool_call_id,
         session_id=session_id,
+        conversation_id=conversation_id,
+        tool_name=tool_name,
         role="tool",
         config=config,
         hermes_home=hermes_home,
@@ -1158,6 +1234,8 @@ def maybe_externalize_payload(
     kind: str = "raw_payload",
     tool_call_id: str = "",
     session_id: str = "",
+    conversation_id: str = "",
+    tool_name: str = "",
     role: str = "",
     config,
     hermes_home: str = "",
@@ -1188,6 +1266,8 @@ def maybe_externalize_payload(
         content,
         tool_call_id=tool_call_id,
         session_id=session_id,
+        conversation_id=conversation_id,
+        tool_name=tool_name,
         kind=kind,
         role=role,
         config=config,
@@ -1237,6 +1317,10 @@ def maybe_externalize_payload(
         "content_bytes": len(content.encode("utf-8")),
         "created_at": time.time(),
     }
+    if conversation_id:
+        payload["conversation_id"] = conversation_id
+    if tool_name:
+        payload["tool_name"] = tool_name
     if metadata:
         payload.update(_safe_persisted_output_metadata(metadata))
         _merge_persisted_output_marker_metadata(payload, metadata)

@@ -967,51 +967,103 @@ class MessageStore:
         return [self._row_to_dict(r) for r in rows]
 
     def get_session_messages(self, session_id: str,
-                             limit: int = 10000) -> List[Dict[str, Any]]:
+                             limit: int = 10000,
+                             conversation_id: str | None = None,
+                             include_legacy_unscoped: bool = False) -> List[Dict[str, Any]]:
         """Get all messages for a session, ordered by store_id."""
+        if conversation_id is None:
+            conversation_clause = ""
+            params: tuple[Any, ...] = (session_id, limit)
+        elif include_legacy_unscoped:
+            conversation_clause = (
+                " AND (conversation_id = ? OR COALESCE(TRIM(conversation_id), '') = '')"
+            )
+            params = (session_id, conversation_id, limit)
+        else:
+            conversation_clause = " AND conversation_id = ?"
+            params = (session_id, conversation_id, limit)
         rows = self._conn.execute(
             f"""SELECT {_MESSAGE_SELECT_COLUMNS} FROM messages
-               WHERE session_id = ?
+               WHERE session_id = ?{conversation_clause}
                ORDER BY store_id LIMIT ?""",
-            (session_id, limit),
+            params,
         ).fetchall()
         return [self._row_to_dict(r) for r in rows]
 
     def get_session_messages_after(self, session_id: str,
                                    after_store_id: int = 0,
-                                   limit: int = 10000) -> List[Dict[str, Any]]:
+                                   limit: int = 10000,
+                                   conversation_id: str | None = None,
+                                   include_legacy_unscoped: bool = False) -> List[Dict[str, Any]]:
         """Get session messages after a store_id, ordered by store_id."""
+        if conversation_id is None:
+            conversation_clause = ""
+            params: tuple[Any, ...] = (session_id, after_store_id, limit)
+        elif include_legacy_unscoped:
+            conversation_clause = (
+                " AND (conversation_id = ? OR COALESCE(TRIM(conversation_id), '') = '')"
+            )
+            params = (session_id, after_store_id, conversation_id, limit)
+        else:
+            conversation_clause = " AND conversation_id = ?"
+            params = (session_id, after_store_id, conversation_id, limit)
         rows = self._conn.execute(
             f"""SELECT {_MESSAGE_SELECT_COLUMNS} FROM messages
-               WHERE session_id = ? AND store_id > ?
+               WHERE session_id = ? AND store_id > ?{conversation_clause}
                ORDER BY store_id LIMIT ?""",
-            (session_id, after_store_id, limit),
+            params,
         ).fetchall()
         return [self._row_to_dict(r) for r in rows]
 
-    def get_session_tail(self, session_id: str, limit: int = 1000) -> List[Dict[str, Any]]:
+    def get_session_tail(self, session_id: str, limit: int = 1000,
+                         conversation_id: str | None = None,
+                         include_legacy_unscoped: bool = False) -> List[Dict[str, Any]]:
         """Get the latest messages for a session, returned in store order."""
         if limit <= 0:
             return []
+        if conversation_id is None:
+            conversation_clause = ""
+            params: tuple[Any, ...] = (session_id, limit)
+        elif include_legacy_unscoped:
+            conversation_clause = (
+                " AND (conversation_id = ? OR COALESCE(TRIM(conversation_id), '') = '')"
+            )
+            params = (session_id, conversation_id, limit)
+        else:
+            conversation_clause = " AND conversation_id = ?"
+            params = (session_id, conversation_id, limit)
         rows = self._conn.execute(
             f"""SELECT {_MESSAGE_SELECT_COLUMNS}
                FROM (
                    SELECT {_MESSAGE_SELECT_COLUMNS}
                    FROM messages
-                   WHERE session_id = ?
+                   WHERE session_id = ?{conversation_clause}
                    ORDER BY store_id DESC
                    LIMIT ?
                )
                ORDER BY store_id""",
-            (session_id, limit),
+            params,
         ).fetchall()
         return [self._row_to_dict(r) for r in rows]
 
-    def get_session_count(self, session_id: str) -> int:
-        """Count messages in a session."""
+    def get_session_count(self, session_id: str,
+                          conversation_id: str | None = None,
+                          include_legacy_unscoped: bool = False) -> int:
+        """Count messages in a session, optionally within one conversation."""
+        if conversation_id is None:
+            conversation_clause = ""
+            params: tuple[Any, ...] = (session_id,)
+        elif include_legacy_unscoped:
+            conversation_clause = (
+                " AND (conversation_id = ? OR COALESCE(TRIM(conversation_id), '') = '')"
+            )
+            params = (session_id, conversation_id)
+        else:
+            conversation_clause = " AND conversation_id = ?"
+            params = (session_id, conversation_id)
         row = self._conn.execute(
-            "SELECT COUNT(*) FROM messages WHERE session_id = ?",
-            (session_id,),
+            f"SELECT COUNT(*) FROM messages WHERE session_id = ?{conversation_clause}",
+            params,
         ).fetchone()
         return row[0] if row else 0
 
