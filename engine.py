@@ -5675,7 +5675,7 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
         if str(message.get("role") or "") != "tool":
             return None
         call_id = str(message.get("tool_call_id") or "").strip()
-        tool_name = str(message.get("tool_name") or message.get("name") or "").strip()
+        tool_name = str(message.get("tool_name") or "").strip()
         if not call_id or len(call_id) > 512 or len(tool_name) > 512:
             return None
         if len(call_id.encode("utf-8", errors="replace")) > 2048:
@@ -5817,9 +5817,9 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
                 logger.warning("%s%s", prefix, serialized)
             except Exception:
                 pass
-        except Exception as exc:
+        except Exception:
             try:
-                logger.debug("LCM duplicate-tool admission diagnostic failed: %s", exc)
+                logger.debug("LCM duplicate-tool admission diagnostic failed")
             except Exception:
                 pass
 

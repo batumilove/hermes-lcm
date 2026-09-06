@@ -14,6 +14,7 @@ import logging
 import sqlite3
 import time
 from contextlib import nullcontext
+from itertools import islice
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional
 
@@ -808,35 +809,42 @@ class MessageStore:
         call_limit = min(max(int(max_call_ids), 0), 8)
         row_limit = min(max(int(max_rows), 0), 64)
         content_limit = min(max(int(max_content_bytes), 0), 65_536)
-        normalized_ids = sorted(
-            {
+        if not call_limit or not row_limit or not content_limit:
+            return []
+        selected_ids: set[str] = set()
+        for call_id in islice(call_ids, call_limit):
+            value = str(call_id).strip()
+            if (
                 value
-                for call_id in call_ids
-                if (value := str(call_id).strip())
                 and len(value) <= 512
                 and len(value.encode("utf-8", errors="replace")) <= 2048
-            }
-        )[:call_limit]
-        if not normalized_ids or not row_limit or not content_limit:
+            ):
+                selected_ids.add(value)
+        normalized_ids = sorted(selected_ids)
+        if not normalized_ids:
             return []
         assert self._conn is not None
 
-        # First bind the scan to the newest 256 store IDs using the existing
-        # session index. The outer query projects bounded BLOB prefixes only, so
-        # even a matching row with a huge TEXT value cannot enter Python in full.
+        # First bind the scan to the newest 256 store IDs using the matching
+        # session or conversation/session index. The outer query projects
+        # bounded BLOB prefixes only, so even a matching row with a huge TEXT
+        # value cannot enter Python in full.
         scan_limit = 256
         placeholders = ",".join("?" for _ in normalized_ids)
         normalized_conversation_id = _normalize_conversation_id_value(conversation_id)
-        conversation_clause = ""
-        conversation_args: list[Any] = []
         if normalized_conversation_id:
-            conversation_clause = " AND m.conversation_id = ?"
-            conversation_args.append(normalized_conversation_id)
+            recent_index = "idx_msg_conversation_session"
+            recent_where = "conversation_id = ? AND session_id = ?"
+            recent_args: list[Any] = [normalized_conversation_id, session_id]
+        else:
+            recent_index = "idx_msg_session"
+            recent_where = "session_id = ?"
+            recent_args = [session_id]
         rows = self._conn.execute(
             f"""WITH recent AS (
                     SELECT store_id
-                      FROM messages INDEXED BY idx_msg_session
-                     WHERE session_id = ?
+                      FROM messages INDEXED BY {recent_index}
+                     WHERE {recent_where}
                      ORDER BY store_id DESC
                      LIMIT ?
                 )
@@ -844,20 +852,18 @@ class MessageStore:
                        m.role,
                        substr(CAST(m.content AS BLOB), 1, ?),
                        m.tool_call_id,
-                       substr(CAST(COALESCE(m.tool_name, '') AS BLOB), 1, 513)
+                       substr(CAST(COALESCE(m.tool_name, '') AS BLOB), 1, 2049)
                   FROM recent
                   JOIN messages m ON m.store_id = recent.store_id
                  WHERE m.role = 'tool'
                    AND m.tool_call_id IN ({placeholders})
-                   {conversation_clause}
                  ORDER BY m.store_id DESC
                  LIMIT ?""",
             [
-                session_id,
+                *recent_args,
                 scan_limit,
                 content_limit + 1,
                 *normalized_ids,
-                *conversation_args,
                 row_limit,
             ],
         ).fetchall()
@@ -865,7 +871,7 @@ class MessageStore:
         for store_id, role, content_prefix, tool_call_id, tool_name_prefix in rows:
             content_bytes = bytes(content_prefix or b"")
             tool_name_bytes = bytes(tool_name_prefix or b"")
-            if len(content_bytes) > content_limit or len(tool_name_bytes) > 512:
+            if len(content_bytes) > content_limit or len(tool_name_bytes) > 2048:
                 continue
             try:
                 content = content_bytes.decode("utf-8")
