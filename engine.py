@@ -2769,6 +2769,7 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
             self._last_overflow_recovery_failed = False
             self._last_condensation_suppressed_reason = ""
         durable_session_state = self._lifecycle.get_by_session(session_id)
+        requested_conversation_id = str(kwargs.get("conversation_id") or "")
         bound_conversation_id = (
             requested_conversation_id
             if requested_conversation_id

@@ -41,7 +41,6 @@ from .ingest_protection import (
     _is_hermes_persisted_output_marker,
     _json_has_duplicate_object_keys,
     _persisted_output_marker_identity_digest,
-    _persisted_output_preview_prefix_digest,
     _persisted_output_saved_path,
     recover_hermes_persisted_output_with_file_stat,
     redact_sensitive_value,
@@ -282,31 +281,6 @@ class ReconcileMixin:
             == expected_chars
             for durable_row in matching_durable_rows
         )
-        incoming_preview_prefix_digest = _persisted_output_preview_prefix_digest(content)
-        durable_marker_identity_matches = bool(
-            incoming_preview_prefix_digest
-            and any(
-                _persisted_output_saved_path(
-                    normalize_content_value(durable_row.get("content")) or ""
-                )
-                == persisted_output_source_path
-                and _expected_persisted_output_chars(
-                    normalize_content_value(durable_row.get("content")) or ""
-                )
-                == expected_chars
-                and (
-                    _persisted_output_preview_prefix_digest(
-                        normalize_content_value(durable_row.get("content")) or ""
-                    )
-                    == incoming_preview_prefix_digest
-                    or _persisted_output_marker_identity_digest(
-                        normalize_content_value(durable_row.get("content")) or ""
-                    )
-                    == incoming_preview_prefix_digest
-                )
-                for durable_row in matching_durable_rows
-            )
-        )
         durable_generation_can_anchor = (
             durable_generation_marker_matches
             and bool(self._config.large_output_externalization_enabled)
@@ -330,10 +304,6 @@ class ReconcileMixin:
                 or str(payload.get("conversation_id") or "")
                 != str(resolved_conversation_id or "")
                 or str(payload.get("tool_call_id") or "").strip() != call_id
-                or (
-                    str(msg.get("tool_name") or "").strip()
-                    and str(payload.get("tool_name") or "").strip() != incoming_tool_name
-                )
                 or (
                     str(payload.get("tool_name") or "").strip()
                     and str(payload.get("tool_name") or "").strip() != incoming_tool_name
@@ -1784,38 +1754,6 @@ class ReconcileMixin:
                     )
                     for later_offset in incoming_tool_offsets
                 )
-                same_source_durable_payload = None
-                if incoming_is_persisted_output_marker and later_equivalent_occurrence:
-                    expected_chars = _expected_persisted_output_chars(incoming_content)
-                    source_path = _persisted_output_saved_path(incoming_content)
-                    preview_sha256, allow_redacted_preview_match = getattr(
-                        self,
-                        "_persisted_output_marker_replay_proof",
-                    )(incoming_content)
-                    if expected_chars is not None and source_path and preview_sha256:
-                        incoming_tool_name = (
-                            incoming_name_map[incoming_anchor]
-                            or str(incoming_tool.get("tool_name") or "").strip()
-                        )
-                        same_source_durable_payload = (
-                            find_externalized_tool_result_content_for_call(
-                                tool_call_id=call_id,
-                                session_id=(
-                                    replay_session_id
-                                    or str(getattr(self, "_session_id", None) or "")
-                                ),
-                                conversation_id=str(
-                                    effective_replay_conversation_id or ""
-                                ),
-                                tool_name=incoming_tool_name,
-                                expected_chars=expected_chars,
-                                persisted_output_source_path=source_path,
-                                persisted_output_preview_sha256=preview_sha256,
-                                allow_redacted_preview_match=allow_redacted_preview_match,
-                                config=getattr(self, "_config"),
-                                hermes_home=getattr(self, "_hermes_home"),
-                            )
-                        )
                 repeated_prefix_candidates = [
                     stored_offset
                     for stored_offset, stored_row in enumerate(stored_rows)
