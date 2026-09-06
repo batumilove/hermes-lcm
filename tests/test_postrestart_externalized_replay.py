@@ -389,6 +389,81 @@ def test_lossy_durable_replay_uses_explicit_session_for_exact_generation_lookup(
     assert lookup_session_ids == [ended_session_id, ended_session_id, ended_session_id]
 
 
+def test_legacy_replay_uses_message_conversation_when_explicit_value_is_omitted(
+    tmp_path,
+    monkeypatch,
+):
+    ended_session_id = "postrestart-legacy-ended-session"
+    ended_conversation_id = "postrestart-legacy-ended-conversation"
+    active_conversation_id = "postrestart-legacy-active-conversation"
+    call_id = "call_legacy_replayed_from_ended_conversation"
+    raw_content = "legacy durable result " + ("x" * 1024)
+    config = LCMConfig(database_path=str(tmp_path / "legacy-message-conversation.db"))
+    persisted_path = tmp_path / "call_legacy_replayed_from_ended_conversation.txt"
+    persisted_path.write_text(raw_content, encoding="utf-8")
+    persisted_marker = (
+        "<persisted-output>\n"
+        f"This tool result was too large ({len(raw_content):,} characters, 1.0 KB).\n"
+        f"Full output saved to: {persisted_path}\n"
+        "Use the read_file tool with offset and limit to access specific sections of this output.\n\n"
+        "Preview (first 30 chars):\n"
+        f"{raw_content[:30]}\n...\n"
+        "</persisted-output>"
+    )
+    message = _tool_result(call_id, persisted_marker)
+    message["conversation_id"] = ended_conversation_id
+    lookup_conversation_ids = []
+
+    monkeypatch.setattr(
+        "hermes_lcm.reconcile._expected_persisted_output_chars",
+        lambda _content: len(raw_content),
+    )
+    monkeypatch.setattr(
+        "hermes_lcm.reconcile._persisted_output_saved_path",
+        lambda _content: str(persisted_path),
+    )
+    monkeypatch.setattr(
+        "hermes_lcm.reconcile.recover_hermes_persisted_output_with_file_stat",
+        lambda _content: (
+            raw_content,
+            {"size": len(raw_content), "mtime_ns": 1, "ctime_ns": 1},
+        ),
+    )
+    monkeypatch.setattr(
+        "hermes_lcm.reconcile.find_externalized_tool_result_content_for_call",
+        lambda **_kwargs: None,
+    )
+    rebound = LCMEngine(config=config, hermes_home=str(tmp_path / "hermes"))
+    rebound._session_id = "postrestart-legacy-active-session"
+    rebound._conversation_id = active_conversation_id
+    monkeypatch.setattr(
+        rebound,
+        "_persisted_output_marker_replay_proof",
+        lambda _content: ("preview-sha256", False),
+    )
+
+    def find_neighborhoods(session_id, call_ids, *, conversation_id=None):
+        lookup_conversation_ids.append(conversation_id)
+        if conversation_id != ended_conversation_id:
+            return []
+        return [_tool_result(call_id, raw_content)]
+
+    monkeypatch.setattr(
+        rebound._store,
+        "get_tool_call_replay_neighborhoods",
+        find_neighborhoods,
+    )
+
+    replayed = rebound._has_durable_persisted_output_replay_identity(
+        message,
+        session_id=ended_session_id,
+    )
+    rebound.shutdown()
+
+    assert replayed is True, lookup_conversation_ids
+    assert lookup_conversation_ids == [ended_conversation_id]
+
+
 @pytest.mark.parametrize(
     ("intervening_messages", "expected_row_count", "expected_tool_rows"),
     [

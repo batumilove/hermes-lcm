@@ -104,7 +104,7 @@ class ReconcileMixin:
         resolved_conversation_id = (
             conversation_id
             if conversation_id is not None
-            else getattr(self, "_conversation_id", None)
+            else msg.get("conversation_id") or getattr(self, "_conversation_id", None)
         )
         if role != "tool" or not _is_hermes_persisted_output_marker(content):
             return False
