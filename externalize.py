@@ -522,7 +522,7 @@ def resolve_large_output_storage_dir(config, hermes_home: str = "") -> Path:
 
 
 def _externalized_summary(path: Path, payload: Dict[str, Any]) -> Dict[str, Any]:
-    return {
+    summary = {
         "ref": path.name,
         "kind": payload.get("kind", "tool_result"),
         "tool_call_id": payload.get("tool_call_id", ""),
@@ -533,6 +533,21 @@ def _externalized_summary(path: Path, payload: Dict[str, Any]) -> Dict[str, Any]
         "content_bytes": payload.get("content_bytes", len((payload.get("content", "") or "").encode("utf-8"))),
         "created_at": payload.get("created_at"),
     }
+    for field in (
+        "conversation_id",
+        "tool_name",
+        "persisted_output_source_path",
+        "persisted_output_expected_chars",
+        "persisted_output_preview_sha256",
+        "persisted_output_redacted_preview_sha256",
+        "persisted_output_file_size",
+        "persisted_output_file_mtime_ns",
+        "persisted_output_file_ctime_ns",
+        "persisted_output_markers",
+    ):
+        if field in payload:
+            summary[field] = payload[field]
+    return summary
 
 
 def _build_externalized_placeholder(summary: Dict[str, Any]) -> str:

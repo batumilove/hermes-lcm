@@ -40,6 +40,7 @@ from .ingest_protection import (
     _is_hermes_persisted_output_marker,
     _json_has_duplicate_object_keys,
     _persisted_output_marker_identity_digest,
+    _persisted_output_preview_prefix_digest,
     _persisted_output_saved_path,
     recover_hermes_persisted_output_with_file_stat,
     redact_sensitive_value,
@@ -279,6 +280,31 @@ class ReconcileMixin:
             )
             == expected_chars
             for durable_row in matching_durable_rows
+        )
+        incoming_preview_prefix_digest = _persisted_output_preview_prefix_digest(content)
+        durable_marker_identity_matches = bool(
+            incoming_preview_prefix_digest
+            and any(
+                _persisted_output_saved_path(
+                    normalize_content_value(durable_row.get("content")) or ""
+                )
+                == persisted_output_source_path
+                and _expected_persisted_output_chars(
+                    normalize_content_value(durable_row.get("content")) or ""
+                )
+                == expected_chars
+                and (
+                    _persisted_output_preview_prefix_digest(
+                        normalize_content_value(durable_row.get("content")) or ""
+                    )
+                    == incoming_preview_prefix_digest
+                    or _persisted_output_marker_identity_digest(
+                        normalize_content_value(durable_row.get("content")) or ""
+                    )
+                    == incoming_preview_prefix_digest
+                )
+                for durable_row in matching_durable_rows
+            )
         )
         durable_generation_can_anchor = (
             durable_generation_marker_matches
@@ -1421,6 +1447,98 @@ class ReconcileMixin:
                 and incoming_clean == stored_clean
             )
 
+        def stored_marker_primary_provenance_matches(
+            stored_row: Dict[str, Any],
+            incoming_content: str,
+            incoming_tool_name: str,
+            *,
+            require_exact_generation: bool = False,
+        ) -> bool:
+            recovered = recover_hermes_persisted_output_with_file_stat(incoming_content)
+            stored_content = normalize_content_value(stored_row.get("content")) or ""
+            ref = extract_externalized_ref(stored_content)
+            if recovered is None or not ref:
+                return False
+            payload = load_externalized_payload(
+                ref,
+                config=getattr(self, "_config", None),
+                hermes_home=str(getattr(self, "_hermes_home", "")),
+            )
+            durable_content = payload.get("content") if payload is not None else None
+            stored_tool_name = str(stored_row.get("tool_name") or "").strip()
+
+            recovered_content = recovered[0]
+            recovered_identity_content = normalize_content_value(
+                redact_sensitive_value(
+                    recovered_content,
+                    getattr(self, "_config", None),
+                    parse_json_strings=False,
+                )
+            )
+            payload_conversation_id = str(
+                (payload.get("conversation_id") if payload is not None else "") or ""
+            )
+            incoming_path = _persisted_output_saved_path(incoming_content)
+            incoming_chars = _expected_persisted_output_chars(incoming_content)
+            incoming_preview = _persisted_output_marker_identity_digest(incoming_content)
+            recovered_generation = recovered[1]
+            payload_markers = payload.get("persisted_output_markers") if payload else None
+            if not isinstance(payload_markers, list):
+                payload_markers = []
+            marker_matches = any(
+                isinstance(marker, dict)
+                and marker.get("source_path") == incoming_path
+                and marker.get("expected_chars") == incoming_chars
+                and (
+                    not incoming_preview
+                    or incoming_preview
+                    in {
+                        marker.get("preview_sha256"),
+                        marker.get("redacted_preview_sha256"),
+                    }
+                )
+                and (
+                    not require_exact_generation
+                    or (
+                        marker.get("file_size") == recovered_generation["size"]
+                        and marker.get("file_mtime_ns")
+                        == recovered_generation["mtime_ns"]
+                        and marker.get("file_ctime_ns")
+                        == recovered_generation["ctime_ns"]
+                    )
+                )
+                for marker in payload_markers
+            )
+            return bool(
+                self._stored_row_has_durable_persisted_output_marker(stored_row)
+                and payload is not None
+                and payload.get("kind") == "tool_result"
+                and payload.get("role") == "tool"
+                and str(payload.get("session_id") or "")
+                == str(stored_row.get("session_id") or "")
+                and (
+                    not payload_conversation_id
+                    or payload_conversation_id
+                    == str(stored_row.get("conversation_id") or "")
+                )
+                and str(payload.get("tool_call_id") or "").strip()
+                == str(stored_row.get("tool_call_id") or "").strip()
+                and (
+                    not str(payload.get("tool_name") or "").strip()
+                    or str(payload.get("tool_name") or "").strip()
+                    == incoming_tool_name
+                )
+                and (not stored_tool_name or stored_tool_name == incoming_tool_name)
+                and marker_matches
+                and isinstance(durable_content, str)
+                and not _has_lossy_sensitive_redaction(durable_content)
+                and not _has_lossy_sensitive_redaction(recovered_identity_content)
+                and getattr(self, "_recovered_content_matches_durable_identity")(
+                    recovered_content,
+                    durable_content,
+                )
+            )
+
         def assistant_tool_call_ids(msg: Dict[str, Any]) -> set[str]:
             tool_calls = msg.get("tool_calls") or []
             if isinstance(tool_calls, str):
@@ -1514,23 +1632,49 @@ class ReconcileMixin:
             # Inline replay metadata may decorate the marker before this scan,
             # so successful recovery (rather than marker-shape recognition alone)
             # is the authoritative signal that exact live generation is available.
+            recovered_persisted_output = recover_hermes_persisted_output_with_file_stat(
+                incoming_content
+            )
             has_live_persisted_output_generation = (
-                recover_hermes_persisted_output_with_file_stat(incoming_content) is not None
+                bool(self._config.large_output_externalization_enabled)
+                and recovered_persisted_output is not None
             )
             if has_live_persisted_output_generation:
-                persisted_output_anchor_proven = (
-                    self._has_durable_persisted_output_replay_identity(
-                        incoming_tool,
-                        session_id=replay_session_id,
-                        conversation_id=replay_conversation_id,
-                        require_exact_generation=True,
+                if incoming_call_occurrences > 1:
+                    candidates = [
+                        stored_offset
+                        for stored_offset, stored_row in enumerate(stored_rows)
+                        if str(stored_row.get("role") or "") == "tool"
+                        and str(stored_row.get("tool_call_id") or "").strip()
+                        == call_id
+                        and stored_identities[stored_offset][4]
+                        == incoming_identities[incoming_anchor][4]
+                        and stored_marker_primary_provenance_matches(
+                            stored_row,
+                            incoming_content,
+                            str(
+                                incoming_tool.get("tool_name")
+                                or incoming_name_map[incoming_anchor]
+                                or ""
+                            ).strip(),
+                            require_exact_generation=True,
+                        )
+                    ]
+                    persisted_output_anchor_proven = bool(candidates)
+                else:
+                    persisted_output_anchor_proven = (
+                        self._has_durable_persisted_output_replay_identity(
+                            incoming_tool,
+                            session_id=replay_session_id,
+                            conversation_id=replay_conversation_id,
+                            require_exact_generation=True,
+                        )
                     )
-                )
-                candidates = (
-                    stored_tool_anchors.get(incoming_identity, [])
-                    if persisted_output_anchor_proven
-                    else []
-                )
+                    candidates = (
+                        stored_tool_anchors.get(incoming_identity, [])
+                        if persisted_output_anchor_proven
+                        else []
+                    )
             else:
                 # An unrecoverable persisted-output pointer is not independently
                 # an anchor in a mixed replay suffix: a retry may reuse the same
@@ -1583,16 +1727,31 @@ class ReconcileMixin:
                     and marker_follows_proven_durable_segment
                     and incoming_replay_segment_matches_durable
                 )
+                legacy_exact_snapshot_marker = (
+                    incoming_is_persisted_output_marker
+                    and bool(self._config.large_output_externalization_enabled)
+                    and incoming_call_occurrences == 1
+                    and incoming_tool.get("_lcm_legacy_raw_payload_before_ingest") is True
+                    and has_adjacent_incoming_call
+                    and not has_live_persisted_output_generation
+                    and incoming_anchor > 0
+                    and incoming_anchor <= len(stored_identities)
+                    and incoming_identities[:incoming_anchor]
+                    == stored_identities[:incoming_anchor]
+                    and bool(marker_candidates)
+                )
                 candidates = (
                     marker_candidates
                     if not incoming_is_persisted_output_marker
                     or marker_inside_proven_replay_segment
+                    or legacy_exact_snapshot_marker
                     else []
                 )
                 if (
                     incoming_is_persisted_output_marker
                     and incoming_call_occurrences > 1
                     and has_adjacent_incoming_call
+                    and recovered_persisted_output is None
                     and not _has_inline_persisted_output_generation_metadata(
                         incoming_content
                     )
@@ -1670,13 +1829,20 @@ class ReconcileMixin:
                     if later_equivalent_occurrence
                     and str(stored_row.get("role") or "") == "tool"
                     and str(stored_row.get("tool_call_id") or "").strip() == call_id
-                    and (
-                        normalize_content_value(stored_row.get("content"))
-                        == incoming_content
-                        or same_source_durable_payload is not None
+                    and stored_marker_primary_provenance_matches(
+                        stored_row,
+                        incoming_content,
+                        str(
+                            incoming_tool.get("tool_name")
+                            or incoming_name_map[incoming_anchor]
+                            or ""
+                        ).strip(),
+                        require_exact_generation=not bool(
+                            getattr(self, "_config").large_output_externalization_enabled
+                        ),
                     )
-                    and stored_name_map[stored_offset]
-                    == incoming_name_map[incoming_anchor]
+                    and stored_identities[stored_offset][4]
+                    == incoming_identities[incoming_anchor][4]
                 ]
                 if repeated_prefix_candidates:
                     # A restarted full transcript can contain one durable pair
