@@ -5775,7 +5775,7 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
             return self._remember_active_replay_messages(messages, active_replay_messages)
 
         final_form_replay_candidate_indexes: set[int] = set()
-        if reconciled_ingest_cursor and self._config.large_output_externalization_enabled:
+        if reconciled_ingest_cursor:
             for relative_index, (absolute_index, message) in enumerate(messages_to_store_with_index):
                 call_id = str(message.get("tool_call_id") or "").strip()
                 if str(message.get("role") or "") != "tool" or not call_id:
