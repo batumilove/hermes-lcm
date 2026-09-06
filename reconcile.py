@@ -312,7 +312,7 @@ class ReconcileMixin:
             ):
                 return None
             markers = payload.get("persisted_output_markers")
-            if not isinstance(markers, list):
+            if not isinstance(markers, list) or not markers:
                 # A row that was externalized from raw tool content predates
                 # persisted-marker metadata. Its scoped ref still binds the
                 # recovered bytes to this exact durable tool row.
