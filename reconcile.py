@@ -2249,6 +2249,7 @@ class ReconcileMixin:
             session_count = self._store.get_session_count(
                 self._session_id,
                 conversation_id=getattr(self, "_conversation_id", None),
+                include_legacy_unscoped=True,
             )
         except Exception as exc:  # pragma: no cover - defensive only
             logger.debug("LCM ingest cursor reconciliation count failed: %s", exc)
@@ -2288,6 +2289,7 @@ class ReconcileMixin:
             self._session_id,
             limit=tail_limit,
             conversation_id=getattr(self, "_conversation_id", None),
+            include_legacy_unscoped=True,
         )
         if not stored_rows:
             return 0
@@ -2377,6 +2379,7 @@ class ReconcileMixin:
             self._session_id,
             limit=tail_limit,
             conversation_id=getattr(self, "_conversation_id", None),
+            include_legacy_unscoped=True,
         )
         stored_head = [self._message_replay_identity(row, stored_row=True) for row in stored_head_rows]
         # Stale-snapshot proof uses the raw durable prefix.  Ignore-message

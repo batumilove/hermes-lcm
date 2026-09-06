@@ -968,14 +968,20 @@ class MessageStore:
 
     def get_session_messages(self, session_id: str,
                              limit: int = 10000,
-                             conversation_id: str | None = None) -> List[Dict[str, Any]]:
+                             conversation_id: str | None = None,
+                             include_legacy_unscoped: bool = False) -> List[Dict[str, Any]]:
         """Get all messages for a session, ordered by store_id."""
-        conversation_clause = " AND conversation_id = ?" if conversation_id is not None else ""
-        params: tuple[Any, ...] = (
-            (session_id, conversation_id, limit)
-            if conversation_id is not None
-            else (session_id, limit)
-        )
+        if conversation_id is None:
+            conversation_clause = ""
+            params: tuple[Any, ...] = (session_id, limit)
+        elif include_legacy_unscoped:
+            conversation_clause = (
+                " AND (conversation_id = ? OR COALESCE(TRIM(conversation_id), '') = '')"
+            )
+            params = (session_id, conversation_id, limit)
+        else:
+            conversation_clause = " AND conversation_id = ?"
+            params = (session_id, conversation_id, limit)
         rows = self._conn.execute(
             f"""SELECT {_MESSAGE_SELECT_COLUMNS} FROM messages
                WHERE session_id = ?{conversation_clause}
@@ -1010,16 +1016,22 @@ class MessageStore:
         return [self._row_to_dict(r) for r in rows]
 
     def get_session_tail(self, session_id: str, limit: int = 1000,
-                         conversation_id: str | None = None) -> List[Dict[str, Any]]:
+                         conversation_id: str | None = None,
+                         include_legacy_unscoped: bool = False) -> List[Dict[str, Any]]:
         """Get the latest messages for a session, returned in store order."""
         if limit <= 0:
             return []
-        conversation_clause = " AND conversation_id = ?" if conversation_id is not None else ""
-        params: tuple[Any, ...] = (
-            (session_id, conversation_id, limit)
-            if conversation_id is not None
-            else (session_id, limit)
-        )
+        if conversation_id is None:
+            conversation_clause = ""
+            params: tuple[Any, ...] = (session_id, limit)
+        elif include_legacy_unscoped:
+            conversation_clause = (
+                " AND (conversation_id = ? OR COALESCE(TRIM(conversation_id), '') = '')"
+            )
+            params = (session_id, conversation_id, limit)
+        else:
+            conversation_clause = " AND conversation_id = ?"
+            params = (session_id, conversation_id, limit)
         rows = self._conn.execute(
             f"""SELECT {_MESSAGE_SELECT_COLUMNS}
                FROM (
@@ -1035,14 +1047,20 @@ class MessageStore:
         return [self._row_to_dict(r) for r in rows]
 
     def get_session_count(self, session_id: str,
-                          conversation_id: str | None = None) -> int:
+                          conversation_id: str | None = None,
+                          include_legacy_unscoped: bool = False) -> int:
         """Count messages in a session, optionally within one conversation."""
-        conversation_clause = " AND conversation_id = ?" if conversation_id is not None else ""
-        params: tuple[Any, ...] = (
-            (session_id, conversation_id)
-            if conversation_id is not None
-            else (session_id,)
-        )
+        if conversation_id is None:
+            conversation_clause = ""
+            params: tuple[Any, ...] = (session_id,)
+        elif include_legacy_unscoped:
+            conversation_clause = (
+                " AND (conversation_id = ? OR COALESCE(TRIM(conversation_id), '') = '')"
+            )
+            params = (session_id, conversation_id)
+        else:
+            conversation_clause = " AND conversation_id = ?"
+            params = (session_id, conversation_id)
         row = self._conn.execute(
             f"SELECT COUNT(*) FROM messages WHERE session_id = ?{conversation_clause}",
             params,
