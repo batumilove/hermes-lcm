@@ -213,3 +213,41 @@ def test_diagnostic_store_lookup_is_indexed_and_result_bounded(tmp_path):
     assert len(rows) == 16
     assert [row["content"] for row in rows] == [f"result-{idx}" for idx in range(84, 100)]
     assert any("idx_msg_session" in str(row) for row in plan)
+
+
+def test_final_form_replay_filter_runs_before_duplicate_admission_diagnostic(
+    tmp_path, monkeypatch, caplog
+):
+    """A replay row removed at the final gate must not emit a false warning."""
+    config = LCMConfig(database_path=str(tmp_path / "final-filter-order.db"))
+    session_id = "final-filter-order-session"
+    replayed = _tool("call_final_filter", "<persisted-output>same durable marker</persisted-output>")
+
+    seed = LCMEngine(config=config)
+    seed.on_session_start(session_id, context_length=200000)
+    seed._store.append(session_id, replayed)
+    seed.shutdown()
+
+    rebound = LCMEngine(config=config)
+    rebound.on_session_start(session_id, context_length=200000)
+    rebound._ingest_cursor = 0
+    rebound._ingest_cursor_needs_reconcile = True
+    monkeypatch.setattr(
+        rebound,
+        "_find_tool_anchored_replay_indexes",
+        lambda *_args, **_kwargs: (set(), 0),
+    )
+    monkeypatch.setattr(
+        rebound,
+        "_has_durable_persisted_output_replay_identity",
+        lambda *_args, **_kwargs: True,
+    )
+
+    with caplog.at_level(logging.WARNING, logger="hermes_lcm.engine"):
+        rebound._ingest_messages([replayed])
+
+    rows = rebound._store.get_session_messages(session_id)
+    rebound.shutdown()
+
+    assert len(rows) == 1
+    assert EVENT_PREFIX not in caplog.text
