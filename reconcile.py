@@ -341,7 +341,11 @@ class ReconcileMixin:
             return None
 
         exact_generation_content = None
-        if marker_was_durable or durable_generation_can_anchor:
+        if bool(self._config.large_output_externalization_enabled):
+            # The incoming persisted marker may itself be new while the
+            # matching durable row is an older raw-output externalization.
+            # Trust only that row's scoped payload; do not require the incoming
+            # marker to have been durable already.
             for durable_row in matching_durable_rows:
                 exact_generation_content = row_bound_exact_generation_content(durable_row)
                 if exact_generation_content is not None:
