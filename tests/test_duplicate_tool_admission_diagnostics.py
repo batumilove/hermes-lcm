@@ -259,7 +259,7 @@ def test_diagnostic_identity_does_not_use_replay_payload_recovery(tmp_path, monk
     duplicate = _tool("call_no_payload_recovery", "same bounded result")
     engine = LCMEngine(config=config)
     engine.on_session_start(session_id, context_length=200000)
-    engine._store.append(session_id, duplicate)
+    engine._ingest_messages([duplicate])
 
     def fail_if_replay_identity_is_used(*_args, **_kwargs):
         raise AssertionError("diagnostics must not recover replay payloads")
