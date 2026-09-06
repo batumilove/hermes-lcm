@@ -6958,6 +6958,256 @@ class TestIngestExternalization:
 
         assert not output_dir.exists()
 
+    def test_exact_generation_proof_rejects_orphan_sidecar_for_raw_durable_row(
+        self, tmp_path, monkeypatch
+    ):
+        import tempfile
+
+        monkeypatch.setattr(tempfile, "tempdir", str(tmp_path))
+        engine, output_dir = self._engine(tmp_path)
+        engine._conversation_id = "orphan-sidecar-conversation"
+        host_storage = tmp_path / "hermes-results"
+        host_storage.mkdir()
+        recovered = "ORPHAN_SIDECAR_RESULT:\n" + ("same" * 2000)
+        persisted_path = host_storage / "orphan-sidecar-result.txt"
+        persisted_path.write_text(recovered, encoding="utf-8")
+        marker = (
+            "<persisted-output>\n"
+            f"This tool result was too large ({len(recovered):,} characters, 7.8 KB).\n"
+            f"Full output saved to: {persisted_path}\n"
+            "Use the read_file tool with offset and limit to access specific sections of this output.\n\n"
+            "Preview (first 30 chars):\n"
+            f"{recovered[:30]}\n...\n"
+            "</persisted-output>"
+        )
+        assistant = {
+            "role": "assistant",
+            "content": "Calling",
+            "tool_calls": [
+                {"id": "call_orphan_sidecar", "function": {"name": "dump", "arguments": "{}"}}
+            ],
+        }
+        tool = {
+            "role": "tool",
+            "tool_call_id": "call_orphan_sidecar",
+            "tool_name": "dump",
+            "content": marker,
+        }
+
+        engine._ingest_messages([assistant, tool])
+        assert len(list(output_dir.glob("*.json"))) == 1
+        engine._store._conn.execute(
+            "UPDATE messages SET content = ? WHERE session_id = ? AND tool_call_id = ?",
+            (recovered, "ingest-session", "call_orphan_sidecar"),
+        )
+        engine._store._conn.commit()
+
+        assert not engine._has_durable_persisted_output_replay_identity(
+            tool,
+            require_exact_generation=True,
+        )
+
+    def test_exact_generation_proof_accepts_row_bound_legacy_payload_without_tool_name(
+        self, tmp_path, monkeypatch
+    ):
+        import tempfile
+
+        monkeypatch.setattr(tempfile, "tempdir", str(tmp_path))
+        engine, output_dir = self._engine(tmp_path)
+        engine._conversation_id = "legacy-tool-name-conversation"
+        host_storage = tmp_path / "hermes-results"
+        host_storage.mkdir()
+        recovered = "LEGACY_TOOL_NAME_RESULT:\n" + ("same" * 2000)
+        persisted_path = host_storage / "legacy-tool-name-result.txt"
+        persisted_path.write_text(recovered, encoding="utf-8")
+        marker = (
+            "<persisted-output>\n"
+            f"This tool result was too large ({len(recovered):,} characters, 7.8 KB).\n"
+            f"Full output saved to: {persisted_path}\n"
+            "Use the read_file tool with offset and limit to access specific sections of this output.\n\n"
+            "Preview (first 30 chars):\n"
+            f"{recovered[:30]}\n...\n"
+            "</persisted-output>"
+        )
+        assistant = {
+            "role": "assistant",
+            "content": "Calling",
+            "tool_calls": [
+                {"id": "call_legacy_tool_name", "function": {"name": "dump", "arguments": "{}"}}
+            ],
+        }
+        tool = {
+            "role": "tool",
+            "tool_call_id": "call_legacy_tool_name",
+            "tool_name": "dump",
+            "content": marker,
+        }
+
+        engine._ingest_messages([assistant, tool])
+        payload_file = next(output_dir.glob("*.json"))
+        payload = json.loads(payload_file.read_text())
+        payload.pop("tool_name")
+        payload_file.write_text(json.dumps(payload), encoding="utf-8")
+
+        assert engine._has_durable_persisted_output_replay_identity(
+            tool,
+            require_exact_generation=True,
+        )
+
+    def test_repeated_retry_ignores_matching_global_sidecar_when_row_payload_is_foreign(
+        self, tmp_path, monkeypatch
+    ):
+        import tempfile
+        import hermes_lcm.reconcile as reconcile_module
+        from hermes_lcm.engine import LCMEngine
+        from hermes_lcm.externalize import extract_externalized_ref
+
+        monkeypatch.setattr(tempfile, "tempdir", str(tmp_path))
+        engine, output_dir = self._engine(tmp_path)
+        engine._conversation_id = "row-bound-conversation"
+        host_storage = tmp_path / "hermes-results"
+        host_storage.mkdir()
+        persisted_path = host_storage / "row-bound-result.txt"
+        recovered = "ROW_BOUND_RESULT:\n" + ("same" * 2000)
+        persisted_path.write_text(recovered, encoding="utf-8")
+        marker = (
+            "<persisted-output>\n"
+            f"This tool result was too large ({len(recovered):,} characters, 3.9 KB).\n"
+            f"Full output saved to: {persisted_path}\n"
+            "Use the read_file tool with offset and limit to access specific sections of this output.\n\n"
+            "Preview (first 30 chars):\n"
+            f"{recovered[:30]}\n...\n"
+            "</persisted-output>"
+        )
+        assistant = {
+            "role": "assistant",
+            "content": "Calling",
+            "tool_calls": [
+                {"id": "call_row_bound", "function": {"name": "dump", "arguments": "{}"}}
+            ],
+        }
+        tool = {
+            "role": "tool",
+            "tool_call_id": "call_row_bound",
+            "tool_name": "dump",
+            "content": marker,
+        }
+        engine._ingest_messages([assistant, tool])
+        payload_files = list(output_dir.glob("*.json"))
+        assert len(payload_files) == 1
+        durable_ref = payload_files[0].name
+        placeholder = (
+            "[Externalized tool output: tool_call_id=call_row_bound; "
+            f"chars={len(recovered)}; bytes={len(recovered.encode('utf-8'))}; "
+            f"ref={durable_ref}]"
+        )
+        engine._store._conn.execute(
+            "UPDATE messages SET content = ? WHERE session_id = ? AND tool_call_id = ?",
+            (placeholder, "ingest-session", "call_row_bound"),
+        )
+        engine._store._conn.commit()
+        assert extract_externalized_ref(placeholder) == durable_ref
+        generation = persisted_path.stat()
+        foreign_payload = {
+            "ref": durable_ref,
+            "kind": "tool_result",
+            "role": "tool",
+            "session_id": "ingest-session",
+            "conversation_id": "row-bound-conversation",
+            "tool_call_id": "call_foreign",
+            "tool_name": "dump",
+            "content": recovered,
+            "persisted_output_markers": [
+                {
+                    "source_path": str(persisted_path),
+                    "expected_chars": len(recovered),
+                    "file_size": generation.st_size,
+                    "file_mtime_ns": generation.st_mtime_ns,
+                    "file_ctime_ns": generation.st_ctime_ns,
+                }
+            ],
+        }
+        monkeypatch.setattr(
+            reconcile_module,
+            "load_externalized_payload",
+            lambda *args, **kwargs: foreign_payload,
+        )
+        monkeypatch.setattr(
+            reconcile_module,
+            "find_externalized_tool_result_content_for_call",
+            lambda **kwargs: recovered,
+        )
+
+        replay = LCMEngine(config=engine._config, hermes_home=str(tmp_path / "hermes"))
+        replay._session_id = "ingest-session"
+        replay._conversation_id = "row-bound-conversation"
+        replay._ingest_cursor_needs_reconcile = True
+        replay._ingest_messages([assistant, tool, assistant, tool])
+
+        stored = replay._store.get_session_messages("ingest-session")
+        assert len(stored) == 6
+        assert [row["tool_call_id"] for row in stored].count("call_row_bound") == 3
+
+    def test_replay_disabled_externalization_preserves_repeated_same_path_new_generation(
+        self, tmp_path, monkeypatch
+    ):
+        import os
+        import tempfile
+        from dataclasses import replace
+        from hermes_lcm.engine import LCMEngine
+
+        monkeypatch.setattr(tempfile, "tempdir", str(tmp_path))
+        engine, _output_dir = self._engine(tmp_path)
+        engine._conversation_id = "disabled-repeated-generation-conversation"
+        host_storage = tmp_path / "hermes-results"
+        host_storage.mkdir()
+        full_result = "DISABLED_REPEATED_NEW_GENERATION:\n" + ("same" * 1000)
+        persisted_path = host_storage / "call_disabled_retry.txt"
+        persisted_path.write_text(full_result, encoding="utf-8")
+        marker = (
+            "<persisted-output>\n"
+            f"This tool result was too large ({len(full_result):,} characters, 3.9 KB).\n"
+            f"Full output saved to: {persisted_path}\n"
+            "Use the read_file tool with offset and limit to access specific sections of this output.\n\n"
+            "Preview (first 30 chars):\n"
+            f"{full_result[:30]}\n...\n"
+            "</persisted-output>"
+        )
+        assistant = {
+            "role": "assistant",
+            "content": "Calling",
+            "tool_calls": [
+                {"id": "call_disabled_retry", "function": {"name": "dump", "arguments": "{}"}}
+            ],
+        }
+        tool = {
+            "role": "tool",
+            "tool_call_id": "call_disabled_retry",
+            "tool_name": "dump",
+            "content": marker,
+        }
+        engine._ingest_messages([assistant, tool])
+        assert engine._store.get_session_count("ingest-session") == 2
+
+        first_stat = persisted_path.stat()
+        next_ns = max(first_stat.st_mtime_ns, first_stat.st_ctime_ns) + 2_000_000_000
+        os.utime(persisted_path, ns=(next_ns, next_ns))
+        assert persisted_path.stat().st_mtime_ns != first_stat.st_mtime_ns
+
+        disabled_config = replace(
+            engine._config,
+            large_output_externalization_enabled=False,
+        )
+        replay = LCMEngine(config=disabled_config, hermes_home=str(tmp_path / "hermes"))
+        replay._session_id = "ingest-session"
+        replay._conversation_id = "disabled-repeated-generation-conversation"
+        replay._ingest_cursor_needs_reconcile = True
+        replay._ingest_messages([assistant, tool, assistant, tool])
+
+        stored = replay._store.get_session_messages("ingest-session")
+        assert len(stored) == 6
+        assert [row["tool_call_id"] for row in stored].count("call_disabled_retry") == 3
+
 
 class TestExtraction:
     def test_serialize_messages_replaces_pure_inline_media_with_attachment_marker(self, tmp_path):

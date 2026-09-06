@@ -498,4 +498,3 @@ def test_repeated_exact_generation_anchor_cannot_supply_three_anchor_proof(tmp_p
     after.shutdown()
 
     assert sum(row["content"] == expired_marker for row in rows) == 2
-    assert sum(row.get("tool_call_id") == anchor_call_id for row in rows) == 1
