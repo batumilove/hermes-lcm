@@ -5799,7 +5799,9 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
                 "conversation_id_sha256": self._diagnostic_sha256(self._conversation_id),
                 "database_path_sha256": self._diagnostic_sha256(database_path),
                 "pid": os.getpid(),
-                "invocation_id": str(os.environ.get("INVOCATION_ID") or "")[:64],
+                "invocation_id_sha256": self._diagnostic_sha256(
+                    os.environ.get("INVOCATION_ID") or ""
+                ),
                 "engine_class": engine_class[:128],
                 "plugin_name": metadata.get("name", "hermes-lcm")[:64],
                 "plugin_version": metadata.get("version", "unknown")[:64],

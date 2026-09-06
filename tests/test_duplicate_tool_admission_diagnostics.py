@@ -30,6 +30,8 @@ def test_exact_duplicate_reaching_storage_admission_emits_bounded_receipt_withou
     conversation_id = "sensitive-conversation-id"
     call_id = "call_sensitive_exact_duplicate"
     content = "sensitive exact result body"
+    invocation_id = "private arbitrary invocation payload"
+    monkeypatch.setenv("INVOCATION_ID", invocation_id)
 
     seed = LCMEngine(config=config)
     seed.on_session_start(
@@ -92,9 +94,11 @@ def test_exact_duplicate_reaching_storage_admission_emits_bounded_receipt_withou
             "durable_store_ids": [1],
         }
     ]
+    assert event["invocation_id_sha256"] == hashlib.sha256(invocation_id.encode()).hexdigest()
+    assert "invocation_id" not in event
     serialized = json.dumps(event, sort_keys=True)
     assert len(serialized) < 4096
-    for secret in (session_id, conversation_id, call_id, content):
+    for secret in (session_id, conversation_id, call_id, content, invocation_id):
         assert secret not in serialized
 
 
