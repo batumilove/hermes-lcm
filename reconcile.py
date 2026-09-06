@@ -157,6 +157,14 @@ class ReconcileMixin:
             return False
         if role != "tool" or not _is_hermes_persisted_output_marker(content):
             return False
+        if require_exact_generation and not bool(
+            getattr(self, "_config").large_output_externalization_enabled
+        ):
+            # With externalization disabled there is no durable row-bound
+            # payload that can prove an exact persisted-file generation. Keep
+            # the retry; callers may still replace this predicate in focused
+            # ordering tests without an outer policy gate masking the result.
+            return False
         expected_chars = _expected_persisted_output_chars(content)
         persisted_output_source_path = _persisted_output_saved_path(content)
         persisted_output_preview_sha256, allow_redacted_preview_match = self._persisted_output_marker_replay_proof(content)
