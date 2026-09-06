@@ -18,6 +18,7 @@ avoid an import cycle (staticmethod resolution is identical).
 
 from __future__ import annotations
 
+import hashlib
 import json
 import re
 from pathlib import Path
@@ -310,76 +311,68 @@ class ReconcileMixin:
             durable_generation_marker_matches
             and bool(self._config.large_output_externalization_enabled)
         )
-        exact_generation_content = (
-            find_externalized_tool_result_content_for_call(
-                tool_call_id=call_id,
-                session_id=resolved_session_id,
-                conversation_id=str(resolved_conversation_id or ""),
-                tool_name=incoming_tool_name,
-                expected_chars=expected_chars,
-                persisted_output_source_path=persisted_output_source_path,
-                persisted_output_file_size=recovered_generation["size"],
-                persisted_output_file_mtime_ns=recovered_generation["mtime_ns"],
-                persisted_output_file_ctime_ns=recovered_generation["ctime_ns"],
+        def row_bound_exact_generation_content(durable_row: Dict[str, Any]) -> str | None:
+            ref = extract_externalized_ref(
+                normalize_content_value(durable_row.get("content")) or ""
+            )
+            if not ref:
+                return None
+            payload = load_externalized_payload(
+                ref,
                 config=self._config,
                 hermes_home=self._hermes_home,
-            )
-            if marker_was_durable or durable_generation_can_anchor
-            else None
-        )
-        explicit_incoming_tool_name = str(msg.get("tool_name") or "").strip()
-        legacy_empty_name_payload_is_bound = (
-            not explicit_incoming_tool_name
-            or set(durable_tool_names_by_offset.values()) == {incoming_tool_name}
-        )
-        if (
-            exact_generation_content is None
-            and (marker_was_durable or durable_generation_can_anchor)
-            and incoming_tool_name
-            and legacy_empty_name_payload_is_bound
-        ):
-            exact_generation_content = find_externalized_tool_result_content_for_call(
-                tool_call_id=call_id,
-                session_id=resolved_session_id,
-                conversation_id=str(resolved_conversation_id or ""),
-                tool_name="",
-                expected_chars=expected_chars,
-                persisted_output_source_path=persisted_output_source_path,
-                persisted_output_file_size=recovered_generation["size"],
-                persisted_output_file_mtime_ns=recovered_generation["mtime_ns"],
-                persisted_output_file_ctime_ns=recovered_generation["ctime_ns"],
-                config=self._config,
-                hermes_home=self._hermes_home,
-            )
-        if (
-            exact_generation_content is None
-            and recovered_with_stat is not None
-        ):
-            exact_generation_content = find_externalized_tool_result_content_for_call(
-                tool_call_id=call_id,
-                session_id=resolved_session_id,
-                conversation_id=str(resolved_conversation_id or ""),
-                tool_name=incoming_tool_name,
-                require_no_persisted_output_marker_metadata=True,
-                expected_content=recovered_content,
-                config=getattr(self, "_config"),
-                hermes_home=getattr(self, "_hermes_home"),
             )
             if (
-                exact_generation_content is None
-                and incoming_tool_name
-                and legacy_empty_name_payload_is_bound
-            ):
-                exact_generation_content = find_externalized_tool_result_content_for_call(
-                    tool_call_id=call_id,
-                    session_id=resolved_session_id,
-                    conversation_id=str(resolved_conversation_id or ""),
-                    tool_name="",
-                    require_no_persisted_output_marker_metadata=True,
-                    expected_content=recovered_content,
-                    config=getattr(self, "_config"),
-                    hermes_home=getattr(self, "_hermes_home"),
+                payload is None
+                or payload.get("kind") != "tool_result"
+                or payload.get("role") != "tool"
+                or str(payload.get("session_id") or "") != resolved_session_id
+                or str(payload.get("conversation_id") or "")
+                != str(resolved_conversation_id or "")
+                or str(payload.get("tool_call_id") or "").strip() != call_id
+                or (
+                    str(msg.get("tool_name") or "").strip()
+                    and str(payload.get("tool_name") or "").strip() != incoming_tool_name
                 )
+                or (
+                    str(payload.get("tool_name") or "").strip()
+                    and str(payload.get("tool_name") or "").strip() != incoming_tool_name
+                )
+                or not isinstance(payload.get("content"), str)
+            ):
+                return None
+            markers = payload.get("persisted_output_markers")
+            if not isinstance(markers, list):
+                return None
+            for marker in markers:
+                if not isinstance(marker, dict):
+                    continue
+                preview_digests = {
+                    str(marker.get("preview_sha256") or ""),
+                    str(marker.get("redacted_preview_sha256") or ""),
+                }
+                preview_prefix = marker.get("preview_prefix")
+                if isinstance(preview_prefix, str) and preview_prefix:
+                    preview_digests.add(
+                        hashlib.sha256(preview_prefix.encode("utf-8")).hexdigest()
+                    )
+                if (
+                    marker.get("source_path") == persisted_output_source_path
+                    and marker.get("expected_chars") == expected_chars
+                    and marker.get("file_size") == recovered_generation["size"]
+                    and marker.get("file_mtime_ns") == recovered_generation["mtime_ns"]
+                    and marker.get("file_ctime_ns") == recovered_generation["ctime_ns"]
+                    and persisted_output_preview_sha256 in preview_digests
+                ):
+                    return payload["content"]
+            return None
+
+        exact_generation_content = None
+        if marker_was_durable or durable_generation_can_anchor:
+            for durable_row in matching_durable_rows:
+                exact_generation_content = row_bound_exact_generation_content(durable_row)
+                if exact_generation_content is not None:
+                    break
         externalized_generation_matches = bool(
             exact_generation_content is not None
             and matching_durable_contents
