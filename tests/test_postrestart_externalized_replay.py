@@ -321,6 +321,74 @@ def test_deferred_final_form_filter_uses_intent_session_identity_when_bound_else
     assert appended == [], evidence
 
 
+def test_lossy_durable_replay_uses_explicit_session_for_exact_generation_lookup(
+    tmp_path,
+    monkeypatch,
+):
+    ended_session_id = "postrestart-lossy-ended-session"
+    active_session_id = "postrestart-lossy-active-session"
+    call_id = "call_lossy_replayed_from_ended_session"
+    raw_content = "password=super-secret " + ("x" * 1024)
+    monkeypatch.setattr(
+        "hermes_lcm.ingest_protection.tempfile.gettempdir",
+        lambda: str(tmp_path),
+    )
+    config = LCMConfig(
+        database_path=str(tmp_path / "lossy-explicit-session.db"),
+        large_output_externalization_enabled=True,
+        large_output_externalization_threshold_chars=256,
+        large_output_externalization_path=str(tmp_path / "externalized"),
+    )
+    host_storage = tmp_path / "hermes-results"
+    host_storage.mkdir()
+    persisted_path = host_storage / "call_lossy_replayed_from_ended_session.txt"
+    persisted_path.write_text(raw_content, encoding="utf-8")
+    persisted_marker = (
+        "<persisted-output>\n"
+        f"This tool result was too large ({len(raw_content):,} characters, 1.0 KB).\n"
+        f"Full output saved to: {persisted_path}\n"
+        "Use the read_file tool with offset and limit to access specific sections of this output.\n\n"
+        "Preview (first 30 chars):\n"
+        f"{raw_content[:30]}\n...\n"
+        "</persisted-output>"
+    )
+    lossy_content = "[LCM sensitive redaction: name=password_assignment]"
+    lookup_session_ids = []
+
+    def find_durable_content(**kwargs):
+        lookup_session_ids.append(kwargs["session_id"])
+        if len(lookup_session_ids) == 1:
+            return lossy_content
+        if len(lookup_session_ids) == 2:
+            return None
+        return lossy_content if kwargs["session_id"] == ended_session_id else None
+
+    monkeypatch.setattr(
+        "hermes_lcm.reconcile.find_externalized_tool_result_content_for_call",
+        find_durable_content,
+    )
+    monkeypatch.setattr(
+        "hermes_lcm.reconcile.redact_sensitive_value",
+        lambda *_args, **_kwargs: lossy_content,
+    )
+    rebound = LCMEngine(config=config, hermes_home=str(tmp_path / "hermes"))
+    rebound._session_id = active_session_id
+    monkeypatch.setattr(
+        rebound,
+        "_recovered_content_matches_durable_identity",
+        lambda *_args, **_kwargs: True,
+    )
+
+    replayed = rebound._has_durable_persisted_output_replay_identity(
+        _tool_result(call_id, persisted_marker),
+        session_id=ended_session_id,
+    )
+    rebound.shutdown()
+
+    assert replayed is True, lookup_session_ids
+    assert lookup_session_ids == [ended_session_id, ended_session_id, ended_session_id]
+
+
 @pytest.mark.parametrize(
     ("intervening_messages", "expected_row_count", "expected_tool_rows"),
     [

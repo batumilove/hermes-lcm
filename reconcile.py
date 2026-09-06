@@ -181,7 +181,7 @@ class ReconcileMixin:
                     return False
                 exact_generation_content = find_externalized_tool_result_content_for_call(
                     tool_call_id=str(msg.get("tool_call_id") or ""),
-                    session_id=str(msg.get("session_id") or self._session_id or ""),
+                    session_id=resolved_session_id,
                     expected_chars=expected_chars,
                     persisted_output_source_path=persisted_output_source_path,
                     persisted_output_preview_sha256=persisted_output_preview_sha256,
