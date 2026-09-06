@@ -123,6 +123,78 @@ def test_new_standalone_tool_content_with_reused_id_stays_silent_and_persists(
     assert EVENT_PREFIX not in caplog.text
 
 
+def test_whitespace_in_tool_identifiers_is_not_normalized_into_a_false_duplicate(
+    tmp_path, caplog
+):
+    config = LCMConfig(database_path=str(tmp_path / "exact-identifiers.db"))
+    engine = LCMEngine(config=config)
+    engine.on_session_start("exact-identifiers-session", context_length=200000)
+    engine._store.append(
+        "exact-identifiers-session",
+        _tool("call_exact", "same result"),
+    )
+
+    incoming = _tool(" call_exact ", "same result")
+    incoming["tool_name"] = " inspect "
+    assert engine._bounded_tool_diagnostic_identity(incoming) != (
+        "tool",
+        "call_exact",
+        "inspect",
+        hashlib.sha256(b"same result").hexdigest(),
+    )
+    with caplog.at_level(logging.WARNING, logger="hermes_lcm.engine"):
+        engine._warn_if_duplicate_tool_admission(
+            [(0, incoming)],
+            incoming_count=1,
+            cursor=0,
+            cursor_before_reconcile=0,
+            reconcile_requested=False,
+            overflow_recovery_pending=False,
+            session_end=False,
+        )
+
+    engine.shutdown()
+    assert EVENT_PREFIX not in caplog.text
+
+
+def test_diagnostic_identifiers_are_not_coerced_before_bounds(tmp_path):
+    class ExplosiveIdentifier:
+        def __init__(self):
+            self.coercions = 0
+
+        def __str__(self):
+            self.coercions += 1
+            raise AssertionError("diagnostic identifier must not be coerced")
+
+    config = LCMConfig(database_path=str(tmp_path / "no-identifier-coercion.db"))
+    engine = LCMEngine(config=config)
+    engine.on_session_start("no-identifier-coercion-session", context_length=200000)
+    incoming_identifier = ExplosiveIdentifier()
+    store_identifier = ExplosiveIdentifier()
+
+    assert (
+        engine._bounded_tool_diagnostic_identity(
+            {
+                "role": "tool",
+                "tool_call_id": incoming_identifier,
+                "tool_name": "inspect",
+                "content": "same result",
+            }
+        )
+        is None
+    )
+    assert (
+        engine._store.get_bounded_tool_call_rows(
+            "no-identifier-coercion-session",
+            [store_identifier],
+        )
+        == []
+    )
+    engine.shutdown()
+    assert incoming_identifier.coercions == 0
+    assert store_identifier.coercions == 0
+
+
 def test_receipt_is_hard_bounded_with_an_adversarial_engine_class_name(
     tmp_path, monkeypatch, caplog
 ):
