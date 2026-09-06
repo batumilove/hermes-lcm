@@ -20,7 +20,6 @@ from __future__ import annotations
 
 import json
 import re
-from bisect import bisect_left
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
@@ -36,6 +35,7 @@ from .ingest_protection import (
     _add_inline_persisted_output_identity_metadata,
     _expected_persisted_output_chars,
     _has_inline_persisted_output_generation_metadata,
+    _inline_persisted_output_generation_metadata,
     _has_lossy_sensitive_redaction,
     _is_hermes_persisted_output_marker,
     _json_has_duplicate_object_keys,
@@ -89,23 +89,71 @@ class ReconcileMixin:
         except (TypeError, ValueError):
             return str(tool_calls)
 
+    @staticmethod
+    def _assistant_tool_name_for_call(row: Dict[str, Any], target_call_id: str) -> str:
+        if str(row.get("role") or "") != "assistant":
+            return ""
+        tool_calls = row.get("tool_calls") or []
+        if isinstance(tool_calls, str):
+            try:
+                tool_calls = json.loads(tool_calls)
+            except (TypeError, ValueError, json.JSONDecodeError):
+                return ""
+        if isinstance(tool_calls, dict):
+            tool_calls = [tool_calls]
+        if not isinstance(tool_calls, list):
+            return ""
+        names: set[str] = set()
+        for tool_call in tool_calls:
+            if not isinstance(tool_call, dict):
+                continue
+            candidate_call_id = str(
+                tool_call.get("id") or tool_call.get("tool_call_id") or ""
+            ).strip()
+            function = tool_call.get("function") or {}
+            candidate_name = (
+                str(function.get("name") or "").strip()
+                if isinstance(function, dict)
+                else ""
+            )
+            if candidate_call_id == target_call_id and candidate_name:
+                names.add(candidate_name)
+        return next(iter(names)) if len(names) == 1 else ""
+
     def _has_durable_persisted_output_replay_identity(
         self,
         msg: Dict[str, Any],
         *,
         session_id: str | None = None,
         conversation_id: str | None = None,
+        allow_content_only_legacy: bool = True,
+        require_exact_generation: bool = False,
     ) -> bool:
         role = str(msg.get("role") or "unknown")
         content = normalize_content_value(msg.get("content")) or ""
         resolved_session_id = str(
-            session_id or msg.get("session_id") or getattr(self, "_session_id", None) or ""
+            session_id
+            if session_id is not None
+            else getattr(self, "_session_id", None) or ""
         )
+        message_session_id = str(msg.get("session_id") or "")
+        if (
+            not resolved_session_id
+            or message_session_id
+            and message_session_id != resolved_session_id
+        ):
+            return False
         resolved_conversation_id = (
             conversation_id
             if conversation_id is not None
             else msg.get("conversation_id") or getattr(self, "_conversation_id", None)
         )
+        message_conversation_id = str(msg.get("conversation_id") or "")
+        if (
+            message_conversation_id
+            and str(resolved_conversation_id or "") != message_conversation_id
+        ):
+            return False
         if role != "tool" or not _is_hermes_persisted_output_marker(content):
             return False
         expected_chars = _expected_persisted_output_chars(content)
@@ -118,12 +166,13 @@ class ReconcileMixin:
         ):
             return False
         recovered_with_stat = recover_hermes_persisted_output_with_file_stat(content)
-        if recovered_with_stat is None:
-            return False
+        inline_generation = _inline_persisted_output_generation_metadata(content)
         require_live_file_freshness = True
         durable_content = find_externalized_tool_result_content_for_call(
             tool_call_id=str(msg.get("tool_call_id") or ""),
             session_id=resolved_session_id,
+            conversation_id=str(resolved_conversation_id or ""),
+            tool_name=str(msg.get("tool_name") or ""),
             expected_chars=expected_chars,
             persisted_output_source_path=persisted_output_source_path,
             persisted_output_preview_sha256=persisted_output_preview_sha256,
@@ -132,7 +181,11 @@ class ReconcileMixin:
             config=self._config,
             hermes_home=self._hermes_home,
         )
-        recovered_content, recovered_generation = recovered_with_stat
+        if recovered_with_stat is not None:
+            recovered_content, recovered_generation = recovered_with_stat
+        else:
+            recovered_content = ""
+            recovered_generation = inline_generation
         recovered_identity_content = normalize_content_value(
             redact_sensitive_value(
                 recovered_content,
@@ -140,13 +193,103 @@ class ReconcileMixin:
                 parse_json_strings=False,
             )
         )
-        if _has_lossy_sensitive_redaction(recovered_identity_content):
-            # Lossy content alone cannot distinguish legitimate retries. An
-            # exact live-file generation is sufficient provenance without
-            # retaining a potentially sensitive raw-preview digest.
-            exact_generation_content = find_externalized_tool_result_content_for_call(
-                tool_call_id=str(msg.get("tool_call_id") or ""),
+        call_id = str(msg.get("tool_call_id") or "").strip()
+        if not call_id:
+            return False
+        durable_rows = getattr(self, "_store").get_tool_call_replay_neighborhoods(
+            resolved_session_id,
+            {call_id},
+            conversation_id=resolved_conversation_id,
+        )
+        durable_tool_names_by_offset: dict[int, str] = {}
+        for offset, durable_row in enumerate(durable_rows):
+            if (
+                str(durable_row.get("role") or "") != "tool"
+                or str(durable_row.get("tool_call_id") or "").strip() != call_id
+            ):
+                continue
+            durable_name = str(durable_row.get("tool_name") or "").strip()
+            if not durable_name and offset > 0:
+                durable_name = self._assistant_tool_name_for_call(
+                    durable_rows[offset - 1],
+                    call_id,
+                )
+            if durable_name:
+                durable_tool_names_by_offset[offset] = durable_name
+
+        incoming_tool_name = str(msg.get("tool_name") or "").strip()
+        if not incoming_tool_name:
+            # Legacy tool rows may omit tool_name. Infer it from the adjacent
+            # durable assistant declaration, but only when the scoped
+            # neighborhood names one tool unambiguously.
+            durable_tool_names = set(durable_tool_names_by_offset.values())
+            if len(durable_tool_names) > 1:
+                return False
+            if durable_tool_names:
+                incoming_tool_name = next(iter(durable_tool_names))
+        matching_durable_contents: list[str] = []
+        matching_durable_rows: list[Dict[str, Any]] = []
+        for offset, durable_row in enumerate(durable_rows):
+            if (
+                str(durable_row.get("role") or "") != "tool"
+                or str(durable_row.get("tool_call_id") or "").strip() != call_id
+                or durable_tool_names_by_offset.get(offset, "") != incoming_tool_name
+            ):
+                continue
+            matching_durable_rows.append(durable_row)
+            matching_durable_contents.append(
+                self._message_replay_identity(durable_row, stored_row=True)[1]
+            )
+
+        if recovered_with_stat is None and inline_generation is None:
+            return allow_content_only_legacy and any(
+                durable_identity_content == content
+                for durable_identity_content in matching_durable_contents
+            )
+        assert recovered_generation is not None
+
+        def matches_bound_durable_row() -> bool:
+            return any(
+                not _has_lossy_sensitive_redaction(durable_identity_content)
+                and self._recovered_content_matches_durable_identity(
+                    recovered_content,
+                    durable_identity_content,
+                )
+                for durable_identity_content in matching_durable_contents
+            )
+
+        marker_was_durable = msg.get("_lcm_durable_marker_before_ingest") is not False
+
+        # An adjacent assistant call can be a legitimate retry with the same
+        # call id and content. In that path, require the exact persisted-file
+        # Exact generation must remain bound to durable row content. Query a
+        # pre-existing payload, or a payload created during this ingest only when
+        # a durable marker row already proves the same path and file generation.
+        durable_generation_marker_matches = any(
+            _inline_persisted_output_generation_metadata(
+                normalize_content_value(durable_row.get("content")) or ""
+            )
+            == recovered_generation
+            and _persisted_output_saved_path(
+                normalize_content_value(durable_row.get("content")) or ""
+            )
+            == persisted_output_source_path
+            and _expected_persisted_output_chars(
+                normalize_content_value(durable_row.get("content")) or ""
+            )
+            == expected_chars
+            for durable_row in matching_durable_rows
+        )
+        durable_generation_can_anchor = (
+            durable_generation_marker_matches
+            and bool(self._config.large_output_externalization_enabled)
+        )
+        exact_generation_content = (
+            find_externalized_tool_result_content_for_call(
+                tool_call_id=call_id,
                 session_id=resolved_session_id,
+                conversation_id=str(resolved_conversation_id or ""),
+                tool_name=incoming_tool_name,
                 expected_chars=expected_chars,
                 persisted_output_source_path=persisted_output_source_path,
                 persisted_output_file_size=recovered_generation["size"],
@@ -155,85 +298,140 @@ class ReconcileMixin:
                 config=self._config,
                 hermes_home=self._hermes_home,
             )
+            if marker_was_durable or durable_generation_can_anchor
+            else None
+        )
+        explicit_incoming_tool_name = str(msg.get("tool_name") or "").strip()
+        legacy_empty_name_payload_is_bound = (
+            not explicit_incoming_tool_name
+            or set(durable_tool_names_by_offset.values()) == {incoming_tool_name}
+        )
+        if (
+            exact_generation_content is None
+            and (marker_was_durable or durable_generation_can_anchor)
+            and incoming_tool_name
+            and legacy_empty_name_payload_is_bound
+        ):
+            exact_generation_content = find_externalized_tool_result_content_for_call(
+                tool_call_id=call_id,
+                session_id=resolved_session_id,
+                conversation_id=str(resolved_conversation_id or ""),
+                tool_name="",
+                expected_chars=expected_chars,
+                persisted_output_source_path=persisted_output_source_path,
+                persisted_output_file_size=recovered_generation["size"],
+                persisted_output_file_mtime_ns=recovered_generation["mtime_ns"],
+                persisted_output_file_ctime_ns=recovered_generation["ctime_ns"],
+                config=self._config,
+                hermes_home=self._hermes_home,
+            )
+        if (
+            exact_generation_content is None
+            and recovered_with_stat is not None
+        ):
+            exact_generation_content = find_externalized_tool_result_content_for_call(
+                tool_call_id=call_id,
+                session_id=resolved_session_id,
+                conversation_id=str(resolved_conversation_id or ""),
+                tool_name=incoming_tool_name,
+                require_no_persisted_output_marker_metadata=True,
+                expected_content=recovered_content,
+                config=getattr(self, "_config"),
+                hermes_home=getattr(self, "_hermes_home"),
+            )
             if (
-                exact_generation_content is not None
-                and _has_lossy_sensitive_redaction(exact_generation_content)
-                and self._recovered_content_matches_durable_identity(
-                    recovered_content,
-                    exact_generation_content,
-                )
+                exact_generation_content is None
+                and incoming_tool_name
+                and legacy_empty_name_payload_is_bound
             ):
-                return True
-        if durable_content is not None:
-            if _has_lossy_sensitive_redaction(durable_content):
-                # A lossy durable value cannot distinguish retries whose only
-                # difference was redacted. Suppress only when the current config
-                # also redacts the recovered value and the durable payload proves
-                # the exact live file generation.
-                recovered_identity_content = normalize_content_value(
-                    redact_sensitive_value(
-                        recovered_content,
-                        self._config,
-                        parse_json_strings=False,
-                    )
-                )
-                if not _has_lossy_sensitive_redaction(recovered_identity_content):
-                    return False
                 exact_generation_content = find_externalized_tool_result_content_for_call(
-                    tool_call_id=str(msg.get("tool_call_id") or ""),
+                    tool_call_id=call_id,
                     session_id=resolved_session_id,
-                    expected_chars=expected_chars,
-                    persisted_output_source_path=persisted_output_source_path,
-                    persisted_output_preview_sha256=persisted_output_preview_sha256,
-                    allow_redacted_preview_match=allow_redacted_preview_match,
-                    persisted_output_file_size=recovered_generation["size"],
-                    persisted_output_file_mtime_ns=recovered_generation["mtime_ns"],
-                    persisted_output_file_ctime_ns=recovered_generation["ctime_ns"],
-                    config=self._config,
-                    hermes_home=self._hermes_home,
+                    conversation_id=str(resolved_conversation_id or ""),
+                    tool_name="",
+                    require_no_persisted_output_marker_metadata=True,
+                    expected_content=recovered_content,
+                    config=getattr(self, "_config"),
+                    hermes_home=getattr(self, "_hermes_home"),
                 )
-                return bool(
-                    exact_generation_content is not None
-                    and _has_lossy_sensitive_redaction(exact_generation_content)
-                    and self._recovered_content_matches_durable_identity(
+        externalized_generation_matches = bool(
+            exact_generation_content is not None
+            and matching_durable_contents
+            and (
+                recovered_with_stat is None
+                or (
+                    not (
+                        _has_lossy_sensitive_redaction(exact_generation_content)
+                        and not _has_lossy_sensitive_redaction(recovered_identity_content)
+                    )
+                    and getattr(
+                        self,
+                        "_recovered_content_matches_durable_identity",
+                    )(
                         recovered_content,
                         exact_generation_content,
                     )
                 )
-            return self._recovered_content_matches_durable_identity(
-                recovered_content,
-                durable_content,
             )
-
-
-        # Older payloads created from raw tool content have no persisted-source
-        # provenance. Resolve those rows by the durable session and call ID,
-        # then require exact, non-lossy recovered-content identity.
-        call_id = str(msg.get("tool_call_id") or "").strip()
-        if not call_id:
-            return False
-        durable_rows = self._store.get_tool_call_replay_neighborhoods(
-            resolved_session_id,
-            {call_id},
-            conversation_id=resolved_conversation_id,
+            and (
+                durable_generation_can_anchor
+                or any(
+                    self._recovered_content_matches_durable_identity(
+                        exact_generation_content,
+                        durable_identity_content,
+                    )
+                    for durable_identity_content in matching_durable_contents
+                )
+            )
         )
-        for durable_row in durable_rows:
-            if (
-                str(durable_row.get("role") or "") != "tool"
-                or str(durable_row.get("tool_call_id") or "").strip() != call_id
-            ):
-                continue
-            durable_identity_content = self._message_replay_identity(
-                durable_row,
-                stored_row=True,
-            )[1]
-            if _has_lossy_sensitive_redaction(durable_identity_content):
-                continue
+        incoming_marker_identity = _persisted_output_marker_identity_digest(content)
+        marker_identity_matches_bound_durable_row = any(
+            _is_hermes_persisted_output_marker(durable_identity_content)
+            and _persisted_output_marker_identity_digest(durable_identity_content)
+            == incoming_marker_identity
+            and not _has_lossy_sensitive_redaction(durable_identity_content)
+            for durable_identity_content in matching_durable_contents
+        )
+        exact_generation_matches = bool(
+            externalized_generation_matches
+            or (
+                durable_generation_marker_matches
+                and (
+                    matches_bound_durable_row()
+                    or marker_identity_matches_bound_durable_row
+                )
+                and matching_durable_contents
+                and all(
+                    not _has_lossy_sensitive_redaction(durable_identity_content)
+                    for durable_identity_content in matching_durable_contents
+                )
+            )
+        )
+        if require_exact_generation:
+            return exact_generation_matches
+        if not marker_was_durable:
+            return allow_content_only_legacy and matches_bound_durable_row()
+        if (
+            externalized_generation_matches
+            and _has_lossy_sensitive_redaction(recovered_identity_content)
+            and _has_lossy_sensitive_redaction(exact_generation_content)
+        ):
+            return True
+        if durable_content is not None:
+            if _has_lossy_sensitive_redaction(durable_content):
+                return False
             if self._recovered_content_matches_durable_identity(
                 recovered_content,
-                durable_identity_content,
-            ):
+                durable_content,
+            ) and matches_bound_durable_row():
                 return True
+
+        # The unanchored restart/session-end path must support old payloads
+        # created from raw tool content before source-generation metadata was
+        # recorded. An adjacent incoming assistant call, however, can denote a
+        # genuine same-content retry, so that caller disables this fallback.
+        if allow_content_only_legacy and matches_bound_durable_row():
+            return True
         return False
 
     def _message_replay_identity(
@@ -242,13 +440,26 @@ class ReconcileMixin:
         *,
         stored_row: bool = False,
         inferred_tool_name: str | None = None,
+        replay_session_id: str | None = None,
+        replay_conversation_id: str | None = None,
     ) -> tuple[str, str, str, str, str]:
         role = str(msg.get("role") or "unknown")
         content = normalize_content_value(msg.get("content")) or ""
+        identity_session_id = str(
+            replay_session_id
+            if replay_session_id is not None
+            else getattr(self, "_session_id", None) or ""
+        )
+        identity_conversation_id = str(
+            replay_conversation_id
+            if replay_conversation_id is not None
+            else getattr(self, "_conversation_id", None) or ""
+        )
         if (
             role == "tool"
             and _is_hermes_persisted_output_marker(content)
             and bool(getattr(self._config, "large_output_externalization_enabled", True))
+            and msg.get("_lcm_durable_marker_before_ingest") is not False
         ):
             expected_chars = _expected_persisted_output_chars(content)
             persisted_output_source_path = _persisted_output_saved_path(content)
@@ -292,7 +503,9 @@ class ReconcileMixin:
             ):
                 durable_content = find_externalized_tool_result_content_for_call(
                     tool_call_id=str(msg.get("tool_call_id") or ""),
-                    session_id=str(msg.get("session_id") or self._session_id or ""),
+                    session_id=identity_session_id,
+                    conversation_id=identity_conversation_id,
+                    tool_name=str(msg.get("tool_name") or inferred_tool_name or ""),
                     expected_chars=expected_chars,
                     persisted_output_source_path=persisted_output_source_path,
                     persisted_output_preview_sha256=persisted_output_preview_sha256,
@@ -301,24 +514,45 @@ class ReconcileMixin:
                     config=self._config,
                     hermes_home=self._hermes_home,
                 )
-            durable_identity_is_safe = (
-                durable_content is not None
-                and (
-                    (
-                        not _has_lossy_sensitive_redaction(durable_content)
-                        and not _has_lossy_sensitive_redaction(recovered_identity_content)
-                    )
-                    or self._has_durable_persisted_output_replay_identity(msg)
-                )
-            )
+            exact_generation_content = None
             if (
-                durable_identity_is_safe
+                not stored_row
+                and expected_chars is not None
+                and persisted_output_source_path
+                and recovered_with_stat is not None
+                and _has_lossy_sensitive_redaction(recovered_identity_content)
+            ):
+                recovered_generation = recovered_with_stat[1]
+                exact_generation_content = find_externalized_tool_result_content_for_call(
+                    tool_call_id=str(msg.get("tool_call_id") or ""),
+                    session_id=identity_session_id,
+                    conversation_id=identity_conversation_id,
+                    tool_name=str(msg.get("tool_name") or inferred_tool_name or ""),
+                    expected_chars=expected_chars,
+                    persisted_output_source_path=persisted_output_source_path,
+                    persisted_output_file_size=recovered_generation["size"],
+                    persisted_output_file_mtime_ns=recovered_generation["mtime_ns"],
+                    persisted_output_file_ctime_ns=recovered_generation["ctime_ns"],
+                    config=self._config,
+                    hermes_home=self._hermes_home,
+                )
+            if (
+                exact_generation_content is not None
+                and _has_lossy_sensitive_redaction(exact_generation_content)
+                and recovered_content is not None
+                and self._recovered_content_matches_durable_identity(
+                    recovered_content,
+                    exact_generation_content,
+                )
+            ):
+                content = exact_generation_content
+            elif (
+                durable_content is not None
+                and not _has_lossy_sensitive_redaction(durable_content)
+                and not _has_lossy_sensitive_redaction(recovered_identity_content)
                 and (
                     recovered_content is None
-                    or self._recovered_content_matches_durable_identity(
-                        recovered_content,
-                        durable_content,
-                    )
+                    or self._recovered_content_matches_durable_identity(recovered_content, durable_content)
                 )
             ):
                 assert durable_content is not None
@@ -326,7 +560,9 @@ class ReconcileMixin:
             elif recovered_content is not None:
                 stale_durable_content = find_externalized_tool_result_content_for_call(
                     tool_call_id=str(msg.get("tool_call_id") or ""),
-                    session_id=str(msg.get("session_id") or self._session_id or ""),
+                    session_id=identity_session_id,
+                    conversation_id=identity_conversation_id,
+                    tool_name=str(msg.get("tool_name") or inferred_tool_name or ""),
                     expected_chars=expected_chars,
                     persisted_output_source_path=persisted_output_source_path,
                     persisted_output_preview_sha256=persisted_output_preview_sha256,
@@ -954,6 +1190,7 @@ class ReconcileMixin:
             page = self._store.get_session_messages_after(
                 self._session_id,
                 after_store_id=after_store_id,
+                conversation_id=getattr(self, "_conversation_id", None),
             )
             if not page:
                 break
@@ -1016,6 +1253,8 @@ class ReconcileMixin:
         suppress_tool_less_duplicates: bool = False,
         durable_key_lookup: bool = False,
         preignored_indexes: set[int] | None = None,
+        replay_session_id: str | None = None,
+        replay_conversation_id: str | None = None,
     ) -> tuple[set[int], int]:
         """Find stable tool rows replayed after a changed active-context prefix.
 
@@ -1057,6 +1296,11 @@ class ReconcileMixin:
         if not incoming_tool_offsets:
             return set(), 0
 
+        effective_replay_conversation_id = (
+            replay_conversation_id
+            if replay_conversation_id is not None
+            else getattr(self, "_conversation_id", None)
+        )
         if durable_key_lookup:
             incoming_call_ids = {
                 str(msg.get("tool_call_id") or "").strip()
@@ -1065,15 +1309,31 @@ class ReconcileMixin:
                 if str(msg.get("tool_call_id") or "").strip()
             }
             scanned_rows = self._store.get_tool_call_replay_neighborhoods(
-                self._session_id,
+                replay_session_id or getattr(self, "_session_id", None),
                 incoming_call_ids,
-                conversation_id=getattr(self, "_conversation_id", None),
+                conversation_id=effective_replay_conversation_id,
             )
+            if suppress_tool_less_duplicates:
+                # Durable-key neighborhoods prove old tool anchors even when they
+                # are outside the bounded tail. Preserve the tail scan as well so
+                # restart/rebind filtering can still suppress byte-identical
+                # tool-less snapshot rows that are not adjacent to those anchors.
+                scan_limit = min(max(len(visible_messages) * 4, 256), 4096)
+                tail_rows = self._store.get_session_tail(
+                    replay_session_id or getattr(self, "_session_id", None),
+                    limit=scan_limit,
+                    conversation_id=effective_replay_conversation_id,
+                )
+                rows_by_store_id = {
+                    int(row["store_id"]): row for row in (*tail_rows, *scanned_rows)
+                }
+                scanned_rows = [rows_by_store_id[key] for key in sorted(rows_by_store_id)]
         else:
             scan_limit = min(max(len(visible_messages) * 4, 256), 4096)
             scanned_rows = self._store.get_session_tail(
-                self._session_id,
+                replay_session_id or getattr(self, "_session_id", None),
                 limit=scan_limit,
+                conversation_id=effective_replay_conversation_id,
             )
         scanned_row_count = len(scanned_rows)
         stored_rows = [
@@ -1133,6 +1393,8 @@ class ReconcileMixin:
             self._message_replay_identity(
                 msg,
                 inferred_tool_name=incoming_name_map[offset],
+                replay_session_id=replay_session_id,
+                replay_conversation_id=replay_conversation_id,
             )
             for offset, msg in enumerate(incoming_rows)
         ]
@@ -1191,13 +1453,6 @@ class ReconcileMixin:
             if str(row.get("role") or "") == "tool"
             and str(row.get("tool_call_id") or "").strip()
         }
-        durable_result_offsets_by_call_id: dict[str, list[int]] = {}
-        for stored_offset, row in enumerate(stored_rows):
-            call_id = str(row.get("tool_call_id") or "").strip()
-            if str(row.get("role") or "") == "tool" and call_id:
-                durable_result_offsets_by_call_id.setdefault(call_id, []).append(
-                    stored_offset
-                )
         durable_assistant_call_ids: set[str] = set()
         for row in stored_rows:
             if str(row.get("role") or "") == "assistant":
@@ -1237,7 +1492,265 @@ class ReconcileMixin:
             # vanished payload; it only creates a duplicate row. The durable
             # identity lookup below still preserves changed markers and markers
             # whose call id/content have never been stored.
-            candidates = stored_tool_anchors.get(incoming_identity, [])
+            call_id = str(incoming_tool.get("tool_call_id") or "").strip()
+            persisted_output_anchor_proven = False
+            has_adjacent_incoming_call = False
+            if incoming_anchor > 0 and call_id:
+                incoming_previous = visible_messages[incoming_anchor - 1][1]
+                has_adjacent_incoming_call = (
+                    str(incoming_previous.get("role") or "") == "assistant"
+                    and call_id in assistant_tool_call_ids(incoming_previous)
+                )
+            incoming_content = normalize_content_value(incoming_tool.get("content")) or ""
+            incoming_is_persisted_output_marker = _is_hermes_persisted_output_marker(
+                incoming_content
+            )
+            incoming_call_occurrences = sum(
+                1
+                for offset in incoming_tool_offsets
+                if str(visible_messages[offset][1].get("tool_call_id") or "").strip()
+                == call_id
+            )
+            # Inline replay metadata may decorate the marker before this scan,
+            # so successful recovery (rather than marker-shape recognition alone)
+            # is the authoritative signal that exact live generation is available.
+            has_live_persisted_output_generation = (
+                recover_hermes_persisted_output_with_file_stat(incoming_content) is not None
+            )
+            if has_live_persisted_output_generation:
+                persisted_output_anchor_proven = (
+                    self._has_durable_persisted_output_replay_identity(
+                        incoming_tool,
+                        session_id=replay_session_id,
+                        conversation_id=replay_conversation_id,
+                        require_exact_generation=True,
+                    )
+                )
+                candidates = (
+                    stored_tool_anchors.get(incoming_identity, [])
+                    if persisted_output_anchor_proven
+                    else []
+                )
+            else:
+                # An unrecoverable persisted-output pointer is not independently
+                # an anchor in a mixed replay suffix: a retry may reuse the same
+                # call id and marker bytes while referring to a vanished
+                # generation. It is replay-safe only when later ordered anchors
+                # already prove that this identical pointer is inside a durable
+                # replay segment. Full cursor equality is handled before this
+                # anchored fallback.
+                marker_candidates = stored_tool_anchors.get(incoming_identity, [])
+                later_anchor_pairs = sorted(
+                    pair
+                    for pair in matched_tool_anchor_pairs
+                    if pair[0] > incoming_anchor
+                )
+                later_anchors_are_strictly_ordered = (
+                    len(later_anchor_pairs) >= 3
+                    and all(
+                        stored_left < stored_right
+                        for (_incoming_left, stored_left), (
+                            _incoming_right,
+                            stored_right,
+                        ) in zip(later_anchor_pairs, later_anchor_pairs[1:])
+                    )
+                )
+                marker_follows_proven_durable_segment = (
+                    bool(marker_candidates)
+                    and bool(later_anchor_pairs)
+                    and any(
+                        candidate > later_anchor_pairs[-1][1]
+                        for candidate in marker_candidates
+                    )
+                )
+                incoming_replay_segment_matches_durable = False
+                if later_anchor_pairs:
+                    last_incoming_anchor, last_stored_anchor = later_anchor_pairs[-1]
+                    incoming_segment = incoming_identities[
+                        incoming_anchor + 1 : last_incoming_anchor + 1
+                    ]
+                    stored_segment_start = last_stored_anchor - len(incoming_segment) + 1
+                    incoming_replay_segment_matches_durable = (
+                        stored_segment_start >= 0
+                        and incoming_segment
+                        == stored_identities[
+                            stored_segment_start : last_stored_anchor + 1
+                        ]
+                    )
+                marker_inside_proven_replay_segment = (
+                    incoming_is_persisted_output_marker
+                    and later_anchors_are_strictly_ordered
+                    and marker_follows_proven_durable_segment
+                    and incoming_replay_segment_matches_durable
+                )
+                candidates = (
+                    marker_candidates
+                    if not incoming_is_persisted_output_marker
+                    or marker_inside_proven_replay_segment
+                    else []
+                )
+                if (
+                    incoming_is_persisted_output_marker
+                    and incoming_call_occurrences > 1
+                    and has_adjacent_incoming_call
+                    and not _has_inline_persisted_output_generation_metadata(
+                        incoming_content
+                    )
+                    and "[LCM sensitive redaction:" not in incoming_content
+                ):
+                    incoming_previous_raw, incoming_previous = visible_messages[
+                        incoming_anchor - 1
+                    ]
+                    incoming_previous_identity = incoming_identities[incoming_anchor - 1]
+                    if call_id in durable_result_call_ids and any(
+                        str(stored_row.get("role") or "") == "assistant"
+                        and call_id in assistant_tool_call_ids(stored_row)
+                        and identities_match(
+                            incoming_previous_identity,
+                            stored_identities[stored_offset],
+                        )
+                        for stored_offset, stored_row in enumerate(stored_rows)
+                    ):
+                        # Preserve the unproven marker retry, but do not duplicate
+                        # its already-durable exact assistant invocation row.
+                        replayed_raw_indexes.add(incoming_previous_raw)
+            if not candidates and call_id and has_adjacent_incoming_call:
+                later_equivalent_occurrence = any(
+                    later_offset > incoming_anchor
+                    and str(
+                        visible_messages[later_offset][1].get("tool_call_id") or ""
+                    ).strip()
+                    == call_id
+                    and normalize_content_value(
+                        visible_messages[later_offset][1].get("content")
+                    )
+                    == incoming_content
+                    and later_offset > 0
+                    and identities_match(
+                        incoming_identities[incoming_anchor - 1],
+                        incoming_identities[later_offset - 1],
+                    )
+                    for later_offset in incoming_tool_offsets
+                )
+                same_source_durable_payload = None
+                if incoming_is_persisted_output_marker and later_equivalent_occurrence:
+                    expected_chars = _expected_persisted_output_chars(incoming_content)
+                    source_path = _persisted_output_saved_path(incoming_content)
+                    preview_sha256, allow_redacted_preview_match = getattr(
+                        self,
+                        "_persisted_output_marker_replay_proof",
+                    )(incoming_content)
+                    if expected_chars is not None and source_path and preview_sha256:
+                        incoming_tool_name = (
+                            incoming_name_map[incoming_anchor]
+                            or str(incoming_tool.get("tool_name") or "").strip()
+                        )
+                        same_source_durable_payload = (
+                            find_externalized_tool_result_content_for_call(
+                                tool_call_id=call_id,
+                                session_id=(
+                                    replay_session_id
+                                    or str(getattr(self, "_session_id", None) or "")
+                                ),
+                                conversation_id=str(
+                                    effective_replay_conversation_id or ""
+                                ),
+                                tool_name=incoming_tool_name,
+                                expected_chars=expected_chars,
+                                persisted_output_source_path=source_path,
+                                persisted_output_preview_sha256=preview_sha256,
+                                allow_redacted_preview_match=allow_redacted_preview_match,
+                                config=getattr(self, "_config"),
+                                hermes_home=getattr(self, "_hermes_home"),
+                            )
+                        )
+                repeated_prefix_candidates = [
+                    stored_offset
+                    for stored_offset, stored_row in enumerate(stored_rows)
+                    if later_equivalent_occurrence
+                    and str(stored_row.get("role") or "") == "tool"
+                    and str(stored_row.get("tool_call_id") or "").strip() == call_id
+                    and (
+                        normalize_content_value(stored_row.get("content"))
+                        == incoming_content
+                        or same_source_durable_payload is not None
+                    )
+                    and stored_name_map[stored_offset]
+                    == incoming_name_map[incoming_anchor]
+                ]
+                if repeated_prefix_candidates:
+                    # A restarted full transcript can contain one durable pair
+                    # followed by an indistinguishable same-call retry. Exact live
+                    # generation proves the later retry is new, while occurrence
+                    # order proves only the earlier byte-identical pair is replay.
+                    persisted_output_anchor_proven = True
+                    if (
+                        not has_live_persisted_output_generation
+                        and any(
+                            normalize_content_value(stored_rows[stored_offset].get("content"))
+                            == incoming_content
+                            for stored_offset in repeated_prefix_candidates
+                        )
+                    ):
+                        # Multiple byte-identical unrecoverable marker pairs are
+                        # copies of the one exact durable marker, not independent
+                        # anchors. Suppress every copy without allowing their
+                        # multiplicity to prove an interleaved gap.
+                        for duplicate_offset in incoming_tool_offsets:
+                            duplicate_raw, duplicate_tool = visible_messages[duplicate_offset]
+                            if (
+                                str(duplicate_tool.get("tool_call_id") or "").strip()
+                                != call_id
+                                or normalize_content_value(duplicate_tool.get("content"))
+                                != incoming_content
+                            ):
+                                continue
+                            replayed_raw_indexes.add(duplicate_raw)
+                            if (
+                                duplicate_offset > 0
+                                and identities_match(
+                                    incoming_identities[duplicate_offset - 1],
+                                    incoming_identities[incoming_anchor - 1],
+                                )
+                            ):
+                                replayed_raw_indexes.add(
+                                    visible_messages[duplicate_offset - 1][0]
+                                )
+                    candidates = repeated_prefix_candidates
+                legacy_snapshot_anchor_proven = (
+                    incoming_call_occurrences == 1
+                    and incoming_tool.get("_lcm_legacy_raw_payload_before_ingest") is True
+                    and incoming_anchor > 0
+                    and incoming_anchor <= len(stored_identities)
+                    and incoming_identities[:incoming_anchor]
+                    == stored_identities[:incoming_anchor]
+                )
+                if not candidates and not has_live_persisted_output_generation:
+                    persisted_output_anchor_proven = (
+                        self._has_durable_persisted_output_replay_identity(
+                            incoming_tool,
+                            session_id=replay_session_id,
+                            conversation_id=replay_conversation_id,
+                            allow_content_only_legacy=legacy_snapshot_anchor_proven,
+                            require_exact_generation=not legacy_snapshot_anchor_proven,
+                        )
+                    )
+                if persisted_output_anchor_proven:
+                    candidates = [
+                        stored_offset
+                        for stored_offset, stored_row in enumerate(stored_rows)
+                        if str(stored_row.get("role") or "") == "tool"
+                        and str(stored_row.get("tool_call_id") or "").strip() == call_id
+                    ]
+
+            def anchor_identity_matches(stored_anchor: int) -> bool:
+                return identities_match(
+                    incoming_identity,
+                    stored_identities[stored_anchor],
+                ) or (
+                    persisted_output_anchor_proven
+                    and previous_assistant_matches(stored_anchor)
+                )
 
             def previous_assistant_matches(stored_anchor: int) -> bool:
                 if incoming_anchor <= 0 or stored_anchor <= 0:
@@ -1263,7 +1776,7 @@ class ReconcileMixin:
                 for stored_anchor in reversed(candidates)
                 if stored_anchor not in claimed_stored_tool_anchors
                 and stored_anchor < stored_anchor_ceiling
-                and identities_match(incoming_identity, stored_identities[stored_anchor])
+                and anchor_identity_matches(stored_anchor)
             ]
             matched_out_of_order_unique = False
             if not matching_candidates:
@@ -1271,88 +1784,21 @@ class ReconcileMixin:
                     candidate
                     for candidate in candidates
                     if candidate not in claimed_stored_tool_anchors
-                    and identities_match(incoming_identity, stored_identities[candidate])
+                    and anchor_identity_matches(candidate)
                 ]
                 if len(unique_candidates) != 1:
-                    call_id = str(incoming_tool.get("tool_call_id") or "").strip()
-                    persisted_candidates = [
-                        candidate
-                        for candidate in durable_result_offsets_by_call_id.get(
-                            call_id, []
-                        )
-                        if candidate not in claimed_stored_tool_anchors
-                    ]
-                    incoming_previous = (
-                        visible_messages[incoming_anchor - 1][1]
-                        if incoming_anchor > 0
-                        else None
-                    )
-                    has_adjacent_new_call = bool(
-                        incoming_previous is not None
-                        and str(incoming_previous.get("role") or "")
-                        == "assistant"
-                        and call_id in assistant_tool_call_ids(incoming_previous)
-                    )
-                    persisted_previous_matches = bool(
-                        len(persisted_candidates) == 1
-                        and previous_assistant_matches(persisted_candidates[0])
-                    )
-                    if (
-                        len(persisted_candidates) == 1
-                        and (
-                            not has_adjacent_new_call
-                            or persisted_previous_matches
-                        )
-                        and _is_hermes_persisted_output_marker(
-                            normalize_content_value(incoming_tool.get("content"))
-                            or ""
-                        )
-                        and self._has_durable_persisted_output_replay_identity(
-                            incoming_tool
-                        )
-                    ):
-                        stored_anchor = persisted_candidates[0]
-                        claimed_stored_tool_anchors.add(stored_anchor)
-                        replayed_raw_indexes.add(incoming_raw_index)
-                        matched_tool_anchor_pairs.append(
-                            (incoming_anchor, stored_anchor)
-                        )
-                        if persisted_previous_matches:
-                            incoming_previous_raw, _ = visible_messages[
-                                incoming_anchor - 1
-                            ]
-                            replayed_raw_indexes.add(incoming_previous_raw)
-                        continue
-                    # A resumed Hermes session can replace an already-durable
-                    # result with an orphan-recovery placeholder. Its content
-                    # intentionally differs, so exact identity cannot prove
-                    # replay; the durable call ID plus the placeholder proves
-                    # that no new execution completed.
-                    if (
-                        call_id in durable_result_call_ids
-                        and is_orphan_recovery_result(incoming_tool)
-                    ):
-                        replayed_raw_indexes.add(incoming_raw_index)
-                        if incoming_anchor > 0:
-                            incoming_previous_raw, incoming_previous = visible_messages[
-                                incoming_anchor - 1
-                            ]
-                            previous_call_ids = assistant_tool_call_ids(incoming_previous)
-                            if (
-                                str(incoming_previous.get("role") or "") == "assistant"
-                                and call_id in previous_call_ids
-                                and previous_call_ids
-                                and previous_call_ids.issubset(
-                                    durable_assistant_call_ids
-                                )
-                            ):
-                                replayed_raw_indexes.add(incoming_previous_raw)
-                        continue
                     # Exact duplicate tool rows are still replay-safe to drop,
                     # but reusing a claimed durable occurrence must not create
                     # another anchor pair: that would turn singleton evidence
                     # into false multi-anchor proof across an unmatched gap.
-                    if candidates and not unique_candidates:
+                    if (
+                        candidates
+                        and not unique_candidates
+                        and (
+                            not persisted_output_anchor_proven
+                            or not incoming_is_persisted_output_marker
+                        )
+                    ):
                         replayed_raw_indexes.add(incoming_raw_index)
                         if len(candidates) == 1:
                             claimed_anchor = candidates[0]
@@ -1380,6 +1826,47 @@ class ReconcileMixin:
                             if any(
                                 previous_assistant_matches(candidate)
                                 for candidate in candidates
+                            ):
+                                replayed_raw_indexes.add(incoming_previous_raw)
+                    # A resumed Hermes session can replace an already-durable
+                    # result with an orphan-recovery placeholder. The content
+                    # differs, but the placeholder proves no new execution
+                    # completed. Suppress its assistant row only when every
+                    # call in that row is already durable.
+                    call_id = str(incoming_tool.get("tool_call_id") or "").strip()
+                    if incoming_anchor > 0 and call_id in durable_assistant_call_ids:
+                        incoming_previous_raw, incoming_previous = visible_messages[
+                            incoming_anchor - 1
+                        ]
+                        # Legacy object-form tool_calls are one durable declaration,
+                        # not a fresh list-form retry wrapper. Preserve a new result
+                        # while suppressing only an exact durable declaration replay.
+                        if isinstance(incoming_previous.get("tool_calls"), dict) and any(
+                            str(stored_row.get("role") or "") == "assistant"
+                            and call_id in assistant_tool_call_ids(stored_row)
+                            and identities_match(
+                                incoming_identities[incoming_anchor - 1],
+                                stored_identities[stored_offset],
+                            )
+                            for stored_offset, stored_row in enumerate(stored_rows)
+                        ):
+                            replayed_raw_indexes.add(incoming_previous_raw)
+                    if (
+                        incoming_raw_index not in replayed_raw_indexes
+                        and call_id in durable_result_call_ids
+                        and is_orphan_recovery_result(incoming_tool)
+                    ):
+                        replayed_raw_indexes.add(incoming_raw_index)
+                        if incoming_anchor > 0:
+                            incoming_previous_raw, incoming_previous = visible_messages[
+                                incoming_anchor - 1
+                            ]
+                            previous_call_ids = assistant_tool_call_ids(incoming_previous)
+                            if (
+                                str(incoming_previous.get("role") or "") == "assistant"
+                                and call_id in previous_call_ids
+                                and previous_call_ids
+                                and previous_call_ids.issubset(durable_assistant_call_ids)
                             ):
                                 replayed_raw_indexes.add(incoming_previous_raw)
                     continue
@@ -1420,18 +1907,74 @@ class ReconcileMixin:
                 replayed_raw_indexes.add(incoming_previous_raw)
 
         if matched_tool_anchor_pairs and suppress_tool_less_duplicates:
-            # Multiple ordered anchors prove that the batch is a replayed
-            # snapshot even when fresh compacted/filler rows are interleaved.
-            # A singleton anchor does not provide that boundary: after the
-            # first unmatched row, later equal identities may be a legitimate
-            # repeated suffix and must remain appendable.
-            allow_interleaved_gaps = len(matched_tool_anchor_pairs) > 1
+            ordered_anchor_pairs = sorted(matched_tool_anchor_pairs)
+            anchors_are_strictly_ordered = all(
+                stored_left < stored_right
+                for (_incoming_left, stored_left), (_incoming_right, stored_right) in zip(
+                    ordered_anchor_pairs,
+                    ordered_anchor_pairs[1:],
+                )
+            )
+            # Two anchors only establish the endpoints of an interval; they do
+            # not prove that an equal visible row after a new gap is replay.
+            # Require a third ordered anchor before crossing interleaved gaps,
+            # and never use out-of-order anchors as gap proof.
+            allow_interleaved_gaps = (
+                len(ordered_anchor_pairs) >= 3 and anchors_are_strictly_ordered
+            )
+            # A non-tool interval between two anchors is suppressible only when
+            # the whole interval is identical and ordered on both sides. If the
+            # incoming interval contains any visible gap, every repeated row in
+            # that interval remains ambiguous even when the ending tool anchor
+            # matches exactly.
+            protected_interleaved_raw_indexes: set[int] = set()
+            matched_incoming_anchors = {
+                incoming_anchor for incoming_anchor, _stored_anchor in matched_tool_anchor_pairs
+            }
+            for left_tool, right_tool in zip(
+                incoming_tool_offsets,
+                incoming_tool_offsets[1:],
+            ):
+                if left_tool in matched_incoming_anchors:
+                    continue
+                protected_interleaved_raw_indexes.update(
+                    raw_index
+                    for offset, (raw_index, message) in enumerate(
+                        visible_messages[left_tool + 1 : right_tool],
+                        start=left_tool + 1,
+                    )
+                    if not (
+                        offset == right_tool - 1
+                        and str(message.get("role") or "") == "assistant"
+                        and str(
+                            visible_messages[right_tool][1].get("tool_call_id") or ""
+                        ).strip()
+                        in assistant_tool_call_ids(message)
+                    )
+                )
+            for (incoming_left, stored_left), (incoming_right, stored_right) in zip(
+                ordered_anchor_pairs,
+                ordered_anchor_pairs[1:],
+            ):
+                incoming_between = incoming_identities[incoming_left + 1 : incoming_right]
+                stored_between = (
+                    stored_identities[stored_left + 1 : stored_right]
+                    if stored_left < stored_right
+                    else []
+                )
+                if incoming_between != stored_between:
+                    protected_interleaved_raw_indexes.update(
+                        raw_index
+                        for raw_index, _message in visible_messages[
+                            incoming_left + 1 : incoming_right
+                        ]
+                    )
+
             # Extend each proven tool anchor only through ordered rows on the
-            # same side of the corresponding durable anchor. Incoming scaffold
-            # or compacted filler may be interleaved, so exact adjacency is not
-            # required, but matching cannot cross another tool-result anchor or
-            # reverse durable order. This keeps suppression bound to the proven
-            # tool exchange instead of using global identity membership.
+            # same side of the corresponding durable anchor. Matching cannot
+            # cross another tool-result anchor, an ambiguous visible interval,
+            # or reverse durable order. This keeps suppression bound to the
+            # proven tool exchange instead of using global identity membership.
             segment_positions_cache: dict[
                 tuple[int, int],
                 tuple[int, dict[tuple[str, str, str, str, str], list[int]]],
@@ -1482,6 +2025,8 @@ class ReconcileMixin:
                             str(message.get("tool_call_id") or "")
                         ):
                             break
+                        if raw_index in protected_interleaved_raw_indexes:
+                            break
                         incoming_identity = incoming_identities[incoming_offset]
                         matched_at = None
                         incoming_keys = {incoming_identity}
@@ -1492,23 +2037,28 @@ class ReconcileMixin:
                             incoming_keys.add(incoming_cleaned)
                         for key in incoming_keys:
                             positions = positions_by_identity.get(key, [])
-                            position_index = bisect_left(positions, stored_cursor)
-                            if position_index < len(positions):
-                                candidate_position = positions[position_index]
-                                if matched_at is None or candidate_position < matched_at:
-                                    matched_at = candidate_position
+                            if stored_cursor in positions:
+                                matched_at = stored_cursor
+                                break
                         if matched_at is None:
-                            if not allow_interleaved_gaps:
-                                # Once a visible non-tool row is not
-                                # durable-proven, a singleton anchor cannot
-                                # distinguish farther replay from a legitimate
-                                # repeated suffix.
+                            inside_matched_anchor_span = (
+                                allow_interleaved_gaps
+                                and ordered_anchor_pairs[0][0]
+                                < incoming_offset
+                                < ordered_anchor_pairs[-1][0]
+                            )
+                            if not inside_matched_anchor_span:
                                 break
                             incoming_offset += step
                             continue
                         replayed_raw_indexes.add(raw_index)
                         stored_cursor = matched_at + 1
                         incoming_offset += step
+
+            # Rows in a visibly mismatched interval are ambiguous even if an
+            # earlier anchor walk admitted them. Keep the interval protection
+            # as a final invariant, not merely a guard on later extensions.
+            replayed_raw_indexes.difference_update(protected_interleaved_raw_indexes)
 
         return replayed_raw_indexes, scanned_row_count
 
@@ -1545,7 +2095,10 @@ class ReconcileMixin:
             return 0
 
         try:
-            session_count = self._store.get_session_count(self._session_id)
+            session_count = self._store.get_session_count(
+                self._session_id,
+                conversation_id=getattr(self, "_conversation_id", None),
+            )
         except Exception as exc:  # pragma: no cover - defensive only
             logger.debug("LCM ingest cursor reconciliation count failed: %s", exc)
             return 0
@@ -1580,7 +2133,11 @@ class ReconcileMixin:
             return 0
 
         tail_limit = min(max(len(messages) * 4, 64), session_count)
-        stored_rows = self._store.get_session_tail(self._session_id, limit=tail_limit)
+        stored_rows = self._store.get_session_tail(
+            self._session_id,
+            limit=tail_limit,
+            conversation_id=getattr(self, "_conversation_id", None),
+        )
         if not stored_rows:
             return 0
         stored_tail_rows = [
@@ -1597,13 +2154,17 @@ class ReconcileMixin:
             and _is_hermes_persisted_output_marker(normalize_content_value(msg.get("content")) or "")
             for msg in messages
         )
-        cursor = self._find_reconciled_cursor_for_store_tail(
-            messages,
-            stored_tail,
-            stored_tail_rows=stored_tail_rows,
-            allow_empty_prefix=True,
-            session_count=len(stored_tail),
-            raw_session_count=session_count,
+        cursor = (
+            None
+            if incoming_has_raw_persisted_marker
+            else self._find_reconciled_cursor_for_store_tail(
+                messages,
+                stored_tail,
+                stored_tail_rows=stored_tail_rows,
+                allow_empty_prefix=True,
+                session_count=len(stored_tail),
+                raw_session_count=session_count,
+            )
         )
         if cursor is not None and cursor > 0:
             reason = (
@@ -1664,6 +2225,7 @@ class ReconcileMixin:
         stored_head_rows = self._store.get_session_messages(
             self._session_id,
             limit=tail_limit,
+            conversation_id=getattr(self, "_conversation_id", None),
         )
         stored_head = [self._message_replay_identity(row, stored_row=True) for row in stored_head_rows]
         # Stale-snapshot proof uses the raw durable prefix.  Ignore-message
@@ -1742,6 +2304,7 @@ class ReconcileMixin:
             page = self._store.get_session_messages_after(
                 self._session_id,
                 after_store_id=next_candidate_after,
+                conversation_id=getattr(self, "_conversation_id", None),
             )
             if not page:
                 break

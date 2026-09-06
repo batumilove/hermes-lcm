@@ -1331,6 +1331,7 @@ def protect_message_for_ingest(
     config,
     hermes_home: str = "",
     session_id: str = "",
+    conversation_id: str = "",
 ) -> Dict[str, Any]:
     """Return a copy of ``message`` safe to persist in SQLite.
 
@@ -1380,6 +1381,8 @@ def protect_message_for_ingest(
                 kind="tool_result",
                 tool_call_id=str(msg.get("tool_call_id") or ""),
                 session_id=session_id,
+                conversation_id=conversation_id,
+                tool_name=str(msg.get("tool_name") or ""),
                 role=role,
                 config=config,
                 hermes_home=hermes_home,
@@ -1462,6 +1465,8 @@ def protect_message_for_ingest(
                     kind=kind,
                     tool_call_id=str(msg.get("tool_call_id") or ""),
                     session_id=session_id,
+                    conversation_id=conversation_id,
+                    tool_name=str(msg.get("tool_name") or ""),
                     role=role,
                     config=config,
                     hermes_home=hermes_home,
@@ -1575,6 +1580,7 @@ def protect_messages_for_ingest(
     config,
     hermes_home: str = "",
     session_id: str = "",
+    conversation_id: str = "",
 ) -> List[Dict[str, Any]]:
     return [
         protect_message_for_ingest(
@@ -1582,6 +1588,7 @@ def protect_messages_for_ingest(
             config=config,
             hermes_home=hermes_home,
             session_id=session_id,
+            conversation_id=conversation_id,
         )
         for message in messages
     ]

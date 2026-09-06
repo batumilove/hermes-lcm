@@ -308,7 +308,9 @@ def test_rotate_empty_tail_branch_returns_noop_shape_without_keyerror(tmp_path):
     # empty. Patch the bound method on this engine's store instance only.
     original_get_session_tail = engine._store.get_session_tail
     try:
-        engine._store.get_session_tail = lambda session_id, limit=1000: []  # type: ignore[method-assign]
+        engine._store.get_session_tail = (  # type: ignore[method-assign]
+            lambda session_id, limit=1000, conversation_id=None: []
+        )
         result = handle_lcm_command("rotate", engine)
     finally:
         engine._store.get_session_tail = original_get_session_tail  # type: ignore[method-assign]
