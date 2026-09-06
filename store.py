@@ -813,7 +813,9 @@ class MessageStore:
             return []
         selected_ids: set[str] = set()
         for call_id in islice(call_ids, call_limit):
-            value = str(call_id).strip()
+            if not isinstance(call_id, str):
+                continue
+            value = call_id
             if (
                 value
                 and len(value) <= 512

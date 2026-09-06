@@ -5672,11 +5672,20 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
         than normalized or externalized, preserving admission behavior while
         bounding observer memory and I/O.
         """
-        if str(message.get("role") or "") != "tool":
+        if message.get("role") != "tool":
             return None
-        call_id = str(message.get("tool_call_id") or "").strip()
-        tool_name = str(message.get("tool_name") or "").strip()
-        if not call_id or len(call_id) > 512 or len(tool_name) > 512:
+        call_id_value = message.get("tool_call_id")
+        if not isinstance(call_id_value, str) or not call_id_value:
+            return None
+        call_id = call_id_value
+        tool_name_value = message.get("tool_name")
+        if tool_name_value is None:
+            tool_name = ""
+        elif isinstance(tool_name_value, str):
+            tool_name = tool_name_value
+        else:
+            return None
+        if len(call_id) > 512 or len(tool_name) > 512:
             return None
         if len(call_id.encode("utf-8", errors="replace")) > 2048:
             return None
@@ -5718,9 +5727,12 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
             candidate_tool_count = 0
             candidates: list[tuple[int, Dict[str, Any], tuple[str, str, str, str]]] = []
             for absolute_idx, message in messages_to_store_with_index:
-                if str(message.get("role") or "") != "tool" or not str(
-                    message.get("tool_call_id") or ""
-                ).strip():
+                call_id_value = message.get("tool_call_id")
+                if (
+                    message.get("role") != "tool"
+                    or not isinstance(call_id_value, str)
+                    or not call_id_value
+                ):
                     continue
                 candidate_tool_count += 1
                 identity = self._bounded_tool_diagnostic_identity(message)
