@@ -4743,10 +4743,14 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
         if not self._session_id or self._session_ignored or self._session_stateless:
             return
         try:
-            self._ingest_cursor_needs_reconcile = self._store.get_session_count(
-                self._session_id,
-                conversation_id=self._conversation_id,
-            ) > 0
+            self._ingest_cursor_needs_reconcile = bool(
+                self._store.get_session_messages_after(
+                    self._session_id,
+                    limit=1,
+                    conversation_id=self._conversation_id,
+                    include_legacy_unscoped=True,
+                )
+            )
         except Exception as exc:  # pragma: no cover - defensive only
             logger.debug("LCM ingest cursor reconciliation probe failed: %s", exc)
             self._ingest_cursor_needs_reconcile = False
@@ -4830,6 +4834,7 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
                 after_store_id=after_store_id,
                 limit=1000,
                 conversation_id=self._conversation_id,
+                include_legacy_unscoped=True,
             )
             if not rows:
                 return False
