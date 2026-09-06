@@ -2770,8 +2770,9 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
             self._last_condensation_suppressed_reason = ""
         durable_session_state = self._lifecycle.get_by_session(session_id)
         bound_conversation_id = (
-            kwargs.get("conversation_id")
-            if side_channel_rebind and kwargs.get("conversation_id")
+            requested_conversation_id
+            if requested_conversation_id
+            and (side_channel_rebind or previous_session_id == session_id)
             else (
                 self._conversation_id
                 if previous_session_id == session_id and self._conversation_id

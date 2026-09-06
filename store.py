@@ -987,14 +987,20 @@ class MessageStore:
     def get_session_messages_after(self, session_id: str,
                                    after_store_id: int = 0,
                                    limit: int = 10000,
-                                   conversation_id: str | None = None) -> List[Dict[str, Any]]:
+                                   conversation_id: str | None = None,
+                                   include_legacy_unscoped: bool = False) -> List[Dict[str, Any]]:
         """Get session messages after a store_id, ordered by store_id."""
-        conversation_clause = " AND conversation_id = ?" if conversation_id is not None else ""
-        params: tuple[Any, ...] = (
-            (session_id, after_store_id, conversation_id, limit)
-            if conversation_id is not None
-            else (session_id, after_store_id, limit)
-        )
+        if conversation_id is None:
+            conversation_clause = ""
+            params: tuple[Any, ...] = (session_id, after_store_id, limit)
+        elif include_legacy_unscoped:
+            conversation_clause = (
+                " AND (conversation_id = ? OR COALESCE(TRIM(conversation_id), '') = '')"
+            )
+            params = (session_id, after_store_id, conversation_id, limit)
+        else:
+            conversation_clause = " AND conversation_id = ?"
+            params = (session_id, after_store_id, conversation_id, limit)
         rows = self._conn.execute(
             f"""SELECT {_MESSAGE_SELECT_COLUMNS} FROM messages
                WHERE session_id = ? AND store_id > ?{conversation_clause}

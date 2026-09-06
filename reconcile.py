@@ -2471,6 +2471,7 @@ class ReconcileMixin:
                 self._session_id,
                 after_store_id=next_candidate_after,
                 conversation_id=getattr(self, "_conversation_id", None),
+                include_legacy_unscoped=True,
             )
             if not page:
                 break
