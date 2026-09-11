@@ -9,10 +9,12 @@ specific to suppress; a single unpaired marker remains ambiguous.
 from __future__ import annotations
 
 import os
+import tempfile
 from collections import Counter
 
 from hermes_lcm.config import LCMConfig
 from hermes_lcm.engine import LCMEngine
+from hermes_lcm.ingest_protection import recover_hermes_persisted_output_with_file_stat
 
 
 def _marker(path, raw: str) -> str:
@@ -94,7 +96,10 @@ def _tool_counts(rows) -> Counter:
     )
 
 
-def test_per_turn_suppresses_two_unpaired_exact_markers_after_source_generation_changes(tmp_path):
+def test_per_turn_suppresses_two_unpaired_exact_markers_after_source_generation_changes(
+    tmp_path, monkeypatch
+):
+    monkeypatch.setattr(tempfile, "tempdir", str(tmp_path))
     config, replayed_tools, raw_by_path = _fixture(tmp_path)
     session_id = "duplicate-admission-per-turn-burst"
     conversation_id = "agent:main:telegram:dm:sanitized:per-turn"
@@ -109,20 +114,23 @@ def test_per_turn_suppresses_two_unpaired_exact_markers_after_source_generation_
     engine.ingest(replayed_tools)
     for path, raw in raw_by_path.items():
         _replace_same_bytes_with_new_generation(path, raw)
+    assert all(
+        recover_hermes_persisted_output_with_file_stat(message["content"]) is not None
+        for message in replayed_tools
+    )
 
     engine._ingest_cursor = 0
     engine._ingest_cursor_needs_reconcile = False
     fresh_call = "call_genuinely_new_per_turn"
-    engine.ingest(
-        [
-            replayed_tools[0],
-            {"role": "user", "content": "genuinely new request"},
-            replayed_tools[1],
-            _assistant_call(fresh_call, "lcm_status"),
-            _tool(fresh_call, "lcm_status", "genuinely new tool result"),
-            {"role": "assistant", "content": "genuinely new response"},
-        ]
-    )
+    incoming = [
+        replayed_tools[0],
+        {"role": "user", "content": "genuinely new request"},
+        replayed_tools[1],
+        _assistant_call(fresh_call, "lcm_status"),
+        _tool(fresh_call, "lcm_status", "genuinely new tool result"),
+        {"role": "assistant", "content": "genuinely new response"},
+    ]
+    engine.ingest(incoming)
 
     rows = engine._store.get_session_messages(session_id)
     counts = _tool_counts(rows)
@@ -141,7 +149,10 @@ def test_per_turn_suppresses_two_unpaired_exact_markers_after_source_generation_
     assert contents.count("genuinely new response") == 1, evidence
 
 
-def test_session_end_suppresses_same_two_marker_burst_and_retains_new_suffix(tmp_path):
+def test_session_end_suppresses_same_two_marker_burst_and_retains_new_suffix(
+    tmp_path, monkeypatch
+):
+    monkeypatch.setattr(tempfile, "tempdir", str(tmp_path))
     config, replayed_tools, raw_by_path = _fixture(tmp_path)
     session_id = "duplicate-admission-session-end-burst"
     conversation_id = "agent:main:telegram:dm:sanitized:session-end"
@@ -157,6 +168,10 @@ def test_session_end_suppresses_same_two_marker_burst_and_retains_new_suffix(tmp
     seed.shutdown()
     for path, raw in raw_by_path.items():
         _replace_same_bytes_with_new_generation(path, raw)
+    assert all(
+        recover_hermes_persisted_output_with_file_stat(message["content"]) is not None
+        for message in replayed_tools
+    )
 
     rebound = LCMEngine(config=config, hermes_home=str(tmp_path / "hermes"))
     rebound.on_session_start(
@@ -193,7 +208,10 @@ def test_session_end_suppresses_same_two_marker_burst_and_retains_new_suffix(tmp
     assert contents.count("genuinely new terminal response") == 1, evidence
 
 
-def test_single_unpaired_marker_with_changed_source_generation_remains_ambiguous(tmp_path):
+def test_single_unpaired_marker_with_changed_source_generation_remains_ambiguous(
+    tmp_path, monkeypatch
+):
+    monkeypatch.setattr(tempfile, "tempdir", str(tmp_path))
     config, replayed_tools, raw_by_path = _fixture(tmp_path)
     session_id = "duplicate-admission-singleton-ambiguity"
     conversation_id = "agent:main:telegram:dm:sanitized:singleton"
@@ -209,6 +227,7 @@ def test_single_unpaired_marker_with_changed_source_generation_remains_ambiguous
     engine.ingest([only])
     path = next(iter(raw_by_path))
     _replace_same_bytes_with_new_generation(path, raw_by_path[path])
+    assert recover_hermes_persisted_output_with_file_stat(only["content"]) is not None
 
     engine._ingest_cursor = 0
     engine._ingest_cursor_needs_reconcile = False

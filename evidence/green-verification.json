@@ -1,0 +1,57 @@
+{
+  "schema_version": 1,
+  "campaign": "duplicate-admission-r2-fix6-green",
+  "created_at": "2026-09-11T08:18:14Z",
+  "base_commit": "2329420890fe13d71936eabd9cbc14b4eafd5bc6",
+  "base_tree": "031d3ba20e21b540a87b15d74c5cdd7f9ac56371",
+  "candidate_files": {
+    "reconcile.py": "e7720a175716bf3dada11e70e1f6dccd9abc52c669f8c17f22e16e2165484bb6",
+    "tests/test_duplicate_admission_persisted_marker_burst.py": "4b8d266d4d096e38e3c126c2dd559ee30be463be7dbbc0b405bc5c2342166092"
+  },
+  "focused": {
+    "status": "PASS",
+    "pytest": "4 passed in 6.78s",
+    "lint_rc": 0,
+    "pytest_rc": 0,
+    "marker": "HERD_DUP_ADMISSION_GREEN_FIX6_e7720a175716_RC=0"
+  },
+  "regression_partition": {
+    "status": "PASS",
+    "totals": {
+      "test_files": 85,
+      "passed": 2605,
+      "xfailed": 12
+    },
+    "runs": [
+      {
+        "partition": "shard1",
+        "runner_sha256": "1ef230c7bfa3782162f68d23d52af217531208ca14163685e3f39a43a385c678",
+        "test_files": 1,
+        "pytest": "795 passed",
+        "lint_rc": 0,
+        "pytest_rc": 0
+      },
+      {
+        "partition": "shard2",
+        "runner_sha256": "05471ed447ee704f0f65ead22cd4347577e2dd66168f98419f4bb9f8e1670a40",
+        "test_files": 26,
+        "pytest": "594 passed",
+        "lint_rc": 0,
+        "pytest_rc": 0
+      },
+      {
+        "partition": "shards3-and-4-detached",
+        "session_id": "sess-1789113981397562708-2072",
+        "test_files": 58,
+        "pytest": "1216 passed, 12 xfailed in 582.81s",
+        "lint_rc": 0,
+        "pytest_rc": 0,
+        "result_file": "evidence/detached-tail-green-result.json",
+        "result_sha256": "ef27067e2c22120258b542ffbee8fef08c51783b5dd08a3f680be2453cfef8e8",
+        "harness_file": "evidence/run-detached-tail-green.py",
+        "harness_sha256": "d783180ccafabdb94394f2db8a588fc9e9dc5531e0d0d887d05fcf3dcd506a24"
+      }
+    ]
+  },
+  "verdict": "PASS"
+}

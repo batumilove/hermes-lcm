@@ -1608,7 +1608,68 @@ class ReconcileMixin:
                 keys.add(cleaned_identity)
             for key in keys:
                 stored_tool_anchors.setdefault(key, []).append(stored_offset)
-
+        persisted_output_unpaired_burst_offsets: set[int] = set()
+        persisted_output_unpaired_candidates: list[tuple[int, str]] = []
+        for incoming_offset in incoming_tool_offsets:
+            _incoming_raw_index, incoming_tool = visible_messages[incoming_offset]
+            call_id = str(incoming_tool.get("tool_call_id") or "").strip()
+            content = normalize_content_value(incoming_tool.get("content")) or ""
+            if not call_id or not _is_hermes_persisted_output_marker(content):
+                continue
+            has_adjacent_call = False
+            if incoming_offset > 0:
+                previous = visible_messages[incoming_offset - 1][1]
+                has_adjacent_call = (
+                    str(previous.get("role") or "") == "assistant"
+                    and call_id in assistant_tool_call_ids(previous)
+                )
+            if has_adjacent_call:
+                continue
+            incoming_identity = incoming_identities[incoming_offset]
+            identity_keys = {incoming_identity}
+            cleaned_identity = self._active_cleanup_replay_identity(incoming_identity)
+            if cleaned_identity is not None:
+                identity_keys.add(cleaned_identity)
+            matching_stored_offsets = {
+                stored_offset
+                for key in identity_keys
+                for stored_offset in stored_tool_anchors.get(key, [])
+            }
+            if not matching_stored_offsets:
+                incoming_tool_name = str(
+                    incoming_tool.get("tool_name")
+                    or incoming_name_map[incoming_offset]
+                    or ""
+                ).strip()
+                matching_stored_offsets = {
+                    stored_offset
+                    for stored_offset, stored_row in enumerate(stored_rows)
+                    if str(stored_row.get("role") or "") == "tool"
+                    and str(stored_row.get("tool_call_id") or "").strip() == call_id
+                    and stored_marker_primary_provenance_matches(
+                        stored_row,
+                        content,
+                        incoming_tool_name,
+                    )
+                }
+            if not matching_stored_offsets:
+                continue
+            # Missing payload files retain the longstanding ambiguity contract.
+            # This fallback is only for still-readable exact marker sources; an
+            # unchanged generation is already replay-safe through the primary
+            # path, while a changed generation needs burst-level proof.
+            if recover_hermes_persisted_output_with_file_stat(content) is None:
+                continue
+            persisted_output_unpaired_candidates.append((incoming_offset, call_id))
+        # A lone unpaired persisted-output marker remains ambiguous: Hermes may
+        # legitimately reuse its call ID and marker bytes after replacing the
+        # source file.  Two distinct, exact durable marker identities in the same
+        # delivery form a replay burst, while adjacent assistant declarations
+        # continue to protect genuinely new executions from this fallback.
+        if len({call_id for _offset, call_id in persisted_output_unpaired_candidates}) >= 2:
+            persisted_output_unpaired_burst_offsets = {
+                offset for offset, _call_id in persisted_output_unpaired_candidates
+            }
 
         replayed_raw_indexes: set[int] = set()
         matched_tool_anchor_pairs: list[tuple[int, int]] = []
@@ -1621,6 +1682,9 @@ class ReconcileMixin:
         for incoming_anchor in reversed(incoming_tool_offsets):
             incoming_raw_index, incoming_tool = visible_messages[incoming_anchor]
             incoming_identity = incoming_identities[incoming_anchor]
+            if incoming_anchor in persisted_output_unpaired_burst_offsets:
+                replayed_raw_indexes.add(incoming_raw_index)
+                continue
             # Missing persisted-output source files do not make an exact stored
             # marker identity new. Re-appending the same
             # (session_id, tool_call_id, content) pointer cannot recover its
