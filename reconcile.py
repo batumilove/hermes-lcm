@@ -1609,7 +1609,9 @@ class ReconcileMixin:
             for key in keys:
                 stored_tool_anchors.setdefault(key, []).append(stored_offset)
         persisted_output_unpaired_burst_offsets: set[int] = set()
-        persisted_output_unpaired_candidates: list[tuple[int, str]] = []
+        persisted_output_unpaired_candidates: list[
+            tuple[int, tuple[str, str, str, str, str]]
+        ] = []
         for incoming_offset in incoming_tool_offsets:
             _incoming_raw_index, incoming_tool = visible_messages[incoming_offset]
             call_id = str(incoming_tool.get("tool_call_id") or "").strip()
@@ -1660,15 +1662,25 @@ class ReconcileMixin:
             # path, while a changed generation needs burst-level proof.
             if recover_hermes_persisted_output_with_file_stat(content) is None:
                 continue
-            persisted_output_unpaired_candidates.append((incoming_offset, call_id))
+            persisted_output_unpaired_candidates.append(
+                (incoming_offset, incoming_identity)
+            )
         # A lone unpaired persisted-output marker remains ambiguous: Hermes may
         # legitimately reuse its call ID and marker bytes after replacing the
         # source file.  Two distinct, exact durable marker identities in the same
         # delivery form a replay burst, while adjacent assistant declarations
         # continue to protect genuinely new executions from this fallback.
-        if len({call_id for _offset, call_id in persisted_output_unpaired_candidates}) >= 2:
+        if (
+            len(
+                {
+                    identity
+                    for _offset, identity in persisted_output_unpaired_candidates
+                }
+            )
+            >= 2
+        ):
             persisted_output_unpaired_burst_offsets = {
-                offset for offset, _call_id in persisted_output_unpaired_candidates
+                offset for offset, _identity in persisted_output_unpaired_candidates
             }
 
         replayed_raw_indexes: set[int] = set()

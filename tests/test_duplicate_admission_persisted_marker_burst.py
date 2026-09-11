@@ -149,6 +149,51 @@ def test_per_turn_suppresses_two_unpaired_exact_markers_after_source_generation_
     assert contents.count("genuinely new response") == 1, evidence
 
 
+def test_per_turn_suppresses_distinct_marker_identities_that_reuse_one_call_id(
+    tmp_path, monkeypatch
+):
+    monkeypatch.setattr(tempfile, "tempdir", str(tmp_path))
+    config, replayed_tools, raw_by_path = _fixture(tmp_path)
+    shared_call_id = "call_reused_across_replay_burst"
+    for message in replayed_tools:
+        message["tool_call_id"] = shared_call_id
+    session_id = "duplicate-admission-per-turn-shared-call-id"
+
+    engine = LCMEngine(config=config, hermes_home=str(tmp_path / "hermes"))
+    engine.on_session_start(
+        session_id,
+        platform="telegram",
+        conversation_id="agent:main:telegram:dm:sanitized:shared-call-id",
+        context_length=200000,
+    )
+    engine.ingest(replayed_tools)
+    for path, raw in raw_by_path.items():
+        _replace_same_bytes_with_new_generation(path, raw)
+    assert all(
+        recover_hermes_persisted_output_with_file_stat(message["content"]) is not None
+        for message in replayed_tools
+    )
+
+    engine._ingest_cursor = 0
+    engine._ingest_cursor_needs_reconcile = False
+    engine.ingest(replayed_tools)
+
+    rows = engine._store.get_session_messages(session_id)
+    matching_rows = [
+        row
+        for row in rows
+        if row.get("role") == "tool" and row.get("tool_call_id") == shared_call_id
+    ]
+    evidence = {
+        "matching_contents": [row.get("content") for row in matching_rows],
+        "row_count": len(rows),
+        "reconciliation": engine._last_ingest_reconciliation,
+    }
+    engine.shutdown()
+
+    assert len(matching_rows) == 2, evidence
+
+
 def test_session_end_suppresses_same_two_marker_burst_and_retains_new_suffix(
     tmp_path, monkeypatch
 ):
