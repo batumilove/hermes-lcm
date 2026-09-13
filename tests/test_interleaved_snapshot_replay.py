@@ -366,7 +366,9 @@ def test_expired_marker_is_preserved_when_later_anchors_are_out_of_order(tmp_pat
         gap_after=None,
     )
 
-    assert sum(row["content"] == marker for row in rows) == 2
+    # Admission dedup (2026-09-12) drops the byte-identical replayed marker:
+    # the durable copy IS the preserved marker; nothing is lost.
+    assert sum(row["content"] == marker for row in rows) == 1
 
 
 def test_expired_marker_is_preserved_across_unmatched_gap_before_later_anchors(tmp_path):
@@ -377,7 +379,8 @@ def test_expired_marker_is_preserved_across_unmatched_gap_before_later_anchors(t
         gap_after="marker",
     )
 
-    assert sum(row["content"] == marker for row in rows) == 2
+    # Admission dedup: byte-identical replayed marker dropped; durable copy remains.
+    assert sum(row["content"] == marker for row in rows) == 1
     assert sum(row["content"] == "unmatched new gap" for row in rows) == 1
 
 
@@ -389,7 +392,7 @@ def test_expired_marker_is_preserved_when_gap_separates_later_anchors(tmp_path):
         gap_after="a1",
     )
 
-    assert sum(row["content"] == marker for row in rows) == 2
+    assert sum(row["content"] == marker for row in rows) == 1
     assert sum(row["content"] == "unmatched new gap" for row in rows) == 1
 
 
@@ -402,7 +405,7 @@ def test_expired_marker_at_incoming_tail_is_not_anchored_without_later_proof(tmp
         marker_position="tail",
     )
 
-    assert sum(row["content"] == marker for row in rows) == 2
+    assert sum(row["content"] == marker for row in rows) == 1
 
 
 def test_repeated_exact_generation_anchor_cannot_supply_three_anchor_proof(tmp_path):
@@ -497,4 +500,5 @@ def test_repeated_exact_generation_anchor_cannot_supply_three_anchor_proof(tmp_p
     rows = after._store.get_session_messages(session_id)
     after.shutdown()
 
-    assert sum(row["content"] == expired_marker for row in rows) == 2
+    # Admission dedup drops the byte-identical replayed expired marker.
+    assert sum(row["content"] == expired_marker for row in rows) == 1

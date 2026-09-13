@@ -5841,8 +5841,13 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
             self._clear_foreground_rebind_candidate_if_bound_session_confirmed()
             return self._remember_active_replay_messages(messages, active_replay_messages)
 
+        admitted_messages_with_index, admission_dropped = (
+            self._drop_exact_duplicate_tool_admission(
+                messages_to_store_with_index
+            )
+        )
         self._warn_if_duplicate_tool_admission(
-            messages_to_store_with_index,
+            admitted_messages_with_index,
             incoming_count=n,
             cursor=cursor,
             cursor_before_reconcile=cursor_before_reconcile,
@@ -5850,6 +5855,37 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
             overflow_recovery_pending=overflow_recovery_pending,
             session_end=bool(session_end_intent_sha256),
         )
+        if admission_dropped:
+            self._record_ingest_reconciliation(
+                action="filtered admission",
+                reason="exact durable tool identity already stored",
+                cursor=cursor,
+                incoming=n,
+                session_count=self._store.get_session_count(
+                    self._session_id,
+                    conversation_id=self._conversation_id,
+                ),
+                stored_tail_count=len(admitted_messages_with_index),
+                effective_incoming=len(admitted_messages_with_index),
+            )
+        messages_to_store_with_index = admitted_messages_with_index
+        if not messages_to_store_with_index:
+            if session_end_intent_sha256:
+                self._store.record_session_end_ingest_receipt(
+                    session_end_intent_sha256,
+                    session_id=self._session_id,
+                    conversation_id=self._conversation_id,
+                    message_fingerprints=session_end_message_fingerprints or [],
+                )
+            self._ingest_cursor = n
+            self._compression_boundary_ingest_pending = False
+            self._overflow_recovery_ingest_pending = False
+            self._compression_boundary_active_placeholder_digest_budget = {}
+            self._compression_boundary_active_placeholder_digest_ordinals = {}
+            self._compression_boundary_stored_placeholder_digest_counts = {}
+            self._clear_foreground_rebind_candidate_if_bound_session_confirmed()
+            return self._remember_active_replay_messages(messages, active_replay_messages)
+
         protected_messages = protect_messages_for_ingest(
             [msg for _idx, msg in messages_to_store_with_index],
             session_id=self._session_id,
@@ -5967,6 +6003,117 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
         if len(encoded) > byte_limit:
             return None
         return ("tool", call_id, tool_name, hashlib.sha256(encoded).hexdigest())
+
+    def _drop_exact_duplicate_tool_admission(
+        self,
+        messages_to_store_with_index: list[tuple[int, Dict[str, Any]]],
+    ) -> tuple[list[tuple[int, Dict[str, Any]]], list[dict[str, Any]]]:
+        """Drop incoming tool rows whose exact identity is already durable.
+
+        This is the hard filter behind the (still behavior-observing)
+        duplicate-admission diagnostic: when an incoming ``tool`` message's
+        bounded identity — (role, tool_call_id, tool_name, sha256(content)) —
+        exactly matches a durable row in the same session and conversation
+        scope, the row is a replay and is dropped from admission instead of
+        stored a second time. Rows whose content differs under the same
+        tool_call_id (legitimate retries) are always admitted; oversized or
+        non-identity tool rows are left untouched. Failures inside the
+        lookup degrade to admitting everything (filter must not break
+        ingestion) with a debug log.
+        """
+        try:
+            candidates: list[tuple[int, Dict[str, Any], tuple[str, str, str, str]]] = []
+            for absolute_idx, message in messages_to_store_with_index:
+                call_id_value = message.get("tool_call_id")
+                if (
+                    message.get("role") != "tool"
+                    or not isinstance(call_id_value, str)
+                    or not call_id_value
+                ):
+                    continue
+                identity = self._bounded_tool_diagnostic_identity(message)
+                if identity is not None:
+                    candidates.append((absolute_idx, message, identity))
+            if not candidates or not self._session_id:
+                return messages_to_store_with_index, []
+
+            call_ids = {identity[1] for _i, _m, identity in candidates}
+            durable_rows = self._store.get_bounded_tool_call_rows(
+                self._session_id,
+                call_ids,
+                conversation_id=self._conversation_id,
+                max_call_ids=8,
+                max_rows=64,
+                max_content_bytes=65_536,
+            )
+            durable_identities: set[tuple[str, str, str, str]] = set()
+            for row in durable_rows:
+                row_identity = self._bounded_tool_diagnostic_identity(row)
+                if row_identity is not None:
+                    durable_identities.add(row_identity)
+
+            if not durable_identities:
+                return messages_to_store_with_index, []
+
+            dropped_indexes: set[int] = set()
+            dropped_events: list[dict[str, Any]] = []
+            for absolute_idx, message, identity in candidates:
+                if identity in durable_identities:
+                    dropped_indexes.add(absolute_idx)
+                    if len(dropped_events) < 8:
+                        dropped_events.append(
+                            {
+                                "incoming_index": absolute_idx,
+                                "tool_call_id_sha256": self._diagnostic_sha256(
+                                    identity[1]
+                                ),
+                                "content_sha256": identity[3],
+                            }
+                        )
+            if not dropped_indexes:
+                return messages_to_store_with_index, []
+
+            kept = [
+                item
+                for item in messages_to_store_with_index
+                if item[0] not in dropped_indexes
+            ]
+            engine_class = f"{type(self).__module__}.{type(self).__qualname__}"
+            receipt_truncated = len(engine_class) > 128
+            event = {
+                "schema": "lcm_duplicate_tool_admission_filtered_v1",
+                "dropped_count": len(dropped_indexes),
+                "duplicates_truncated": len(dropped_indexes) > len(dropped_events),
+                "duplicates": dropped_events,
+                "candidate_tool_count": len(candidates),
+                "admission_count": len(messages_to_store_with_index),
+                "engine_class": engine_class[:128],
+                "receipt_truncated": receipt_truncated,
+            }
+            serialized_event = json.dumps(event, sort_keys=True, separators=(",", ":"))
+            if len(serialized_event.encode("utf-8")) > 4096:
+                event["duplicates"] = event["duplicates"][:1]
+                event["duplicates_truncated"] = True
+                serialized_event = json.dumps(
+                    event, sort_keys=True, separators=(",", ":")
+                )
+            # The drop decision must never depend on the diagnostic sink: a
+            # failing logging handler is logged-and-ignored, not a reason to
+            # admit (or reject) anything.
+            try:
+                logger.warning(
+                    "LCM_DUPLICATE_TOOL_ADMISSION_FILTERED %s",
+                    serialized_event,
+                )
+            except Exception:
+                logger.debug(
+                    "LCM admission-filter receipt logging failed",
+                    exc_info=True,
+                )
+            return kept, dropped_events
+        except Exception:
+            logger.debug("LCM admission dedup filter failed; admitting batch", exc_info=True)
+            return messages_to_store_with_index, []
 
     def _warn_if_duplicate_tool_admission(
         self,

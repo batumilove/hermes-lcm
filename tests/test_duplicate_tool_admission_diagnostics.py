@@ -21,7 +21,7 @@ def _tool(call_id: str, content: str) -> dict:
     }
 
 
-def test_exact_duplicate_reaching_storage_admission_emits_bounded_receipt_without_filtering(
+def test_exact_duplicate_reaching_storage_admission_is_filtered_with_bounded_receipt(
     tmp_path, monkeypatch, caplog
 ):
     db_path = tmp_path / "duplicate-admission.db"
@@ -52,8 +52,8 @@ def test_exact_duplicate_reaching_storage_admission_emits_bounded_receipt_withou
     )
     engine._ingest_cursor = 0
     engine._ingest_cursor_needs_reconcile = False
-    # Model a missed earlier replay scan. The admission diagnostic must be an
-    # independent observer and must not turn into another behavior filter.
+    # Model a missed earlier replay scan. The admission filter must drop the
+    # exact duplicate even when the replay scanner sees nothing.
     monkeypatch.setattr(
         engine,
         "_find_tool_anchored_replay_indexes",
@@ -71,34 +71,29 @@ def test_exact_duplicate_reaching_storage_admission_emits_bounded_receipt_withou
     rows = engine._store.get_session_messages(session_id)
     engine.shutdown()
 
+    FILTERED_PREFIX = "LCM_DUPLICATE_TOOL_ADMISSION_FILTERED "
     events = [
-        json.loads(record.message[len(EVENT_PREFIX) :])
+        json.loads(record.message[len(FILTERED_PREFIX) :])
         for record in caplog.records
-        if record.message.startswith(EVENT_PREFIX)
+        if record.message.startswith(FILTERED_PREFIX)
     ]
-    assert len(rows) == 2, "instrumentation must not alter storage behavior"
+    assert len(rows) == 1, "exact duplicate must be filtered at admission"
     assert len(events) == 1
     event = events[0]
-    assert event["schema"] == "lcm_duplicate_tool_admission_v1"
-    assert event["duplicate_count"] == 1
-    assert event["incoming_count"] == 1
-    assert event["cursor"] == 0
-    assert event["cursor_before_reconcile"] == 0
-    assert event["reconcile_requested"] is False
-    assert event["session_end"] is False
+    assert event["schema"] == "lcm_duplicate_tool_admission_filtered_v1"
+    assert event["dropped_count"] == 1
+    assert event["candidate_tool_count"] == 1
+    assert event["admission_count"] == 1
     assert event["duplicates"] == [
         {
             "incoming_index": 0,
             "tool_call_id_sha256": hashlib.sha256(call_id.encode()).hexdigest(),
             "content_sha256": hashlib.sha256(content.encode()).hexdigest(),
-            "durable_store_ids": [1],
         }
     ]
-    assert event["invocation_id_sha256"] == hashlib.sha256(invocation_id.encode()).hexdigest()
-    assert "invocation_id" not in event
     serialized = json.dumps(event, sort_keys=True)
     assert len(serialized) < 4096
-    for secret in (session_id, conversation_id, call_id, content, invocation_id):
+    for secret in (session_id, conversation_id, call_id, content):
         assert secret not in serialized
 
 
@@ -219,18 +214,27 @@ def test_receipt_is_hard_bounded_with_an_adversarial_engine_class_name(
         engine._ingest_messages([_tool("call_bounded", "same result")])
 
     engine.shutdown()
-    records = [record.message for record in caplog.records if record.message.startswith(EVENT_PREFIX)]
-    assert len(records) == 1
-    assert len(records[0].encode("utf-8")) <= 4096
-    assert json.loads(records[0][len(EVENT_PREFIX) :])["receipt_truncated"] is True
+    filtered = [
+        record.message
+        for record in caplog.records
+        if record.message.startswith("LCM_DUPLICATE_TOOL_ADMISSION_FILTERED ")
+    ]
+    assert len(filtered) == 1
+    assert len(filtered[0].encode("utf-8")) <= 4096
+    filtered_event = json.loads(filtered[0][len("LCM_DUPLICATE_TOOL_ADMISSION_FILTERED ") :])
+    assert filtered_event["receipt_truncated"] is True
 
 
 def test_failing_diagnostic_logging_handler_does_not_block_storage(tmp_path, monkeypatch):
     class FailingHandler(logging.Handler):
         def emit(self, record):
             message = record.getMessage()
-            if EVENT_PREFIX in message or message.startswith(
-                "LCM duplicate-tool admission diagnostic failed:"
+            if (
+                EVENT_PREFIX in message
+                or message.startswith("LCM_DUPLICATE_TOOL_ADMISSION_FILTERED ")
+                or message.startswith(
+                    "LCM duplicate-tool admission diagnostic failed:"
+                )
             ):
                 raise RuntimeError("diagnostic sink unavailable")
 
@@ -259,7 +263,9 @@ def test_failing_diagnostic_logging_handler_does_not_block_storage(tmp_path, mon
 
     rows = engine._store.get_session_messages(session_id)
     engine.shutdown()
-    assert len(rows) == 2
+    # The drop decision is independent of the diagnostic sink: even with a
+    # failing logging handler the exact duplicate is filtered at admission.
+    assert len(rows) == 1
 
 
 def test_diagnostic_store_lookup_is_indexed_and_result_bounded(tmp_path):
