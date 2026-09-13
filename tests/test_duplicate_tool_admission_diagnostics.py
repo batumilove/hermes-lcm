@@ -308,8 +308,10 @@ def test_totally_failing_diagnostic_sink_cannot_flip_drop_or_abort_ingestion(
     assert len(rows) == 1
 
     # Same adversarial sink on a fail-open lookup path (non-duplicate batch):
-    # the batch must still be admitted end-to-end, including the post-append
-    # Ingested-log line, without aborting ingestion.
+    # force the REAL filter's store lookup to raise, retain the real method,
+    # and keep the logger at DEBUG so the guarded post-append Ingested line is
+    # actually emitted into the failing sink. The batch must still be admitted
+    # end-to-end without aborting ingestion.
     engine2 = LCMEngine(config=config)
     engine2.on_session_start(session_id, context_length=200000)
     engine2._ingest_cursor = 0
@@ -319,28 +321,28 @@ def test_totally_failing_diagnostic_sink_cannot_flip_drop_or_abort_ingestion(
         "_find_tool_anchored_replay_indexes",
         lambda *_args, **_kwargs: (set(), 0),
     )
+
+    def _raising_lookup(*_a, **_k):
+        raise RuntimeError("store lookup unavailable")
+
     monkeypatch.setattr(
-        engine2,
-        "_drop_exact_duplicate_tool_admission",
-        lambda *a, **k: (_drop_fail_open(a[0]), []),
+        engine2._store,
+        "get_bounded_tool_call_rows",
+        _raising_lookup,
     )
     handler2 = AllFailingHandler()
+    logger.setLevel(logging.DEBUG)
     logger.addHandler(handler2)
     try:
         engine2._ingest_messages([_tool("call_allfail_unique", "fresh result")])
     finally:
         logger.removeHandler(handler2)
+        logger.setLevel(prior_level)
     rows2 = engine2._store.get_session_messages(session_id)
     engine2.shutdown()
     assert any(
         "call_allfail_unique" in str(r) for r in rows2
     ), "fail-open path must admit and store the unique row"
-
-
-def _drop_fail_open(batch):
-    # Simulates the lookup-failure fail-open branch returning the batch
-    # unfiltered (mirrors engine.py outer except: admit everything).
-    return list(batch)
 
 
 def test_diagnostic_store_lookup_is_indexed_and_result_bounded(tmp_path):
