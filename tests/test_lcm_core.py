@@ -5952,8 +5952,12 @@ class TestIngestExternalization:
         replay._ingest_messages(messages)
 
         stored = replay._store.get_session_messages("ingest-session")
-        assert len(stored) == 3
-        assert stored[-1]["content"] == messages[-1]["content"]
+        # Admission dedup (2026-09-12): the byte-identical replayed
+        # unrecoverable marker is dropped; the durable original remains.
+        assert len(stored) == 2
+        assert any(
+            row["content"] == messages[-1]["content"] for row in stored
+        )
 
     def test_replay_appends_stale_lossy_persisted_retry_when_redaction_config_disabled(self, tmp_path, monkeypatch):
         import os
