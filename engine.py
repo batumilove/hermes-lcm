@@ -5948,7 +5948,14 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
         self._compression_boundary_active_placeholder_digest_budget = {}
         self._compression_boundary_active_placeholder_digest_ordinals = {}
         self._compression_boundary_stored_placeholder_digest_counts = {}
-        logger.debug("Ingested %d messages into LCM store", len(messages_to_store_with_index))
+        try:
+            logger.debug(
+                "Ingested %d messages into LCM store",
+                len(messages_to_store_with_index),
+            )
+        except Exception:
+            # Ingestion must not depend on the logging sink.
+            pass
         self._clear_foreground_rebind_candidate_if_bound_session_confirmed()
         # Most ``protected_messages`` changes are storage-only: inline media and
         # data/base64 substrings stay provider-usable in active replay. The
