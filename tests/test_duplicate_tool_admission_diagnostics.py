@@ -268,6 +268,46 @@ def test_failing_diagnostic_logging_handler_does_not_block_storage(tmp_path, mon
     assert len(rows) == 1
 
 
+def test_totally_failing_diagnostic_sink_cannot_flip_drop_or_abort_ingestion(
+    tmp_path, monkeypatch
+):
+    # Regression for the Atomic-review finding: a sink that rejects EVERY
+    # record (including the fallback logger.debug calls) must neither flip the
+    # drop into admission nor abort ingestion.
+    class AllFailingHandler(logging.Handler):
+        def emit(self, record):
+            raise RuntimeError("all logging broken")
+
+    config = LCMConfig(database_path=str(tmp_path / "all-failing-handler.db"))
+    session_id = "all-failing-handler-session"
+    engine = LCMEngine(config=config)
+    engine.on_session_start(session_id, context_length=200000)
+    engine._ingest_messages([_tool("call_allfail", "same result")])
+    engine._ingest_cursor = 0
+    engine._ingest_cursor_needs_reconcile = False
+    monkeypatch.setattr(
+        engine,
+        "_find_tool_anchored_replay_indexes",
+        lambda *_args, **_kwargs: (set(), 0),
+    )
+    handler = AllFailingHandler()
+    logger = logging.getLogger("hermes_lcm.engine")
+    prior_level = logger.level
+    logger.setLevel(logging.DEBUG)
+    logger.addHandler(handler)
+    try:
+        engine._ingest_messages([_tool("call_allfail", "same result")])
+    finally:
+        logger.removeHandler(handler)
+        logger.setLevel(prior_level)
+
+    rows = engine._store.get_session_messages(session_id)
+    engine.shutdown()
+    # The duplicate was still dropped and ingestion completed despite the
+    # universally failing logging sink.
+    assert len(rows) == 1
+
+
 def test_diagnostic_store_lookup_is_indexed_and_result_bounded(tmp_path):
     config = LCMConfig(database_path=str(tmp_path / "bounded-lookup.db"))
     engine = LCMEngine(config=config)

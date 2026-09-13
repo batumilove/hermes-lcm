@@ -5503,10 +5503,14 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
                     stored_tail_count=replay_scan_count,
                     effective_incoming=n - cursor - len(tool_anchored_replay_indexes),
                 )
-        logger.debug(
-            "Ingest: session=%s cursor=%d incoming=%d",
-            self._session_id, cursor, n,
-        )
+        try:
+            logger.debug(
+                "Ingest: session=%s cursor=%d incoming=%d",
+                self._session_id, cursor, n,
+            )
+        except Exception:
+            # Admission must not depend on the logging sink.
+            pass
 
         new_messages = replay_messages[cursor:] if cursor < n else []
         original_new_messages = messages[cursor:] if cursor < n else []
@@ -6106,13 +6110,28 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
                     serialized_event,
                 )
             except Exception:
-                logger.debug(
-                    "LCM admission-filter receipt logging failed",
-                    exc_info=True,
-                )
+                # The drop decision must never depend on the diagnostic sink,
+                # including this fallback: guard it so a second failing sink
+                # cannot flip the drop into admission (or abort ingestion).
+                try:
+                    logger.debug(
+                        "LCM admission-filter receipt logging failed",
+                        exc_info=True,
+                    )
+                except Exception:
+                    pass
             return kept, dropped_events
         except Exception:
-            logger.debug("LCM admission dedup filter failed; admitting batch", exc_info=True)
+            # Fail-open: admit the batch on any unexpected filter failure. The
+            # diagnostic emission is guarded so a broken logging sink cannot
+            # turn fail-open into an ingestion abort.
+            try:
+                logger.debug(
+                    "LCM admission dedup filter failed; admitting batch",
+                    exc_info=True,
+                )
+            except Exception:
+                pass
             return messages_to_store_with_index, []
 
     def _warn_if_duplicate_tool_admission(
