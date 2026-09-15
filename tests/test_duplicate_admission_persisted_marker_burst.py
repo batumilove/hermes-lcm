@@ -8,13 +8,16 @@ specific to suppress; a single unpaired marker remains ambiguous.
 
 from __future__ import annotations
 
+import json
 import os
 import tempfile
 from collections import Counter
 
+import hermes_lcm.reconcile as reconcile_module
 from hermes_lcm.config import LCMConfig
 from hermes_lcm.engine import LCMEngine
 from hermes_lcm.ingest_protection import recover_hermes_persisted_output_with_file_stat
+from hermes_lcm.reconcile import _proven_distinct_durable_burst_offsets
 
 
 def _marker(path, raw: str) -> str:
@@ -94,6 +97,21 @@ def _tool_counts(rows) -> Counter:
         for row in rows
         if row.get("role") == "tool" and row.get("tool_call_id")
     )
+
+
+def test_burst_proof_requires_distinct_durable_occurrences():
+    identity_a = ("tool", "call", "session_search", "hash-a", "")
+    identity_b = ("tool", "call", "session_search", "hash-b", "")
+
+    assert (
+        _proven_distinct_durable_burst_offsets(
+            [(0, identity_a, {7}), (1, identity_b, {7})]
+        )
+        == set()
+    )
+    assert _proven_distinct_durable_burst_offsets(
+        [(0, identity_a, {7}), (1, identity_b, {8})]
+    ) == {0, 1}
 
 
 def test_per_turn_suppresses_two_unpaired_exact_markers_after_source_generation_changes(
@@ -192,6 +210,79 @@ def test_per_turn_suppresses_distinct_marker_identities_that_reuse_one_call_id(
     engine.shutdown()
 
     assert len(matching_rows) == 2, evidence
+
+
+def test_two_marker_identities_cannot_reuse_one_durable_occurrence_as_burst_proof(
+    tmp_path, monkeypatch
+):
+    monkeypatch.setattr(tempfile, "tempdir", str(tmp_path))
+    config, replayed_tools, raw_by_path = _fixture(tmp_path)
+    shared_call_id = "call_one_durable_occurrence"
+    first, second = replayed_tools
+    first["tool_call_id"] = shared_call_id
+    second["tool_call_id"] = shared_call_id
+    second["tool_name"] = first["tool_name"]
+    session_id = "duplicate-admission-one-durable-occurrence"
+
+    engine = LCMEngine(config=config, hermes_home=str(tmp_path / "hermes"))
+    engine.on_session_start(
+        session_id,
+        platform="telegram",
+        conversation_id="agent:main:telegram:dm:sanitized:one-durable-occurrence",
+        context_length=200000,
+    )
+    engine.ingest([first])
+
+    stored = engine._store.get_session_messages(session_id)
+    assert len(stored) == 1
+    ref = stored[0]["content"].rsplit("ref=", 1)[1].rstrip("]")
+    payload_path = tmp_path / "externalized" / ref
+    payload = json.loads(payload_path.read_text(encoding="utf-8"))
+    second_path = next(path for path in raw_by_path if str(path) in second["content"])
+    first_path = next(path for path in raw_by_path if str(path) in first["content"])
+    second_raw = raw_by_path[first_path]
+    second_path.write_text(second_raw, encoding="utf-8")
+    second["content"] = _marker(second_path, second_raw)
+    raw_by_path[second_path] = second_raw
+    second_stat = second_path.stat()
+    payload["persisted_output_markers"].append(
+        {
+            "source_path": str(second_path),
+            "expected_chars": len(second_raw),
+            "file_size": second_stat.st_size,
+            "file_mtime_ns": second_stat.st_mtime_ns,
+            "file_ctime_ns": second_stat.st_ctime_ns,
+        }
+    )
+    payload_path.write_text(json.dumps(payload), encoding="utf-8")
+    monkeypatch.setattr(
+        reconcile_module,
+        "load_externalized_payload",
+        lambda *args, **kwargs: payload,
+    )
+
+    for path, raw in raw_by_path.items():
+        _replace_same_bytes_with_new_generation(path, raw)
+    engine._ingest_cursor = 0
+    engine._ingest_cursor_needs_reconcile = True
+    engine.ingest([first, second])
+
+    rows = engine._store.get_session_messages(session_id)
+    matching_rows = [
+        row
+        for row in rows
+        if row.get("role") == "tool" and row.get("tool_call_id") == shared_call_id
+    ]
+    evidence = {
+        "matching_contents": [row.get("content") for row in matching_rows],
+        "row_count": len(rows),
+        "reconciliation": engine._last_ingest_reconciliation,
+    }
+    engine.shutdown()
+
+    # One durable row cannot prove a two-occurrence replay burst. Both incoming
+    # marker identities therefore remain ambiguous and are retained.
+    assert len(matching_rows) == 3, evidence
 
 
 def test_session_end_suppresses_same_two_marker_burst_and_retains_new_suffix(
