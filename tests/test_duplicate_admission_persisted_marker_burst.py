@@ -116,6 +116,16 @@ def test_burst_proof_requires_distinct_durable_occurrences():
         [(0, identity_a, {7}), (1, identity_a, {8}), (2, identity_b, {7})]
     ) == {1, 2}
 
+    oversized = [
+        (
+            offset,
+            ("tool", f"call-{offset}", "session_search", f"hash-{offset}", ""),
+            {offset},
+        )
+        for offset in range(129)
+    ]
+    assert _proven_distinct_durable_burst_offsets(oversized) == set()
+
 
 def test_per_turn_suppresses_two_unpaired_exact_markers_after_source_generation_changes(
     tmp_path, monkeypatch

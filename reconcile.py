@@ -69,38 +69,42 @@ def _proven_distinct_durable_burst_offsets(
         )
     if len(by_identity) < 2:
         return set()
+    if len(by_identity) > 128 or sum(len(rows) for rows in by_identity.values()) > 256:
+        return set()
 
     identities = sorted(by_identity, key=repr)
-    best: tuple[tuple[int, int], ...] = ()
+    stored_owner: dict[int, _ReplayIdentity] = {}
+    identity_assignment: dict[_ReplayIdentity, tuple[int, int]] = {}
 
-    def search(
-        identity_index: int,
-        used_stored_offsets: set[int],
-        assignment: tuple[tuple[int, int], ...],
-    ) -> None:
-        nonlocal best
-        if identity_index == len(identities):
-            normalized = tuple(sorted(assignment))
-            if len(normalized) > len(best) or (
-                len(normalized) == len(best) and normalized < best
-            ):
-                best = normalized
-            return
+    def assign(identity: _ReplayIdentity, visited: set[int]) -> bool:
+        edges = sorted(
+            (
+                (stored_offset, incoming_offset)
+                for incoming_offset, matching_stored_offsets in by_identity[identity]
+                for stored_offset in matching_stored_offsets
+            ),
+            key=lambda edge: (edge[0], edge[1]),
+        )
+        for stored_offset, incoming_offset in edges:
+            if stored_offset in visited:
+                continue
+            visited.add(stored_offset)
+            previous_identity = stored_owner.get(stored_offset)
+            if previous_identity is None or assign(previous_identity, visited):
+                stored_owner[stored_offset] = identity
+                identity_assignment[identity] = (incoming_offset, stored_offset)
+                return True
+        return False
 
-        search(identity_index + 1, used_stored_offsets, assignment)
-        identity = identities[identity_index]
-        for incoming_offset, matching_stored_offsets in sorted(
-            by_identity[identity], key=lambda candidate: candidate[0]
-        ):
-            for stored_offset in sorted(matching_stored_offsets - used_stored_offsets):
-                search(
-                    identity_index + 1,
-                    used_stored_offsets | {stored_offset},
-                    assignment + ((incoming_offset, stored_offset),),
-                )
+    for identity in identities:
+        assign(identity, set())
 
-    search(0, set(), ())
-    return {incoming_offset for incoming_offset, _stored_offset in best} if len(best) >= 2 else set()
+    if len(identity_assignment) < 2:
+        return set()
+    return {
+        incoming_offset
+        for incoming_offset, _stored_offset in identity_assignment.values()
+    }
 
 
 class ReconcileMixin:
