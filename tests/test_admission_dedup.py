@@ -13,7 +13,6 @@ import hashlib
 import json
 import logging
 
-import hermes_lcm.engine as engine_module
 from hermes_lcm.config import LCMConfig
 from hermes_lcm.engine import LCMEngine
 

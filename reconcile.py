@@ -55,6 +55,64 @@ logger = logging.getLogger(__name__)
 _PRESERVED_OBJECTIVE_CONTEXT_PREFIX = "[Current user objective preserved from compacted history]"
 
 
+_ReplayIdentity = tuple[str, str, str, str, str]
+
+
+def _proven_distinct_durable_burst_offsets(
+    candidates: list[tuple[int, _ReplayIdentity, set[int]]],
+) -> set[int]:
+    """Return a deterministic matching of distinct identities to durable rows."""
+    by_identity: dict[_ReplayIdentity, list[tuple[int, set[int]]]] = {}
+    for incoming_offset, identity, matching_stored_offsets in candidates:
+        by_identity.setdefault(identity, []).append(
+            (incoming_offset, matching_stored_offsets)
+        )
+    if len(by_identity) < 2:
+        return set()
+    candidate_count = sum(len(rows) for rows in by_identity.values())
+    edge_count = sum(
+        len(matching_stored_offsets)
+        for rows in by_identity.values()
+        for _incoming_offset, matching_stored_offsets in rows
+    )
+    if len(by_identity) > 128 or candidate_count > 256 or edge_count > 256:
+        return set()
+
+    identities = sorted(by_identity, key=repr)
+    stored_owner: dict[int, _ReplayIdentity] = {}
+    identity_assignment: dict[_ReplayIdentity, tuple[int, int]] = {}
+
+    def assign(identity: _ReplayIdentity, visited: set[int]) -> bool:
+        edges = sorted(
+            (
+                (stored_offset, incoming_offset)
+                for incoming_offset, matching_stored_offsets in by_identity[identity]
+                for stored_offset in matching_stored_offsets
+            ),
+            key=lambda edge: (edge[0], edge[1]),
+        )
+        for stored_offset, incoming_offset in edges:
+            if stored_offset in visited:
+                continue
+            visited.add(stored_offset)
+            previous_identity = stored_owner.get(stored_offset)
+            if previous_identity is None or assign(previous_identity, visited):
+                stored_owner[stored_offset] = identity
+                identity_assignment[identity] = (incoming_offset, stored_offset)
+                return True
+        return False
+
+    for identity in identities:
+        assign(identity, set())
+
+    if len(identity_assignment) < 2:
+        return set()
+    return {
+        incoming_offset
+        for incoming_offset, _stored_offset in identity_assignment.values()
+    }
+
+
 class ReconcileMixin:
     @staticmethod
     def _canonicalize_tool_call_identity_value(value: Any) -> Any:
@@ -1608,7 +1666,73 @@ class ReconcileMixin:
                 keys.add(cleaned_identity)
             for key in keys:
                 stored_tool_anchors.setdefault(key, []).append(stored_offset)
-
+        persisted_output_unpaired_burst_offsets: set[int] = set()
+        persisted_output_unpaired_candidates: list[
+            tuple[int, tuple[str, str, str, str, str], set[int]]
+        ] = []
+        for incoming_offset in incoming_tool_offsets:
+            _incoming_raw_index, incoming_tool = visible_messages[incoming_offset]
+            call_id = str(incoming_tool.get("tool_call_id") or "").strip()
+            content = normalize_content_value(incoming_tool.get("content")) or ""
+            if not call_id or not _is_hermes_persisted_output_marker(content):
+                continue
+            has_adjacent_call = False
+            if incoming_offset > 0:
+                previous = visible_messages[incoming_offset - 1][1]
+                has_adjacent_call = (
+                    str(previous.get("role") or "") == "assistant"
+                    and call_id in assistant_tool_call_ids(previous)
+                )
+            if has_adjacent_call:
+                continue
+            incoming_identity = incoming_identities[incoming_offset]
+            identity_keys = {incoming_identity}
+            cleaned_identity = self._active_cleanup_replay_identity(incoming_identity)
+            if cleaned_identity is not None:
+                identity_keys.add(cleaned_identity)
+            matching_stored_offsets = {
+                stored_offset
+                for key in identity_keys
+                for stored_offset in stored_tool_anchors.get(key, [])
+            }
+            if not matching_stored_offsets:
+                incoming_tool_name = str(
+                    incoming_tool.get("tool_name")
+                    or incoming_name_map[incoming_offset]
+                    or ""
+                ).strip()
+                matching_stored_offsets = {
+                    stored_offset
+                    for stored_offset, stored_row in enumerate(stored_rows)
+                    if str(stored_row.get("role") or "") == "tool"
+                    and str(stored_row.get("tool_call_id") or "").strip() == call_id
+                    and stored_marker_primary_provenance_matches(
+                        stored_row,
+                        content,
+                        incoming_tool_name,
+                    )
+                }
+            if not matching_stored_offsets:
+                continue
+            # Missing payload files retain the longstanding ambiguity contract.
+            # This fallback is only for still-readable exact marker sources; an
+            # unchanged generation is already replay-safe through the primary
+            # path, while a changed generation needs burst-level proof.
+            if recover_hermes_persisted_output_with_file_stat(content) is None:
+                continue
+            persisted_output_unpaired_candidates.append(
+                (incoming_offset, incoming_identity, matching_stored_offsets)
+            )
+        # A lone unpaired persisted-output marker remains ambiguous: Hermes may
+        # legitimately reuse its call ID and marker bytes after replacing the
+        # source file.  Two distinct, exact durable marker identities in the same
+        # delivery form a replay burst, while adjacent assistant declarations
+        # continue to protect genuinely new executions from this fallback.
+        persisted_output_unpaired_burst_offsets = (
+            _proven_distinct_durable_burst_offsets(
+                persisted_output_unpaired_candidates
+            )
+        )
 
         replayed_raw_indexes: set[int] = set()
         matched_tool_anchor_pairs: list[tuple[int, int]] = []
@@ -1621,6 +1745,9 @@ class ReconcileMixin:
         for incoming_anchor in reversed(incoming_tool_offsets):
             incoming_raw_index, incoming_tool = visible_messages[incoming_anchor]
             incoming_identity = incoming_identities[incoming_anchor]
+            if incoming_anchor in persisted_output_unpaired_burst_offsets:
+                replayed_raw_indexes.add(incoming_raw_index)
+                continue
             # Missing persisted-output source files do not make an exact stored
             # marker identity new. Re-appending the same
             # (session_id, tool_call_id, content) pointer cannot recover its
