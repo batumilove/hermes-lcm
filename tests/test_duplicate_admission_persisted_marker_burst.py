@@ -112,6 +112,9 @@ def test_burst_proof_requires_distinct_durable_occurrences():
     assert _proven_distinct_durable_burst_offsets(
         [(0, identity_a, {7}), (1, identity_b, {8})]
     ) == {0, 1}
+    assert _proven_distinct_durable_burst_offsets(
+        [(0, identity_a, {7}), (1, identity_a, {8}), (2, identity_b, {7})]
+    ) == {1, 2}
 
 
 def test_per_turn_suppresses_two_unpaired_exact_markers_after_source_generation_changes(
