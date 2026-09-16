@@ -126,6 +126,12 @@ def test_burst_proof_requires_distinct_durable_occurrences():
     ]
     assert _proven_distinct_durable_burst_offsets(oversized) == set()
 
+    too_many_edges = [
+        (0, identity_a, set(range(257))),
+        (1, identity_b, {257}),
+    ]
+    assert _proven_distinct_durable_burst_offsets(too_many_edges) == set()
+
 
 def test_per_turn_suppresses_two_unpaired_exact_markers_after_source_generation_changes(
     tmp_path, monkeypatch

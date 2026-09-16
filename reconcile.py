@@ -69,7 +69,13 @@ def _proven_distinct_durable_burst_offsets(
         )
     if len(by_identity) < 2:
         return set()
-    if len(by_identity) > 128 or sum(len(rows) for rows in by_identity.values()) > 256:
+    candidate_count = sum(len(rows) for rows in by_identity.values())
+    edge_count = sum(
+        len(matching_stored_offsets)
+        for rows in by_identity.values()
+        for _incoming_offset, matching_stored_offsets in rows
+    )
+    if len(by_identity) > 128 or candidate_count > 256 or edge_count > 256:
         return set()
 
     identities = sorted(by_identity, key=repr)
