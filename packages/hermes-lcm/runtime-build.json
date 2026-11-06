@@ -30,7 +30,7 @@
     "model_routing.py": "580859f036c4aeaeb33ed7e9265027330460e63ebbcd246e997cdfc91347118e",
     "native_identity.py": "b384408f47b56d26bff1c1039b615e85c4c3f45446d05dd12e60e4335af13f4a",
     "placeholder_ledger.py": "a6bf47bc483a37605e7963b21f877119970a4f69408c0c6b8fadeb787e3ab20f",
-    "plugin.yaml": "7fe1e40506423f026252da71576eab8963e3cbab0223ac1691df489f2e11e7f4",
+    "plugin.yaml": "e618fa2439f949ab15f32f60aa172ffbdcd5cd2769f34de150e162df72ee9ec6",
     "presets.py": "84cb1f66e5989b25ab07c4be4588757528e35a85ce798384868b721ce59599a9",
     "reconcile.py": "a7fb9291f145919a35d75c6a1963ffb35f9f10876d3c7865218a96d3926d51d0",
     "reset_state.py": "4e98273c5d907be1abbddeb805c2c33e6d05669bbfdc39e186c857be92771dce",

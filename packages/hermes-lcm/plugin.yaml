@@ -9,3 +9,15 @@ python_dependencies:
   - tiktoken>=0.8
   - numpy>=1.26
   - fastembed>=0.7
+
+provides_tools:
+  - lcm_grep
+  - lcm_recall
+  - lcm_recent
+  - lcm_load_session
+  - lcm_describe
+  - lcm_expand
+  - lcm_expand_query
+  - lcm_status
+  - lcm_inspect
+  - lcm_doctor
