@@ -1,0 +1,11 @@
+manifest_version: 2
+name: hermes-lcm
+version: 0.1.0
+description: Lossless Context Management runtime distribution
+kind: standalone
+python_dependencies:
+  - PyYAML>=6.0
+  - regex>=2024.0
+  - tiktoken>=0.8
+  - numpy>=1.26
+  - fastembed>=0.7

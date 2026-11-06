@@ -2635,8 +2635,8 @@ class ReconcileMixin:
         generated_surplus_skip_message_ids: set[int] = set()
         generated_placeholder_message_ids = getattr(
             self,
-            "_generated_ignored_active_replay_placeholder_message_ids",
-            set(),
+            "_generated_ignored_active_replay_placeholder_messages",
+            {},
         )
         for identity, active_count in active_identity_counts.items():
             wanted_cleanup_identity = self._active_cleanup_replay_identity(identity)
@@ -2650,7 +2650,7 @@ class ReconcileMixin:
                 for msg in messages:
                     if surplus_count <= 0:
                         break
-                    if id(msg) not in generated_placeholder_message_ids:
+                    if generated_placeholder_message_ids.get(id(msg)) is not msg:
                         continue
                     if self._message_replay_identity(msg) != identity:
                         continue

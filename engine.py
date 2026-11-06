@@ -529,7 +529,7 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
         self._current_compress_placeholder_identity_counts: dict[tuple[str, str, str, str, str], int] = {}
         self._last_active_replay_source_identities: list[tuple[Any, ...]] = []
         self._last_active_replay_messages: list[Dict[str, Any]] = []
-        self._generated_ignored_active_replay_placeholder_message_ids: set[int] = set()
+        self._generated_ignored_active_replay_placeholder_messages: dict[int, dict] = {}
         self._logged_filter_config = False
         self._pending_reset_session_id: str = ""
         self._pending_reset_conversation_id: str = ""
@@ -708,6 +708,16 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
         # Lifecycle metrics: record one storage bind.
         from .lifecycle_metrics import record_storage_bind
         record_storage_bind()
+        # Emit identity from the process that actually bound the database.
+        # No conversation text, credentials, or provider configuration belongs here.
+        logger.info("LCM_RUNTIME_IDENTITY %s", json.dumps({
+            "pid": os.getpid(),
+            "invocation_id": os.environ.get("INVOCATION_ID", ""),
+            "module_path": str(Path(__file__).resolve()),
+            "database_path": str(Path(self._store.db_path).resolve()),
+            "hermes_home": str(Path(hermes_home).resolve()) if hermes_home else "",
+            "embeddings_enabled": bool(self._config.embeddings_enabled),
+        }, sort_keys=True))
 
     def start_deferred_integrity_scans(self) -> None:
         """Start deep FTS integrity scans queued during storage binding.
@@ -1521,6 +1531,11 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
             session_id,
         )
         return True
+
+    def native_snapshot_scope(self, originals, copies):
+        """Host-only provenance bridge at the actual deepcopy boundary."""
+        from .snapshot_provenance import snapshot_scope
+        return snapshot_scope(self, originals, copies)
 
     def ingest(self, messages: List[Dict[str, Any]]) -> None:
         """Persist messages to the durable store every turn.
@@ -4874,13 +4889,13 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
         copied_replay_messages: list[Dict[str, Any]] = []
         generated_message_ids = getattr(
             self,
-            "_generated_ignored_active_replay_placeholder_message_ids",
-            set(),
+            "_generated_ignored_active_replay_placeholder_messages",
+            {},
         )
         for message in active_replay_messages:
             copied_message = dict(message)
-            if id(message) in generated_message_ids:
-                self._generated_ignored_active_replay_placeholder_message_ids.add(id(copied_message))
+            if generated_message_ids.get(id(message)) is message:
+                self._generated_ignored_active_replay_placeholder_messages[id(copied_message)] = copied_message
             copied_replay_messages.append(copied_message)
         return copied_replay_messages
 
@@ -4904,6 +4919,16 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
         self._write_generated_ignored_placeholder_hash_ordinals(
             self._generated_placeholder_digest_ordinals_for_active_replay(active_replay_messages)
         )
+        # Retain only active/original/cached objects, never bare IDs: Python can
+        # reuse an ID after collection and falsely mark a literal as generated.
+        retained = {id(message) for group in (
+            original_messages, active_replay_messages, self._last_active_replay_messages
+        ) for message in group}
+        self._generated_ignored_active_replay_placeholder_messages = {
+            key: message
+            for key, message in self._generated_ignored_active_replay_placeholder_messages.items()
+            if key in retained
+        }
         return active_replay_messages
 
     def _cached_active_replay_messages(
@@ -5145,8 +5170,8 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
         redacted_replay_messages: list[Dict[str, Any]] = []
         generated_message_ids = getattr(
             self,
-            "_generated_ignored_active_replay_placeholder_message_ids",
-            set(),
+            "_generated_ignored_active_replay_placeholder_messages",
+            {},
         )
         for message in messages:
             redacted_message = dict(message)
@@ -5164,8 +5189,8 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
                     self._config,
                     parse_json_strings=True,
                 )
-            if id(message) in generated_message_ids:
-                self._generated_ignored_active_replay_placeholder_message_ids.add(id(redacted_message))
+            if generated_message_ids.get(id(message)) is message:
+                self._generated_ignored_active_replay_placeholder_messages[id(redacted_message)] = redacted_message
             redacted_replay_messages.append(redacted_message)
         return redacted_replay_messages
 
@@ -5207,6 +5232,21 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
                     message_fingerprints=session_end_message_fingerprints or [],
                 )
             return self._redact_active_replay_messages(messages)
+
+        # Fast-path replay also creates copies. Release previous returned
+        # objects once they are absent from both input and the replay cache.
+        retained_generated_ids = {
+            id(message)
+            for group in (messages, self._last_active_replay_messages)
+            for message in group
+        }
+        self._generated_ignored_active_replay_placeholder_messages = {
+            key: message
+            for key, message in self._generated_ignored_active_replay_placeholder_messages.items()
+            if key in retained_generated_ids
+        }
+        from .admission_binding import bind_late_identities
+        bind_late_identities(self, messages)
 
         n = len(messages)
         cursor_before_reconcile = min(max(self._ingest_cursor, 0), n)
@@ -5503,6 +5543,23 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
                     stored_tail_count=replay_scan_count,
                     effective_incoming=n - cursor - len(tool_anchored_replay_indexes),
                 )
+        # A result alone cannot prove replay of a newly admitted call: a
+        # provider may reuse its ID and return identical bytes for new args.
+        # Earlier matchers may recognize the result but reject its assistant
+        # call identity. Preserve that call's results as a complete exchange.
+        admitted_assistant_call_ids = {
+            call_id
+            for index in range(cursor, n)
+            if index not in tool_anchored_replay_indexes
+            and not ignored_original_messages[index]
+            and str(messages[index].get("role") or "") == "assistant"
+            for call_id in self._assistant_tool_call_ids(messages[index])
+        }
+        tool_anchored_replay_indexes.difference_update(
+            index for index in tuple(tool_anchored_replay_indexes)
+            if str(messages[index].get("role") or "") == "tool"
+            and str(messages[index].get("tool_call_id") or "").strip() in admitted_assistant_call_ids
+        )
         try:
             logger.debug(
                 "Ingest: session=%s cursor=%d incoming=%d",
@@ -5674,12 +5731,12 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
                     boundary_ordinals = self._compression_boundary_active_placeholder_digest_ordinals
                     generated_message_ids = getattr(
                         self,
-                        "_generated_ignored_active_replay_placeholder_message_ids",
-                        set(),
+                        "_generated_ignored_active_replay_placeholder_messages",
+                        {},
                     )
                     has_generated_provenance = (
-                        id(replay_msg) in generated_message_ids
-                        or id(original_msg) in generated_message_ids
+                        generated_message_ids.get(id(replay_msg)) is replay_msg
+                        or generated_message_ids.get(id(original_msg)) is original_msg
                     )
                     ordinal_matches_generated = (
                         current_placeholder_ordinal in boundary_ordinals.get(
@@ -5767,6 +5824,10 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
             messages_to_store_with_index = kept
 
         if not messages_to_store_with_index:
+            self._store._append_protected_batch(
+                self._session_id, [], [], conversation_id=self._conversation_id,
+                native_replay_messages=[messages[index] for index in sorted(tool_anchored_replay_indexes)],
+            )
             if session_end_intent_sha256:
                 self._store.record_session_end_ingest_receipt(
                     session_end_intent_sha256,
@@ -5788,6 +5849,8 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
             for relative_index, (absolute_index, message) in enumerate(messages_to_store_with_index):
                 call_id = str(message.get("tool_call_id") or "").strip()
                 if str(message.get("role") or "") != "tool" or not call_id:
+                    continue
+                if call_id in admitted_assistant_call_ids:
                     continue
                 has_adjacent_new_call = False
                 if relative_index > 0:
@@ -5829,6 +5892,10 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
 
 
         if not messages_to_store_with_index:
+            self._store._append_protected_batch(
+                self._session_id, [], [], conversation_id=self._conversation_id,
+                native_replay_messages=[messages[index] for index in sorted(tool_anchored_replay_indexes)],
+            )
             if session_end_intent_sha256:
                 self._store.record_session_end_ingest_receipt(
                     session_end_intent_sha256,
@@ -5874,6 +5941,10 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
             )
         messages_to_store_with_index = admitted_messages_with_index
         if not messages_to_store_with_index:
+            self._store._append_protected_batch(
+                self._session_id, [], [], conversation_id=self._conversation_id,
+                native_replay_messages=[messages[index] for index in sorted(tool_anchored_replay_indexes)],
+            )
             if session_end_intent_sha256:
                 self._store.record_session_end_ingest_receipt(
                     session_end_intent_sha256,
@@ -5927,7 +5998,7 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
                 active_replay_messages[absolute_idx] = stubbed_message
 
         estimates = [count_message_tokens(m) for m in protected_messages]
-        self._store._append_protected_batch(
+        admitted_row_ids = self._store._append_protected_batch(
             self._session_id,
             protected_messages,
             estimates,
@@ -5935,7 +6006,12 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
             conversation_id=self._conversation_id,
             session_end_intent_sha256=session_end_intent_sha256,
             session_end_message_fingerprints=session_end_message_fingerprints,
+            native_identity_messages=[messages[index] for index, _message in messages_to_store_with_index],
+            native_replay_messages=[messages[index] for index in sorted(tool_anchored_replay_indexes)],
         )
+
+        from .admission_binding import remember_admissions
+        remember_admissions(self, messages, messages_to_store_with_index, admitted_row_ids)
 
         # Rollup staleness is driven by summary-node PUBLICATION
         # (_invalidate_rollups_for_published_node at every add_node site), not by
@@ -6033,6 +6109,15 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
         ingestion) with a debug log.
         """
         try:
+            # An admitted assistant call was not proved replay by the earlier
+            # argument-aware matcher. Its result must remain admitted, even if
+            # a provider reused a call ID and returned byte-identical output.
+            admitted_call_ids = {
+                call_id
+                for _index, message in messages_to_store_with_index
+                if str(message.get("role") or "") == "assistant"
+                for call_id in self._assistant_tool_call_ids(message)
+            }
             candidates: list[tuple[int, Dict[str, Any], tuple[str, str, str, str]]] = []
             for absolute_idx, message in messages_to_store_with_index:
                 call_id_value = message.get("tool_call_id")
@@ -6040,6 +6125,7 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
                     message.get("role") != "tool"
                     or not isinstance(call_id_value, str)
                     or not call_id_value
+                    or call_id_value in admitted_call_ids
                 ):
                     continue
                 identity = self._bounded_tool_diagnostic_identity(message)
@@ -6051,7 +6137,9 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
             call_ids = {identity[1] for _i, _m, identity in candidates}
             durable_rows = self._store.get_bounded_tool_call_rows(
                 self._session_id,
-                call_ids,
+                # The bounded store helper samples before sorting. Supply a
+                # stable order so admission cannot depend on PYTHONHASHSEED.
+                tuple(sorted(call_ids)),
                 conversation_id=self._conversation_id,
                 max_call_ids=8,
                 max_rows=64,

@@ -7269,9 +7269,7 @@ class TestMessageFiltering:
         assert id(quoted_placeholder) in store_map
 
         generated_placeholder_after_quote = {"role": "user", "content": placeholder}
-        engine._generated_ignored_active_replay_placeholder_message_ids.add(
-            id(generated_placeholder_after_quote)
-        )
+        engine._generated_ignored_active_replay_placeholder_messages[id(generated_placeholder_after_quote)] = generated_placeholder_after_quote
         store_map = engine._get_store_id_map_for_messages(
             [quoted_placeholder, generated_placeholder_after_quote]
         )
@@ -7750,7 +7748,7 @@ class TestMessageFiltering:
             generated = {"role": "user", "content": placeholder}
             literal_store_id = engine._store.append("session", literal)
             engine._remember_generated_ignored_placeholder_hash(digest)
-            engine._generated_ignored_active_replay_placeholder_message_ids.add(id(generated))
+            engine._generated_ignored_active_replay_placeholder_messages[id(generated)] = generated
 
             engine._remember_active_replay_messages(
                 [literal, generated],
@@ -7786,7 +7784,7 @@ class TestMessageFiltering:
         raw_ignored = {"role": "user", "content": "SECRET later ignored"}
         engine._store.append("user-123", literal)
         engine._remember_generated_ignored_placeholder_hash(digest)
-        engine._generated_ignored_active_replay_placeholder_message_ids.add(id(generated))
+        engine._generated_ignored_active_replay_placeholder_messages[id(generated)] = generated
 
         active_replay = engine._apply_ignored_active_replay_placeholders(
             [literal, generated, raw_ignored],
@@ -7796,7 +7794,7 @@ class TestMessageFiltering:
         ids_by_message_id = engine._get_store_id_map_for_messages(active_replay)
 
         assert copied_new_placeholder["content"].startswith("[LCM active replay placeholder: message ignored;")
-        assert id(copied_generated) in engine._generated_ignored_active_replay_placeholder_message_ids
+        assert id(copied_generated) in engine._generated_ignored_active_replay_placeholder_messages
         assert ids_by_message_id.get(id(copied_literal)) is not None
         assert id(copied_generated) not in ids_by_message_id
 
@@ -7930,7 +7928,7 @@ class TestMessageFiltering:
             literal = {"role": "user", "content": placeholder}
             generated = {"role": "user", "content": placeholder}
             engine._remember_generated_ignored_placeholder_hash(digest)
-            engine._generated_ignored_active_replay_placeholder_message_ids.add(id(generated))
+            engine._generated_ignored_active_replay_placeholder_messages[id(generated)] = generated
             engine._compression_boundary_ingest_pending = True
             engine._compression_boundary_active_placeholder_digest_budget = {digest: 1}
 

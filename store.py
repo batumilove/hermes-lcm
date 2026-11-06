@@ -49,6 +49,9 @@ from .search_query import (
 from .message_content import normalize_content_value as _normalize_content_value
 from .sqlite_util import process_sqlite_write_lock, sqlite_lock_diagnostics
 from .tokens import count_message_tokens
+from .native_identity import (
+    receipt_key, bound_row, record_in_transaction, bind_proven_replay_in_transaction,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -396,7 +399,9 @@ class MessageStore:
                                 source: str = "",
                                 conversation_id: str = "",
                                 session_end_intent_sha256: str | None = None,
-                                session_end_message_fingerprints: list[str] | None = None) -> List[int]:
+                                session_end_message_fingerprints: list[str] | None = None,
+                                native_identity_messages: List[Dict[str, Any]] | None = None,
+                                native_replay_messages: List[Dict[str, Any]] | None = None) -> List[int]:
         """Persist messages that already passed ingest protection.
 
         This is an internal fast path for callers that need the protected form
@@ -407,9 +412,31 @@ class MessageStore:
         if token_estimates is None:
             token_estimates = [0] * len(messages)
 
+        if native_identity_messages is not None and len(native_identity_messages) != len(messages):
+            raise ValueError("native identity messages must align with protected messages")
+        if len(token_estimates) != len(messages):
+            raise ValueError("token estimates must align with protected messages")
+        identity_keys = [
+            receipt_key(session_id, conversation_id, message)
+            for message in native_identity_messages
+        ] if native_identity_messages is not None else [None] * len(messages)
         ids = []
         with self._write_lock, self._conn:
-            for msg, est in zip(messages, token_estimates):
+            # Connection context managers do not BEGIN for SELECT. Reserve the
+            # SQLite writer before checking receipts so independent processes
+            # cannot both observe a missing receipt and then append duplicates.
+            has_replay_bindings = any(
+                receipt_key(session_id, conversation_id, msg) is not None
+                for msg in (native_replay_messages or [])
+            )
+            if (any(identity_keys) or has_replay_bindings) and not self._conn.in_transaction:
+                self._conn.execute("BEGIN IMMEDIATE")
+            for index, (msg, est) in enumerate(zip(messages, token_estimates)):
+                key = identity_keys[index]
+                existing_id = bound_row(self, key)
+                if existing_id is not None:
+                    ids.append(existing_id)
+                    continue
                 tc = msg.get("tool_calls")
                 tc_json = json.dumps(tc) if tc else None
                 ts = time.time()
@@ -433,6 +460,9 @@ class MessageStore:
                     ),
                 )
                 ids.append(cur.lastrowid)
+                record_in_transaction(self, key, cur.lastrowid)
+            for message in native_replay_messages or []:
+                bind_proven_replay_in_transaction(self, session_id, conversation_id, message)
             if session_end_intent_sha256:
                 self._record_session_end_ingest_receipt_in_transaction(
                     session_end_intent_sha256,

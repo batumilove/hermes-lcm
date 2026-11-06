@@ -50,7 +50,8 @@ class ResetStateMixin:
         self._reset_session_counters()
         self._reset_compaction_progress()
         self._generated_ignored_active_replay_placeholder_hashes = set()
-        self._generated_ignored_active_replay_placeholder_message_ids = set()
+        self._generated_ignored_active_replay_placeholder_messages = {}
+        self._pending_native_admissions = {}
         self._compression_boundary_ingest_pending = False
         self._overflow_recovery_ingest_pending = False
         self._compression_boundary_active_placeholder_digest_budget = {}
