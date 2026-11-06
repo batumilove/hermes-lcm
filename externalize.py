@@ -16,6 +16,7 @@ import math
 import os
 import re
 import stat
+import sys
 import time
 from pathlib import Path
 from typing import Any, BinaryIO, Dict
@@ -997,6 +998,18 @@ def find_externalized_payload_for_message(
     return fallback_match
 
 
+def _checkpoint_externalized_scan() -> None:
+    """Observe the host's existing thread-scoped watchdog/tool interrupt.
+
+    Do not bootstrap host tools in standalone plugin consumers. In the host,
+    tools.interrupt is already loaded by run_agent; no interrupt is cleared here.
+    Cooperative only: cannot interrupt an in-progress filesystem syscall.
+    """
+    interrupt = sys.modules.get("tools.interrupt")
+    if interrupt is not None and interrupt.is_interrupted():
+        raise interrupt.TurnInterrupted("LCM externalized payload scan interrupted")
+
+
 def find_externalized_tool_result_content_for_call(
     *,
     tool_call_id: str,
@@ -1038,12 +1051,17 @@ def find_externalized_tool_result_content_for_call(
         and not exact_generation_supplied
     ):
         return None
+    _checkpoint_externalized_scan()
     storage_dir = get_large_output_storage_dir(config, hermes_home=hermes_home, create=False)
     if not storage_dir.exists() or not storage_dir.is_dir():
         return None
     for path in sorted(storage_dir.glob("*.json")):
+        _checkpoint_externalized_scan()
         try:
-            payload = json.loads(path.read_text(encoding="utf-8"))
+            text = path.read_text(encoding="utf-8")
+            _checkpoint_externalized_scan()
+            payload = json.loads(text)
+            _checkpoint_externalized_scan()
         except (OSError, json.JSONDecodeError):
             continue
         if payload.get("kind", "tool_result") != "tool_result":
@@ -1126,12 +1144,17 @@ def has_persisted_output_marker_metadata_for_call(
     """Return whether a durable tool payload already has marker provenance."""
     if not tool_call_id:
         return False
+    _checkpoint_externalized_scan()
     storage_dir = get_large_output_storage_dir(config, hermes_home=hermes_home, create=False)
     if not storage_dir.exists() or not storage_dir.is_dir():
         return False
     for path in sorted(storage_dir.glob("*.json")):
+        _checkpoint_externalized_scan()
         try:
-            payload = json.loads(path.read_text(encoding="utf-8"))
+            text = path.read_text(encoding="utf-8")
+            _checkpoint_externalized_scan()
+            payload = json.loads(text)
+            _checkpoint_externalized_scan()
         except (OSError, json.JSONDecodeError):
             continue
         if payload.get("kind", "tool_result") != "tool_result":
