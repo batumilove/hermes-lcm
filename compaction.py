@@ -16,6 +16,7 @@ lifecycle) through normal attribute lookup. ``LCMEngine`` mixes this in ahead of
 from __future__ import annotations
 
 import logging
+import sys
 import time
 from typing import Any, Dict, List, Optional
 
@@ -111,6 +112,11 @@ class CompactionMixin:
                     self._record_ingest_success()
                     break
                 except Exception as exc:
+                    # Cancellation is control flow, not failed ingest or missing provenance.
+                    interrupt = sys.modules.get("tools.interrupt")
+                    cancelled = getattr(interrupt, "TurnInterrupted", ())
+                    if isinstance(exc, cancelled):
+                        raise
                     if attempt == 0 and _is_sqlite_locked_error(exc):
                         logger.info(
                             "LCM preflight ingest retrying once after transient SQLite contention"
